@@ -1,6 +1,16 @@
+from __future__ import annotations
+
 from AgentBasedModel.utils import Order, OrderList
 from AgentBasedModel.utils.math import exp, mean
 import random
+import math as _math
+from typing import TYPE_CHECKING, Optional, List, Dict, Union
+
+if TYPE_CHECKING:
+    from AgentBasedModel.venues.amm import CPMMPool, HFMMPool
+    from AgentBasedModel.venues.clob import CLOBVenue
+    from AgentBasedModel.environment.processes import MarketEnvironment
+    from AgentBasedModel.venues.amm import classify_trade_size as _classify_trade_size
 
 
 class ExchangeAgent:
@@ -10,7 +20,7 @@ class ExchangeAgent:
     """
     id = 0
 
-    def __init__(self, price: float or int = 100, std: float or int = 25, volume: int = 1000, rf: float = 5e-4,
+    def __init__(self, price: Union[float, int] = 100, std: Union[float, int] = 25, volume: int = 1000, rf: float = 5e-4,
                  transaction_cost: float = 0):
         """
         Initialization parameters
@@ -42,10 +52,12 @@ class ExchangeAgent:
         """
         Fill order book with random orders. Fill dividend book with n future dividends.
         """
-        # Order book
+        # Order book — qty range scales with volume for deeper books
+        qty_lo = max(1, volume // 500)
+        qty_hi = max(5, volume // 100)
         prices1 = [round(random.normalvariate(price - std, std), 1) for _ in range(volume // 2)]
         prices2 = [round(random.normalvariate(price + std, std), 1) for _ in range(volume // 2)]
-        quantities = [random.randint(1, 5) for _ in range(volume)]
+        quantities = [random.randint(qty_lo, qty_hi) for _ in range(volume)]
 
         for (p, q) in zip(sorted(prices1 + prices2), quantities):
             if p > price:
@@ -71,7 +83,7 @@ class ExchangeAgent:
         self.order_book['bid'] = OrderList.from_list([order for order in self.order_book['bid'] if order.qty > 0])
         self.order_book['ask'] = OrderList.from_list([order for order in self.order_book['ask'] if order.qty > 0])
 
-    def spread(self) -> dict or None:
+    def spread(self) -> Optional[dict]:
         """
         :return: {'bid': float, 'ask': float}
         """
@@ -79,7 +91,7 @@ class ExchangeAgent:
             return {'bid': self.order_book['bid'].first.price, 'ask': self.order_book['ask'].first.price}
         return None
 
-    def spread_volume(self) -> dict or None:
+    def spread_volume(self) -> Optional[dict]:
         """
         :return: {'bid': float, 'ask': float}
         """
@@ -87,13 +99,13 @@ class ExchangeAgent:
             return {'bid': self.order_book['bid'].first.qty, 'ask': self.order_book['ask'].first.qty}
         return None
 
-    def price(self) -> float or None:
+    def price(self) -> Optional[float]:
         spread = self.spread()
         if spread:
             return round((spread['bid'] + spread['ask']) / 2, 1)
         raise Exception(f'Price cannot be determined, since no orders either bid or ask')
 
-    def dividend(self, access: int = None) -> list or float:
+    def dividend(self, access: int = None) -> Union[list, float]:
         """
         Returns current dividend payment value. If called by a trader, returns n future dividends
         given information access.
@@ -158,7 +170,7 @@ class ExchangeAgent:
 class Trader:
     id = 0
 
-    def __init__(self, market: ExchangeAgent, cash: float or int, assets: int = 0):
+    def __init__(self, market: ExchangeAgent, cash: Union[float, int], assets: int = 0):
         """
         Trader that is activated on call to perform action.
 
@@ -221,17 +233,17 @@ class Random(Trader):
     """
     Random creates noisy orders to recreate trading in real environment.
     """
-    def __init__(self, market: ExchangeAgent, cash: float or int, assets: int = 0):
+    def __init__(self, market: ExchangeAgent, cash: Union[float, int], assets: int = 0):
         super().__init__(market, cash, assets)
         self.type = 'Random'
 
     @staticmethod
-    def draw_delta(std: float or int = 2.5):
+    def draw_delta(std: Union[float, int] = 2.5):
         lamb = 1 / std
         return random.expovariate(lamb)
 
     @staticmethod
-    def draw_price(order_type, spread: dict, std: float or int = 2.5) -> float:
+    def draw_price(order_type, spread: dict, std: Union[float, int] = 2.5) -> float:
         """
         Draw price for limit order of Noise Agent. The price is calculated as:
         1) 35% - within the spread - uniform distribution
@@ -306,7 +318,7 @@ class Fundamentalist(Trader):
     value, i.e. E(V|Ij,k), they accept the limit order, otherwise they put a new limit order
     between the former best bid and best ask prices.
     """
-    def __init__(self, market: ExchangeAgent, cash: float or int, assets: int = 0, access: int = 1):
+    def __init__(self, market: ExchangeAgent, cash: Union[float, int], assets: int = 0, access: int = 1):
         """
         :param market: exchange agent link
         :param cash: number of cash
@@ -386,7 +398,7 @@ class Chartist(Trader):
     buys stock or sells. Sentiment revaluation happens at the end of each iteration based on opinion
     propagation among other chartists, current price changes.
     """
-    def __init__(self, market: ExchangeAgent, cash: float or int, assets: int = 0):
+    def __init__(self, market: ExchangeAgent, cash: Union[float, int], assets: int = 0):
         """
         :param market: exchange agent link
         :param cash: number of cash
@@ -465,7 +477,7 @@ class Universalist(Fundamentalist, Chartist):
     Universalist mixes Fundamentalist, Chartist trading strategies, and allows to change from
     one strategy to another.
     """
-    def __init__(self, market: ExchangeAgent, cash: float or int, assets: int = 0, access: int = 1):
+    def __init__(self, market: ExchangeAgent, cash: Union[float, int], assets: int = 0, access: int = 1):
         """
         :param market: exchange agent link
         :param cash: number of cash
@@ -575,3 +587,418 @@ class MarketMaker(Trader):
             base_offset = -((spread['ask'] - spread['bid']) * (self.assets / self.softlimit))  # Price offset
             self._buy_limit(bid_volume, spread['bid'] - base_offset - .1)  # BID
             self._sell_limit(ask_volume, spread['ask'] + base_offset + .1)  # ASK
+
+
+# ---------------------------------------------------------------------------
+# FX-specific agents with multi-venue routing
+# ---------------------------------------------------------------------------
+
+class FXTrader(Trader):
+    """
+    Base FX liquidity-taker with multi-venue cost estimation and routing.
+    Extends :class:`Trader` to inherit CLOB order management methods.
+
+    Venue selection rule (§5.1):
+        deterministic:  v*(Q) = argmin_v  Ĉ_v(Q)
+        stochastic:     P(v=i) ∝ exp(−β Ĉ_i(Q))
+    """
+
+    def __init__(self,
+                 clob: CLOBVenue,
+                 amm_pools: Dict[str, CPMMPool | HFMMPool],
+                 env: MarketEnvironment,
+                 cash: float = 1e4,
+                 beta: float = 1.0,
+                 deterministic: bool = False):
+        super().__init__(clob.exchange, cash, assets=0)
+        self.type = 'FXTrader'
+        self.clob = clob
+        self.amm_pools = amm_pools   # {'cpmm': CPMMPool, 'hfmm': HFMMPool}
+        self.env = env
+        self.beta = beta              # logit sensitivity
+        self.deterministic = deterministic
+        self.base_holdings = 0.0
+        self.trades: List[dict] = []
+
+    # ---- cost estimation -------------------------------------------------
+
+    def estimate_costs(self, Q: float, side: str = 'buy') -> Dict[str, float]:
+        """Return dict {venue_name: cost_bps} for quantity Q."""
+        S_t = self.clob.mid_price()
+        costs: Dict[str, float] = {}
+        costs['clob'] = self.clob.cost_bps(Q, side)
+        for name, pool in self.amm_pools.items():
+            try:
+                if side == 'buy':
+                    q = pool.quote_buy(Q, S_t)
+                else:
+                    q = pool.quote_sell(Q, S_t)
+                costs[name] = q['cost_bps']
+            except Exception:
+                costs[name] = float('inf')
+        return costs
+
+    def choose_venue(self, Q: float, side: str = 'buy') -> str:
+        """Select venue using deterministic argmin or softmax (logit) rule."""
+        costs = self.estimate_costs(Q, side)
+        if self.deterministic:
+            return min(costs, key=costs.get)
+        items = list(costs.items())
+        min_c = min(c for _, c in items)
+        weights = []
+        for name, c in items:
+            if c == float('inf'):
+                weights.append(0.0)
+            else:
+                weights.append(_math.exp(-self.beta * (c - min_c)))
+        total = sum(weights)
+        if total == 0:
+            return items[0][0]
+        r = random.random() * total
+        cumulative = 0.0
+        for (name, _), w in zip(items, weights):
+            cumulative += w
+            if r <= cumulative:
+                return name
+        return items[-1][0]
+
+    # ---- execution -------------------------------------------------------
+
+    def _classify(self, Q: float, venue: str) -> dict:
+        """
+        Compute relative trade size θ = Q/R and size bucket.
+
+        R is always the **maximum AMM effective depth** across pools,
+        so that "small/medium/large" reflects the trade's significance
+        relative to AMM liquidity — the dimension we study.
+        This makes θ comparable across venues and avoids the artefact
+        where CLOB depth ≠ AMM depth produces different buckets for
+        the same Q.
+        """
+        from AgentBasedModel.venues.amm import classify_trade_size
+        try:
+            mid = self.clob.mid_price()
+        except Exception:
+            return dict(theta=0.0, size_bucket='medium', R=1.0)
+
+        # Reference depth R = max effective depth among AMM pools
+        R = 1.0
+        ref_pool = None
+        for pool in self.amm_pools.values():
+            d = pool.effective_depth(mid)
+            if d > R:
+                R = d
+                ref_pool = pool
+
+        if ref_pool is not None:
+            return classify_trade_size(Q, ref_pool, mid)
+
+        # Fallback if no AMM pools
+        theta = Q / R
+        if theta <= 0.01:
+            bucket = 'small'
+        elif theta <= 0.05:
+            bucket = 'medium'
+        else:
+            bucket = 'large'
+        return dict(theta=theta, size_bucket=bucket, R=R)
+
+    def _execute_on_venue(self, venue: str, Q: float, side: str) -> dict:
+        """Execute trade of *Q* base on *venue*.  Returns cost dict."""
+        if venue == 'clob':
+            return self._execute_clob(Q, side)
+        pool = self.amm_pools[venue]
+        if side == 'buy':
+            return pool.execute_buy(Q)
+        return pool.execute_sell(Q)
+
+    def _execute_clob(self, Q: float, side: str) -> dict:
+        """Execute a market order on the CLOB, reusing inherited helpers."""
+        if side == 'buy':
+            quote_info = self.clob.quote_buy(Q)
+            if quote_info['cost_bps'] == float('inf'):
+                return quote_info
+            self._buy_market(round(Q))
+            return quote_info
+        else:
+            quote_info = self.clob.quote_sell(Q)
+            if quote_info['cost_bps'] == float('inf'):
+                return quote_info
+            self._sell_market(round(Q))
+            return quote_info
+
+    def call(self):
+        pass
+
+
+class FXNoiseTaker(FXTrader):
+    """
+    Random FX taker: each call, with some probability, generates a
+    market order of random size and routes it to the cheapest venue.
+    Extends :class:`FXTrader` (→ :class:`Trader`).
+    """
+
+    def __init__(self, clob, amm_pools, env,
+                 cash=1e4, beta=1.0, deterministic=False,
+                 trade_prob=0.3, q_min=1, q_max=5):
+        super().__init__(clob, amm_pools, env, cash, beta, deterministic)
+        self.type = 'FXNoiseTaker'
+        self.trade_prob = trade_prob
+        self.q_min = q_min
+        self.q_max = q_max
+
+    def call(self) -> Optional[dict]:
+        if random.random() > self.trade_prob:
+            return None
+        side = 'buy' if random.random() > 0.5 else 'sell'
+        Q = random.randint(self.q_min, self.q_max)
+        venue = self.choose_venue(Q, side)
+        cls_info = self._classify(Q, venue)
+        result = self._execute_on_venue(venue, Q, side)
+        trade_record = dict(
+            trader_id=self.id, trader_type=self.type,
+            venue=venue, side=side, quantity=Q,
+            cost_bps=result.get('cost_bps', 0),
+            theta=cls_info['theta'],
+            size_bucket=cls_info['size_bucket'],
+        )
+        self.trades.append(trade_record)
+        return trade_record
+
+
+class FXFundamentalist(FXTrader):
+    """
+    Trades when CLOB price deviates from a fundamental exchange rate.
+    Trade size proportional to mispricing.
+    Extends :class:`FXTrader` (→ :class:`Trader`).
+    """
+
+    def __init__(self, clob, amm_pools, env,
+                 cash=1e4, beta=1.0, deterministic=False,
+                 fundamental_rate: float = 100.0,
+                 gamma: float = 5e-3, q_max: int = 10):
+        super().__init__(clob, amm_pools, env, cash, beta, deterministic)
+        self.type = 'FXFundamentalist'
+        self.fundamental_rate = fundamental_rate
+        self.gamma = gamma
+        self.q_max = q_max
+
+    def call(self) -> Optional[dict]:
+        try:
+            mid = self.clob.mid_price()
+        except Exception:
+            return None
+        mispricing = (self.fundamental_rate - mid) / mid
+        if abs(mispricing) < self.gamma:
+            return None
+        side = 'buy' if mispricing > 0 else 'sell'
+        Q = min(round(abs(mispricing) / self.gamma), self.q_max)
+        if Q <= 0:
+            return None
+        venue = self.choose_venue(Q, side)
+        cls_info = self._classify(Q, venue)
+        result = self._execute_on_venue(venue, Q, side)
+        trade_record = dict(
+            trader_id=self.id, trader_type=self.type,
+            venue=venue, side=side, quantity=Q,
+            cost_bps=result.get('cost_bps', 0),
+            theta=cls_info['theta'],
+            size_bucket=cls_info['size_bucket'],
+        )
+        self.trades.append(trade_record)
+        return trade_record
+
+
+class FXRetailTaker(FXTrader):
+    """
+    Retail FX taker — generates small trades (θ ≤ 1% pool depth).
+    Models retail flow that should find AMM adequate.
+    """
+
+    def __init__(self, clob, amm_pools, env,
+                 cash=1e4, beta=1.0, deterministic=False,
+                 trade_prob=0.4, q_min=1, q_max=2):
+        super().__init__(clob, amm_pools, env, cash, beta, deterministic)
+        self.type = 'FXRetailTaker'
+        self.trade_prob = trade_prob
+        self.q_min = q_min
+        self.q_max = q_max
+
+    def call(self) -> Optional[dict]:
+        if random.random() > self.trade_prob:
+            return None
+        side = 'buy' if random.random() > 0.5 else 'sell'
+        Q = random.randint(self.q_min, self.q_max)
+        venue = self.choose_venue(Q, side)
+        cls_info = self._classify(Q, venue)
+        result = self._execute_on_venue(venue, Q, side)
+        trade_record = dict(
+            trader_id=self.id, trader_type=self.type,
+            venue=venue, side=side, quantity=Q,
+            cost_bps=result.get('cost_bps', 0),
+            theta=cls_info['theta'],
+            size_bucket=cls_info['size_bucket'],
+        )
+        self.trades.append(trade_record)
+        return trade_record
+
+
+class FXInstitutional(FXTrader):
+    """
+    Institutional/hedger FX taker — generates large trades (θ > 5% pool depth).
+    Models institutional flow that should strongly prefer CLOB.
+    """
+
+    def __init__(self, clob, amm_pools, env,
+                 cash=5e4, beta=1.0, deterministic=False,
+                 trade_prob=0.15, q_min=15, q_max=50):
+        super().__init__(clob, amm_pools, env, cash, beta, deterministic)
+        self.type = 'FXInstitutional'
+        self.trade_prob = trade_prob
+        self.q_min = q_min
+        self.q_max = q_max
+
+    def call(self) -> Optional[dict]:
+        if random.random() > self.trade_prob:
+            return None
+        side = 'buy' if random.random() > 0.5 else 'sell'
+        Q = random.randint(self.q_min, self.q_max)
+        venue = self.choose_venue(Q, side)
+        cls_info = self._classify(Q, venue)
+        result = self._execute_on_venue(venue, Q, side)
+        trade_record = dict(
+            trader_id=self.id, trader_type=self.type,
+            venue=venue, side=side, quantity=Q,
+            cost_bps=result.get('cost_bps', 0),
+            theta=cls_info['theta'],
+            size_bucket=cls_info['size_bucket'],
+        )
+        self.trades.append(trade_record)
+        return trade_record
+
+
+class FXMarketMaker(Trader):
+    """
+    Market maker for the CLOB.  Sets quoted spread and depth as functions
+    of exogenous volatility σ_t and funding cost c_t (Brunnermeier–Pedersen).
+
+        qspr_t = α₀ + α₁ σ_t + α₂ c_t
+        depth_t = d₀ − d₁ σ_t − d₂ c_t   (floored at d_min)
+
+    Extends :class:`Trader` for order lifecycle helpers.
+    """
+
+    def __init__(self, market: ExchangeAgent, env: MarketEnvironment,
+                 cash: float = 1e4,
+                 alpha0: float = 2.0, alpha1: float = 100.0,
+                 alpha2: float = 50.0,
+                 d0: float = 50.0, d1: float = 200.0, d2: float = 100.0,
+                 d_min: float = 5.0):
+        super().__init__(market, cash)
+        self.type = 'FXMarketMaker'
+        self.env = env
+        self.alpha0 = alpha0
+        self.alpha1 = alpha1
+        self.alpha2 = alpha2
+        self.d0 = d0
+        self.d1 = d1
+        self.d2 = d2
+        self.d_min = d_min
+
+    def _target_spread_bps(self) -> float:
+        return self.alpha0 + self.alpha1 * self.env.sigma + self.alpha2 * self.env.funding_cost
+
+    def _target_depth(self) -> float:
+        d = self.d0 - self.d1 * self.env.sigma - self.d2 * self.env.funding_cost
+        return max(d, self.d_min)
+
+    def call(self):
+        """Cancel previous orders; post new bid/ask around mid."""
+        for order in self.orders.copy():
+            try:
+                self._cancel_order(order)
+            except Exception:
+                pass
+        self.orders.clear()
+
+        sp = self.market.spread()
+        if sp is None:
+            return
+
+        mid = (sp['bid'] + sp['ask']) / 2.0
+        half_spread = mid * self._target_spread_bps() / 10_000.0 / 2.0
+        depth = max(1, int(self._target_depth()))
+
+        bid_price = round(mid - half_spread, 2)
+        ask_price = round(mid + half_spread, 2)
+
+        self._buy_limit(depth, bid_price)
+        self._sell_limit(depth, ask_price)
+
+
+class AMMProvider:
+    """
+    Liquidity Provider for AMM pools.
+
+    Rule (§5.3):
+        L_{t+1} = L_t + φ₁ Π^fee_t − φ₂ σ_t − φ₃ c_t
+
+    Produces non-monotonic response to volatility:
+    at moderate σ, fee income dominates → L grows;
+    at high σ, risk terms dominate → L shrinks.
+    """
+
+    def __init__(self, pool: CPMMPool | HFMMPool,
+                 env: MarketEnvironment,
+                 phi1: float = 0.5,
+                 phi2: float = 2.0,
+                 phi3: float = 1.0,
+                 max_adj: float = 0.05):
+        self.type = 'AMMProvider'
+        self.pool = pool
+        self.env = env
+        self.phi1 = phi1
+        self.phi2 = phi2
+        self.phi3 = phi3
+        self.max_adj = max_adj
+
+    def update_liquidity(self):
+        """Adjust pool liquidity according to LP rule.  Called once per period."""
+        L = self.pool.liquidity_measure()
+        if L <= 0:
+            return
+        fee_income = self.pool.period_fee_revenue
+        sigma = self.env.sigma
+        c = self.env.funding_cost
+        delta_L = self.phi1 * fee_income - self.phi2 * sigma - self.phi3 * c
+        frac = delta_L / L
+        frac = max(-self.max_adj, min(self.max_adj, frac))
+        if frac > 0:
+            self.pool.add_liquidity(frac)
+        elif frac < 0:
+            self.pool.remove_liquidity(abs(frac))
+
+
+class AMMArbitrageur:
+    """
+    Arbitrageur that trades on AMM pools to align their mid-price with
+    the CLOB reference price S_t (minus a fee-band tolerance).
+    """
+
+    def __init__(self, clob: CLOBVenue,
+                 amm_pools: Dict[str, CPMMPool | HFMMPool]):
+        self.clob = clob
+        self.amm_pools = amm_pools
+        self.type = 'AMMArbitrageur'
+
+    def arbitrage(self):
+        """For each AMM pool, align its price to S_t if profitable."""
+        try:
+            S_t = self.clob.mid_price()
+        except Exception:
+            return
+        for name, pool in self.amm_pools.items():
+            try:
+                pool.arbitrage_to_target(S_t)
+            except Exception:
+                pass

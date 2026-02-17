@@ -36,7 +36,7 @@ for n_rand, n_fund, n_chart, n_univ in tqdm(list(itertools.product(RANGE, repeat
         info = simulator.info
         simulator.simulate(500, silent=True)
 
-        tmp = aggToShock(simulator, 1, FUNCS)['Market Price shock (it=200, dp=-10)']['price']
+        tmp = aggToShock(simulator, 1, FUNCS)['market price shock (it=200, dp=-10)']['price']
 
         traders.append({'Random': n_rand, 'Fundamentalist': n_fund, 'Chartist': n_chart, 'Universalist': n_univ,
                         'MarketMaker': is_mm})
