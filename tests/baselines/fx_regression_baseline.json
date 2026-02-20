@@ -1,0 +1,70 @@
+{
+  "meta": {
+    "n_iter": 120,
+    "seed": 42
+  },
+  "metrics": {
+    "avg_cost_bps": {
+      "clob_Q1": 9.999999999999448,
+      "clob_Q20": 9.999999999999448,
+      "clob_Q5": 9.999999999999448,
+      "cpmm_Q5": 131.08367183501463,
+      "hfmm_Q5": 10.497604384726023
+    },
+    "avg_flow_share": {
+      "clob": 1.0,
+      "cpmm": 0.0,
+      "hfmm": 0.0
+    },
+    "cost_correlation_Q5": {
+      "clob_cpmm": -2.480151039000125e-13,
+      "clob_hfmm": 2.121507387024806e-10
+    },
+    "n_iterations": 120,
+    "n_trades": 604,
+    "theta_bins": {
+      "large": {
+        "clob": {
+          "avg_cost_bps": 5.8695652173909085,
+          "total_volume": 952.0
+        },
+        "cpmm": {
+          "avg_cost_bps": null,
+          "total_volume": 0.0
+        },
+        "hfmm": {
+          "avg_cost_bps": null,
+          "total_volume": 0.0
+        }
+      },
+      "medium": {
+        "clob": {
+          "avg_cost_bps": 5.721153846153521,
+          "total_volume": 442.0
+        },
+        "cpmm": {
+          "avg_cost_bps": null,
+          "total_volume": 0.0
+        },
+        "hfmm": {
+          "avg_cost_bps": null,
+          "total_volume": 0.0
+        }
+      },
+      "small": {
+        "clob": {
+          "avg_cost_bps": 4.761706349206033,
+          "total_volume": 1035.0
+        },
+        "cpmm": {
+          "avg_cost_bps": null,
+          "total_volume": 0.0
+        },
+        "hfmm": {
+          "avg_cost_bps": null,
+          "total_volume": 0.0
+        }
+      }
+    }
+  }
+}

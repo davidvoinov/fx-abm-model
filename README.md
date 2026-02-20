@@ -29,6 +29,21 @@ python test_theta.py
 python test_full.py
 ```
 
+## Regression baseline (сравнение прогонов)
+
+Для сравнения результатов между коммитами используется фиксированный baseline:
+
+- baseline файл: `tests/baselines/fx_regression_baseline.json`
+- сбор текущих метрик: `python -m tests.regression.collect_metrics`
+- проверка против baseline: `python -m tests.regression.compare_baseline`
+
+Если вы осознанно меняете поведение модели и ожидаете новые метрики,
+обновите baseline отдельным коммитом:
+
+```bash
+python -m tests.regression.collect_metrics --write tests/baselines/fx_regression_baseline.json
+```
+
 ## Рекомендуемый workflow в команде
 
 1. Создавайте ветку от `main`: `feature/<topic>` или `fix/<topic>`

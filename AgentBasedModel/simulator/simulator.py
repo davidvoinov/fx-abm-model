@@ -1,53 +1,284 @@
-from AgentBasedModel.agents import ExchangeAgent, Universalist, Chartist, Fundamentalist
+from __future__ import annotations
+
+from AgentBasedModel.agents import ExchangeAgent, Universalist, Chartist, Fundamentalist, MarketMaker, AMMProvider, AMMArbitrageur, Random
 from AgentBasedModel.utils.math import mean, std, difference, rolling
 import random
+from typing import Optional, List, Dict, Any
 from tqdm import tqdm
 
 
 class Simulator:
     """
-    Simulator is responsible for launching agents' actions and executing scenarios
+    Simulator is responsible for launching agents' actions and executing scenarios.
+
+    Operates in two modes determined automatically:
+
+    **Classic mode** (no AMM / CLOB wrapper supplied):
+        Legacy stock-market ABM — same behaviour as before.
+
+    **Multi-venue mode** (``clob``, ``amm_pools`` supplied):
+        CLOB + AMM FX simulation with venue routing, LP agents,
+        arbitrageurs, MetricsLogger, and MarketEnvironment.
     """
-    def __init__(self, exchange: ExchangeAgent = None, traders: list = None, events: list = None):
+    def __init__(self,
+                 exchange: ExchangeAgent = None,
+                 traders: list = None,
+                 events: list = None,
+                 # ---- multi-venue extras (all optional) ----
+                 clob: Any = None,
+                 amm_pools: Dict[str, Any] = None,
+                 env: Any = None,
+                 fx_traders: List = None,
+                 clob_noise: List = None,
+                 market_maker: Any = None,
+                 lp_providers: List[AMMProvider] = None,
+                 arbitrageur: AMMArbitrageur = None,
+                 logger: Any = None,
+                 ):
         self.exchange = exchange
-        self.events = [event.link(self) for event in events] if events else None  # link all events to simulator
-        self.traders = traders
-        self.info = SimulatorInfo(self.exchange, self.traders)  # links to existing objects
+        self.events = [event.link(self) for event in events] if events else None
+        self.traders = traders  # used in classic mode (+ SimulatorInfo)
+
+        # Multi-venue
+        self.clob = clob
+        self.amm_pools = amm_pools or {}
+        self.env = env
+        self.fx_traders = fx_traders or []
+        self.clob_noise = clob_noise or []
+        self.mm = market_maker
+        self.lp_providers = lp_providers or []
+        self.arbitrageur = arbitrageur
+        self.logger = logger
+
+        # SimulatorInfo — only created when classic traders list is given
+        if self.traders:
+            self.info = SimulatorInfo(self.exchange, self.traders)
+        else:
+            self.info = None
+
+    @property
+    def multi_venue(self) -> bool:
+        return self.clob is not None and bool(self.amm_pools)
+
+    # ------------------------------------------------------------------
+    # Classic helpers
+    # ------------------------------------------------------------------
 
     def _payments(self):
         for trader in self.traders:
-            # Dividend payments
-            trader.cash += trader.assets * self.exchange.dividend()  # allow negative dividends
-            # Interest payment
-            trader.cash += trader.cash * self.exchange.risk_free  # allow risk-free loan
+            trader.cash += trader.assets * self.exchange.dividend()
+            trader.cash += trader.cash * self.exchange.risk_free
 
-    def simulate(self, n_iter: int, silent=False) -> object:
+    # ------------------------------------------------------------------
+    # Unified simulate
+    # ------------------------------------------------------------------
+
+    def simulate(self, n_iter: int, silent: bool = False) -> Simulator:
+        if self.multi_venue:
+            return self._simulate_multi(n_iter, silent)
+        return self._simulate_classic(n_iter, silent)
+
+    # ---- classic single-venue loop --------------------------------------
+
+    def _simulate_classic(self, n_iter: int, silent: bool) -> Simulator:
         for it in tqdm(range(n_iter), desc='Simulation', disable=silent):
-            # Call scenario
+            # Scenario events
             if self.events:
                 for event in self.events:
                     event.call(it)
 
-            # Capture current info
+            # Capture info
             self.info.capture()
 
-            # Change behaviour
+            # Behaviour changes (Universalist / Chartist)
             for trader in self.traders:
                 if type(trader) == Universalist:
                     trader.change_strategy(self.info)
                 elif type(trader) == Chartist:
                     trader.change_sentiment(self.info)
 
-            # Call Traders
+            # Call traders
             random.shuffle(self.traders)
             for trader in self.traders:
                 trader.call()
 
-            # Payments and dividends
-            self._payments()  # pay dividends
-            self.exchange.generate_dividend()  # generate next dividends
+            # Payments & dividends
+            self._payments()
+            self.exchange.generate_dividend()
 
         return self
+
+    # ---- multi-venue loop -----------------------------------------------
+
+    def _simulate_multi(self, n_iter: int, silent: bool) -> Simulator:
+        for t in tqdm(range(n_iter), desc='Simulation', disable=silent):
+
+            # 1. Environment step → σ_t, c_t
+            if self.env is not None:
+                self.env.step()
+
+            # 2. CLOB market maker quotes
+            if self.mm is not None:
+                self.mm.call()
+
+            # 3. CLOB noise traders (keep book alive)
+            random.shuffle(self.clob_noise)
+            for tr in self.clob_noise:
+                tr.call()
+
+            # 4. Dividends
+            self.exchange.generate_dividend()
+
+            # 5. Reset AMM period fees
+            for pool in self.amm_pools.values():
+                pool.reset_period_fees()
+
+            # 6. FX liquidity takers route orders
+            period_trades: List[dict] = []
+            random.shuffle(self.fx_traders)
+            for tr in self.fx_traders:
+                result = tr.call()
+                if result is not None:
+                    period_trades.append(result)
+
+            # 7. Arbitrageurs align AMM prices
+            if self.arbitrageur is not None:
+                self.arbitrageur.arbitrage()
+
+            # 8. LP agents adjust AMM liquidity
+            for lp in self.lp_providers:
+                lp.update_liquidity()
+
+            # 9. Record AMM state
+            for pool in self.amm_pools.values():
+                pool.record_state()
+
+            # 10. Metrics snapshot
+            if self.logger is not None:
+                self.logger.snapshot(t, self.clob, self.amm_pools,
+                                    self.env, period_trades)
+
+        return self
+
+    # ------------------------------------------------------------------
+    # Convenience factory for multi-venue mode
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def default_fx(cls,
+                   n_noise: int = 30,
+                   n_fx_takers: int = 15,
+                   n_fx_fund: int = 5,
+                   n_retail: int = 10,
+                   n_institutional: int = 3,
+                   clob_std: float = 2.0,
+                   clob_volume: int = 1000,
+                   cpmm_reserves: float = 500.0,
+                   hfmm_reserves: float = 500.0,
+                   hfmm_A: float = 100.0,
+                   cpmm_fee: float = 0.003,
+                   hfmm_fee: float = 0.001,
+                   stress_start: Optional[int] = 200,
+                   stress_end: Optional[int] = 350,
+                   sigma_low: float = 0.01,
+                   sigma_high: float = 0.05,
+                   c_low: float = 0.001,
+                   c_high: float = 0.02,
+                   price: float = 100.0,
+                   beta: float = 1.0,
+                   deterministic: bool = False,
+                   ) -> Simulator:
+        """Build a ready-to-run multi-venue FX simulator with sensible defaults."""
+        from AgentBasedModel.venues.amm import CPMMPool, HFMMPool
+        from AgentBasedModel.venues.clob import CLOBVenue
+        from AgentBasedModel.environment.processes import MarketEnvironment
+        from AgentBasedModel.metrics.logger import MetricsLogger
+
+        # Exchange (CLOB) — moderate depth FX book
+        exchange = ExchangeAgent(price=price, std=clob_std, volume=clob_volume)
+
+        # AMM pools
+        cpmm = CPMMPool(x=cpmm_reserves, y=cpmm_reserves * price, fee=cpmm_fee)
+        hfmm = HFMMPool(x=hfmm_reserves, y=hfmm_reserves * price,
+                         A=hfmm_A, fee=hfmm_fee, rate=price)
+
+        # Wrap CLOB
+        clob = CLOBVenue(exchange)
+
+        # Environment
+        env = MarketEnvironment(
+            sigma_low=sigma_low, sigma_high=sigma_high,
+            c_low=c_low, c_high=c_high,
+            stress_start=stress_start, stress_end=stress_end,
+            mode='piecewise',
+        )
+
+        amm_pools = {'cpmm': cpmm, 'hfmm': hfmm}
+
+        # CLOB noise traders (keep the book alive)
+        clob_noise = [Random(exchange, cash=1e4) for _ in range(n_noise)]
+
+        # Market maker — σ/c-dependent spread (Brunnermeier-Pedersen)
+        mm = MarketMaker(exchange, cash=1e4, env=env,
+                         alpha0=3.0, alpha1=300.0, alpha2=200.0,
+                         d0=50.0, d1=500.0, d2=250.0, d_min=5.0)
+
+        # Liquidity takers with venue routing
+        fx_traders: List = []
+        for _ in range(n_fx_takers):
+            fx_traders.append(Random(
+                exchange, cash=1e4,
+                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
+                deterministic_venue=deterministic,
+                trade_prob=0.3, q_min=1, q_max=5, label='Noise',
+            ))
+        for _ in range(n_fx_fund):
+            fx_traders.append(Fundamentalist(
+                exchange, cash=1e4,
+                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
+                deterministic_venue=deterministic,
+                fundamental_rate=price, fx_gamma=5e-3, fx_q_max=10,
+            ))
+        for _ in range(n_retail):
+            fx_traders.append(Random(
+                exchange, cash=1e4,
+                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
+                deterministic_venue=deterministic,
+                trade_prob=0.4, q_min=1, q_max=2, label='Retail',
+            ))
+        for _ in range(n_institutional):
+            fx_traders.append(Random(
+                exchange, cash=5e4,
+                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
+                deterministic_venue=deterministic,
+                trade_prob=0.15, q_min=15, q_max=50, label='Institutional',
+            ))
+
+        # LP providers
+        lp_cpmm = AMMProvider(cpmm, env, phi1=0.5, phi2=2.0, phi3=1.0)
+        lp_hfmm = AMMProvider(hfmm, env, phi1=0.5, phi2=2.0, phi3=1.0)
+
+        # Arbitrageur
+        arb = AMMArbitrageur(clob, amm_pools)
+
+        # Logger
+        logger = MetricsLogger(
+            Q_grid=[1, 2, 5, 10, 20, 50],
+            slippage_thresholds=[5, 10, 25, 50],
+        )
+
+        return cls(
+            exchange=exchange,
+            clob=clob,
+            amm_pools=amm_pools,
+            env=env,
+            fx_traders=fx_traders,
+            clob_noise=clob_noise,
+            market_maker=mm,
+            lp_providers=[lp_cpmm, lp_hfmm],
+            arbitrageur=arb,
+            logger=logger,
+        )
 
 
 class SimulatorInfo:
