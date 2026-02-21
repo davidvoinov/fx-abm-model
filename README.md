@@ -17,7 +17,7 @@ AgentBasedModel/
   visualization/  # graphs and dashboards
 ```
 
-## Quick starts
+## Quick start
 
 ```bash
 python3 -m venv .venv
