@@ -1,6 +1,8 @@
 # Agent-Based FX Market Model
 
-The project simulates FX market with multiple execution venues (CLOB + AMM), stress scenario and execution metrics.
+The model is an agent-based simulation of the foreign exchange (FX) market in which multiple execution venues - a classical stock market stack (CLOB) and two types of automated market makers (AMMs) - operate simultaneously, competing for the order flow of heterogeneous participants.
+
+
 
 ## Model structure
 
