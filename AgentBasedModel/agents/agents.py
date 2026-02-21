@@ -209,8 +209,8 @@ class Trader:
 
     @property
     def multi_venue(self) -> bool:
-        """True if trader has AMM pools available."""
-        return bool(self.amm_pools) and self.clob is not None
+        """True if trader operates in FX multi-venue mode (even CLOB-only)."""
+        return self.clob is not None
 
     def __str__(self) -> str:
         return f'{self.name} ({self.type})'

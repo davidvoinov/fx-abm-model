@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 from AgentBasedModel.visualization.venue_plots import (
     _avg_finite, _rolling_avg, _shade_stress,
 )
+from AgentBasedModel.visualization import venue_plots as _vp
 
 # Shared palette
 _C = {
@@ -440,6 +441,539 @@ def dashboard_h2(logger: 'MetricsLogger',
 
 
 # ===================================================================
+#  Dashboard 3 — Comparison: With AMM vs Without AMM
+# ===================================================================
+
+def _rolling_return_vol(mid_series, window=20):
+    """Rolling standard deviation of log-returns."""
+    import math as _m
+    returns = []
+    for i in range(1, len(mid_series)):
+        p0, p1 = mid_series[i - 1], mid_series[i]
+        if p0 > 0 and p1 > 0:
+            returns.append(_m.log(p1 / p0))
+        else:
+            returns.append(0.0)
+    vol = []
+    for i in range(len(returns)):
+        start = max(0, i - window + 1)
+        chunk = returns[start:i + 1]
+        if len(chunk) < 2:
+            vol.append(0.0)
+        else:
+            mu = sum(chunk) / len(chunk)
+            var = sum((x - mu) ** 2 for x in chunk) / (len(chunk) - 1)
+            vol.append(var ** 0.5)
+    # Pad to same length as mid_series
+    return [0.0] + vol
+
+
+def dashboard_comparison(logger_amm: 'MetricsLogger',
+                         logger_no_amm: 'MetricsLogger',
+                         out_dir: str = 'output',
+                         rolling: int = 10,
+                         vol_window: int = 20,
+                         stress_start: int = 200) -> str:
+    """
+    4-panel comparison dashboard — With AMM vs Without AMM:
+      (0,0): CLOB Depth [MA]
+      (0,1): Rolling Return Volatility
+      (1,0): CLOB Quoted Spread [MA]
+      (1,1): Market Quality Comparison table
+    """
+    fig = plt.figure(figsize=(16, 10))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.30)
+    fig.suptitle('Comparison  ·  Market Quality With vs Without AMM',
+                 fontsize=15, fontweight='bold', y=0.97)
+
+    n_amm = len(logger_amm.iterations)
+    n_no = len(logger_no_amm.iterations)
+    n = min(n_amm, n_no)
+
+    c_amm = '#2ca02c'    # green solid
+    c_no = '#1f77b4'     # blue dashed
+
+    def _mean(lst):
+        f = [x for x in lst if math.isfinite(x)]
+        return sum(f) / len(f) if f else float('nan')
+
+    # ── (0,0) CLOB Depth ─────────────────────────────────────────────
+    ax = fig.add_subplot(gs[0, 0])
+    ax.set_title(f'CLOB Depth  [MA {rolling}]')
+
+    def _total_depth(logger):
+        return [(d.get('bid', 0) + d.get('ask', 0)) if isinstance(d, dict) else 0
+                for d in logger.clob_depth]
+
+    d_amm = _rolling_avg(_total_depth(logger_amm)[:n], rolling)
+    d_no = _rolling_avg(_total_depth(logger_no_amm)[:n], rolling)
+    ax.plot(d_amm, color=c_amm, lw=1.5, label='With AMM')
+    ax.plot(d_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
+    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Depth (bid + ask)')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.25)
+
+    # ── (0,1) Rolling Return Volatility ──────────────────────────────
+    ax = fig.add_subplot(gs[0, 1])
+    ax.set_title(f'Rolling Return Volatility  (window={vol_window})')
+
+    vol_amm = _rolling_return_vol(logger_amm.clob_mid_series[:n], vol_window)
+    vol_no = _rolling_return_vol(logger_no_amm.clob_mid_series[:n], vol_window)
+    ax.plot(vol_amm, color=c_amm, lw=1.5, label='With AMM')
+    ax.plot(vol_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
+    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('σ(return)')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.25)
+
+    # ── (1,0) CLOB Quoted Spread ─────────────────────────────────────
+    ax = fig.add_subplot(gs[1, 0])
+    ax.set_title(f'CLOB Quoted Spread  [MA {rolling}]')
+
+    s_amm = _rolling_avg(logger_amm.clob_qspr[:n], rolling)
+    s_no = _rolling_avg(logger_no_amm.clob_qspr[:n], rolling)
+    ax.plot(s_amm, color=c_amm, lw=1.5, label='With AMM')
+    ax.plot(s_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
+    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Spread (bps)')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.25)
+
+    # ── (1,1) Market Quality Comparison Table ────────────────────────
+    ax = fig.add_subplot(gs[1, 1])
+    ax.axis('off')
+
+    depth_amm = _total_depth(logger_amm)
+    depth_no = _total_depth(logger_no_amm)
+    vol_amm_all = _rolling_return_vol(logger_amm.clob_mid_series, vol_window)
+    vol_no_all = _rolling_return_vol(logger_no_amm.clob_mid_series, vol_window)
+
+    avg_spr_amm = _mean(logger_amm.clob_qspr)
+    avg_spr_no = _mean(logger_no_amm.clob_qspr)
+    avg_dep_amm = _mean(depth_amm)
+    avg_dep_no = _mean(depth_no)
+    avg_vol_amm = _mean(vol_amm_all)
+    avg_vol_no = _mean(vol_no_all)
+
+    def _delta(a, b):
+        if b == 0 or not math.isfinite(a) or not math.isfinite(b):
+            return 'N/A'
+        return f'{(a - b) / abs(b):+.1%}'
+
+    rows = [
+        ('Avg Spread (bps)', f'{avg_spr_amm:.1f}', f'{avg_spr_no:.1f}',
+         _delta(avg_spr_amm, avg_spr_no)),
+        ('Avg CLOB Depth', f'{avg_dep_amm:.0f}', f'{avg_dep_no:.0f}',
+         _delta(avg_dep_amm, avg_dep_no)),
+        ('Avg Volatility', f'{avg_vol_amm:.4f}', f'{avg_vol_no:.4f}',
+         _delta(avg_vol_amm, avg_vol_no)),
+    ]
+
+    # Header box
+    ax.text(0.5, 0.92, 'Market Quality Comparison',
+            ha='center', va='center', fontsize=13, fontweight='bold',
+            transform=ax.transAxes)
+    ax.text(0.5, 0.86, '=' * 42, ha='center', va='center', fontsize=10,
+            fontfamily='monospace', transform=ax.transAxes)
+
+    col_labels = ['Metric', 'AMM', 'No AMM', 'Delta']
+    tbl = ax.table(
+        cellText=[[r[0], r[1], r[2], r[3]] for r in rows],
+        colLabels=col_labels,
+        loc='center',
+        cellLoc='center',
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(11)
+    tbl.scale(1.0, 1.6)
+    for j in range(4):
+        tbl[0, j].set_facecolor('#4c72b0')
+        tbl[0, j].set_text_props(color='white', fontweight='bold')
+    for i in range(1, len(rows) + 1):
+        color = '#f0f4f8' if i % 2 == 0 else 'white'
+        for j in range(4):
+            tbl[i, j].set_facecolor(color)
+
+    path = os.path.join(out_dir, 'dashboard_comparison.png')
+    fig.savefig(path, dpi=DPI, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
+
+# ===================================================================
+#  Individual comparison plots (each panel from dashboard_comparison)
+# ===================================================================
+
+def save_comparison_individual(logger_amm: 'MetricsLogger',
+                               logger_no_amm: 'MetricsLogger',
+                               out_dir: str = 'output',
+                               rolling: int = 10,
+                               vol_window: int = 20,
+                               stress_start: int = 200) -> list:
+    """Save each panel of dashboard_comparison as a separate PNG."""
+    os.makedirs(out_dir, exist_ok=True)
+    paths: list = []
+
+    n_amm = len(logger_amm.iterations)
+    n_no = len(logger_no_amm.iterations)
+    n = min(n_amm, n_no)
+
+    c_amm = '#2ca02c'
+    c_no = '#1f77b4'
+
+    def _mean(lst):
+        f = [x for x in lst if math.isfinite(x)]
+        return sum(f) / len(f) if f else float('nan')
+
+    def _total_depth(logger):
+        return [(d.get('bid', 0) + d.get('ask', 0)) if isinstance(d, dict) else 0
+                for d in logger.clob_depth]
+
+    def _delta(a, b):
+        if b == 0 or not math.isfinite(a) or not math.isfinite(b):
+            return 'N/A'
+        return f'{(a - b) / abs(b):+.1%}'
+
+    # ── 1. CLOB Depth ────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.set_title(f'CLOB Depth  [MA {rolling}]', fontsize=13)
+    d_amm = _rolling_avg(_total_depth(logger_amm)[:n], rolling)
+    d_no = _rolling_avg(_total_depth(logger_no_amm)[:n], rolling)
+    ax.plot(d_amm, color=c_amm, lw=1.5, label='With AMM')
+    ax.plot(d_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
+    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    ax.set_xlabel('Iteration'); ax.set_ylabel('Depth (bid + ask)')
+    ax.legend(fontsize=11); ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    p = os.path.join(out_dir, 'cmp_clob_depth.png')
+    fig.savefig(p, dpi=DPI, bbox_inches='tight'); plt.close(fig); paths.append(p)
+
+    # ── 2. Rolling Return Volatility ─────────────────────────────────
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.set_title(f'Rolling Return Volatility  (window={vol_window})', fontsize=13)
+    vol_amm = _rolling_return_vol(logger_amm.clob_mid_series[:n], vol_window)
+    vol_no = _rolling_return_vol(logger_no_amm.clob_mid_series[:n], vol_window)
+    ax.plot(vol_amm, color=c_amm, lw=1.5, label='With AMM')
+    ax.plot(vol_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
+    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    ax.set_xlabel('Iteration'); ax.set_ylabel('σ(return)')
+    ax.legend(fontsize=11); ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    p = os.path.join(out_dir, 'cmp_rolling_volatility.png')
+    fig.savefig(p, dpi=DPI, bbox_inches='tight'); plt.close(fig); paths.append(p)
+
+    # ── 3. CLOB Quoted Spread ────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.set_title(f'CLOB Quoted Spread  [MA {rolling}]', fontsize=13)
+    s_amm = _rolling_avg(logger_amm.clob_qspr[:n], rolling)
+    s_no = _rolling_avg(logger_no_amm.clob_qspr[:n], rolling)
+    ax.plot(s_amm, color=c_amm, lw=1.5, label='With AMM')
+    ax.plot(s_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
+    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    ax.set_xlabel('Iteration'); ax.set_ylabel('Spread (bps)')
+    ax.legend(fontsize=11); ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    p = os.path.join(out_dir, 'cmp_quoted_spread.png')
+    fig.savefig(p, dpi=DPI, bbox_inches='tight'); plt.close(fig); paths.append(p)
+
+    # ── 4. Market Quality Comparison Table ───────────────────────────
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.axis('off')
+    ax.set_title('Market Quality Comparison: With vs Without AMM',
+                 fontsize=14, fontweight='bold', pad=12)
+
+    depth_amm = _total_depth(logger_amm)
+    depth_no = _total_depth(logger_no_amm)
+    vol_amm_all = _rolling_return_vol(logger_amm.clob_mid_series, vol_window)
+    vol_no_all = _rolling_return_vol(logger_no_amm.clob_mid_series, vol_window)
+
+    avg_spr_amm = _mean(logger_amm.clob_qspr)
+    avg_spr_no = _mean(logger_no_amm.clob_qspr)
+    avg_dep_amm = _mean(depth_amm)
+    avg_dep_no = _mean(depth_no)
+    avg_vol_amm = _mean(vol_amm_all)
+    avg_vol_no = _mean(vol_no_all)
+
+    rows = [
+        ('Avg Spread (bps)', f'{avg_spr_amm:.1f}', f'{avg_spr_no:.1f}',
+         _delta(avg_spr_amm, avg_spr_no)),
+        ('Avg CLOB Depth', f'{avg_dep_amm:.0f}', f'{avg_dep_no:.0f}',
+         _delta(avg_dep_amm, avg_dep_no)),
+        ('Avg Volatility', f'{avg_vol_amm:.4f}', f'{avg_vol_no:.4f}',
+         _delta(avg_vol_amm, avg_vol_no)),
+    ]
+
+    col_labels = ['Metric', 'AMM', 'No AMM', 'Delta']
+    tbl = ax.table(
+        cellText=[[r[0], r[1], r[2], r[3]] for r in rows],
+        colLabels=col_labels, loc='center', cellLoc='center',
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(12)
+    tbl.scale(1.0, 1.7)
+    for j in range(4):
+        tbl[0, j].set_facecolor('#4c72b0')
+        tbl[0, j].set_text_props(color='white', fontweight='bold')
+    for i in range(1, len(rows) + 1):
+        color = '#f0f4f8' if i % 2 == 0 else 'white'
+        for j in range(4):
+            tbl[i, j].set_facecolor(color)
+    plt.tight_layout()
+    p = os.path.join(out_dir, 'cmp_quality_table.png')
+    fig.savefig(p, dpi=DPI, bbox_inches='tight'); plt.close(fig); paths.append(p)
+
+    return paths
+
+
+# ===================================================================
+#  Standalone figures requested separately
+# ===================================================================
+
+def plot_market_quality_table(logger: 'MetricsLogger',
+                              out_dir: str = 'output',
+                              stress_start: int = 200) -> str:
+    """
+    Market-quality comparison table rendered as an image.
+    Columns: Metric | Normal | Stress | Ratio.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    n = len(logger.iterations)
+    idx = min(stress_start, n)
+
+    # --- collect metrics ---
+    def _mean(lst):
+        f = [x for x in lst if math.isfinite(x)]
+        return sum(f) / len(f) if f else float('nan')
+
+    qspr = logger.clob_qspr
+    depth_total = [(d.get('total', 0) if isinstance(d, dict) else 0)
+                   for d in logger.clob_depth]
+
+    rows = []
+    # Quoted spread
+    n_spr = _mean(qspr[:idx])
+    s_spr = _mean(qspr[idx:])
+    rows.append(('CLOB Quoted Spread (bps)',
+                 f'{n_spr:.1f}', f'{s_spr:.1f}',
+                 f'{s_spr/n_spr:.2f}×' if n_spr > 0 else '—'))
+
+    # CLOB depth
+    n_dep = _mean(depth_total[:idx])
+    s_dep = _mean(depth_total[idx:])
+    rows.append(('CLOB Depth (units)',
+                 f'{n_dep:.0f}', f'{s_dep:.0f}',
+                 f'{s_dep/n_dep:.2f}×' if n_dep > 0 else '—'))
+
+    # Cost Q=5 per venue
+    for v in ['clob'] + list(logger.amm_cost_curves.keys()):
+        s = logger.cost_series(v, 5)
+        n_c = _mean(s[:idx])
+        s_c = _mean(s[idx:])
+        rows.append((f'{v.upper()} Cost Q=5 (bps)',
+                     f'{n_c:.1f}' if math.isfinite(n_c) else 'N/A',
+                     f'{s_c:.1f}' if math.isfinite(s_c) else 'N/A',
+                     f'{s_c/n_c:.2f}×' if (math.isfinite(n_c) and n_c > 0) else '—'))
+
+    # AMM flow share
+    for v in logger.amm_cost_curves:
+        fs = logger.flow_share(v)
+        n_f = _mean(fs[:idx])
+        s_f = _mean(fs[idx:])
+        rows.append((f'{v.upper()} Flow Share',
+                     f'{n_f:.1%}', f'{s_f:.1%}',
+                     f'{s_f/n_f:.1f}×' if n_f > 0 else '—'))
+
+    # Correlation
+    for v in logger.amm_cost_curves:
+        ba = logger.commonality_before_after('clob', v, Q=5,
+                                             stress_start=stress_start)
+        b_s = f'{ba["before"]:.3f}' if math.isfinite(ba['before']) else 'N/A'
+        a_s = f'{ba["after"]:.3f}' if math.isfinite(ba['after']) else 'N/A'
+        rows.append((f'ρ CLOB↔{v.upper()} (Q=5)', b_s, a_s, ''))
+
+    # --- render table ---
+    col_labels = ['Metric', 'Normal', 'Stress', 'Ratio']
+    cell_text = [[r[0], r[1], r[2], r[3]] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(10, 0.55 * len(rows) + 1.5))
+    ax.axis('off')
+    ax.set_title('Market Quality Comparison: Normal vs Stress',
+                 fontsize=14, fontweight='bold', pad=12)
+
+    tbl = ax.table(cellText=cell_text, colLabels=col_labels,
+                   loc='center', cellLoc='center')
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(11)
+    tbl.scale(1.0, 1.6)
+
+    # Style header
+    for j in range(len(col_labels)):
+        tbl[0, j].set_facecolor('#4c72b0')
+        tbl[0, j].set_text_props(color='white', fontweight='bold')
+    # Alternate row colors
+    for i in range(1, len(rows) + 1):
+        color = '#f0f4f8' if i % 2 == 0 else 'white'
+        for j in range(len(col_labels)):
+            tbl[i, j].set_facecolor(color)
+
+    path = os.path.join(out_dir, 'market_quality_table.png')
+    fig.savefig(path, dpi=DPI, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
+
+def plot_clob_depth(logger: 'MetricsLogger',
+                    out_dir: str = 'output',
+                    rolling: int = 10) -> str:
+    """CLOB order-book depth (bid + ask) over time."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    n = len(logger.iterations)
+    bid_d = [(d.get('bid', 0) if isinstance(d, dict) else 0)
+             for d in logger.clob_depth]
+    ask_d = [(d.get('ask', 0) if isinstance(d, dict) else 0)
+             for d in logger.clob_depth]
+    bid_r = _rolling_avg(bid_d, rolling)
+    ask_r = _rolling_avg(ask_d, rolling)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    title = 'CLOB Order-Book Depth (Bid + Ask)'
+    if rolling > 1:
+        title += f'  [MA {rolling}]'
+    ax.set_title(title, fontsize=13)
+    ax.fill_between(range(n), 0, bid_r, alpha=0.5, label='Bid depth',
+                     color='#2ca02c')
+    ax.fill_between(range(n), 0, [-a for a in ask_r], alpha=0.5,
+                     label='Ask depth', color='#d62728')
+    ax.axhline(0, color='black', lw=0.6)
+    _shade_stress(ax, logger)
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Depth (units)')
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+
+    path = os.path.join(out_dir, 'clob_depth.png')
+    fig.savefig(path, dpi=DPI, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
+
+def plot_quoted_spread(logger: 'MetricsLogger',
+                       out_dir: str = 'output',
+                       rolling: int = 5) -> str:
+    """CLOB quoted spread with mean-line annotations for normal/stress."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    qspr = logger.clob_qspr
+    s = _rolling_avg(qspr, rolling)
+    n = len(s)
+
+    # Regime split
+    regimes = logger.regime_series
+    normal_vals = [v for v, r in zip(qspr, regimes) if r != 'stress' and math.isfinite(v)]
+    stress_vals = [v for v, r in zip(qspr, regimes) if r == 'stress' and math.isfinite(v)]
+    avg_n = sum(normal_vals) / len(normal_vals) if normal_vals else 0
+    avg_s = sum(stress_vals) / len(stress_vals) if stress_vals else 0
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    title = 'CLOB Quoted Spread'
+    if rolling > 1:
+        title += f'  [MA {rolling}]'
+    ax.set_title(title, fontsize=13)
+    ax.plot(s, color='black', linewidth=1)
+    _shade_stress(ax, logger)
+
+    # Mean lines
+    ax.axhline(avg_n, color=_C['normal'], ls='--', lw=1.2,
+               label=f'Normal mean = {avg_n:.1f} bps')
+    if stress_vals:
+        ax.axhline(avg_s, color=_C['stress'], ls='--', lw=1.2,
+                   label=f'Stress mean = {avg_s:.1f} bps')
+
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Spread (bps)')
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+
+    path = os.path.join(out_dir, 'quoted_spread.png')
+    fig.savefig(path, dpi=DPI, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
+
+def plot_h1_summary_table(logger: 'MetricsLogger',
+                          out_dir: str = 'output') -> str:
+    """
+    H1 summary table as image: avg cost per venue per Q + flow shares + trade count.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    summary = logger.summary()
+    Q_grid = logger.Q_grid
+    venues = ['clob'] + list(logger.amm_cost_curves.keys())
+
+    # --- Cost rows ---
+    col_labels = ['Q'] + [v.upper() for v in venues]
+    cost_rows = []
+    for q in Q_grid:
+        row = [str(int(q))]
+        for v in venues:
+            val = summary.get(f'avg_cost_{v}_Q{q}', float('nan'))
+            row.append(f'{val:.1f}' if math.isfinite(val) else 'N/A')
+        cost_rows.append(row)
+
+    # --- Flow share row ---
+    flow_row = ['Flow %']
+    for v in venues:
+        fs = summary.get(f'avg_flow_share_{v}', 0)
+        flow_row.append(f'{fs:.1%}')
+
+    # --- Meta ---
+    n_iter = summary.get('n_iterations', 0)
+    n_trades = summary.get('n_trades', 0)
+
+    all_rows = cost_rows + [flow_row]
+
+    fig, ax = plt.subplots(figsize=(8, 0.55 * len(all_rows) + 2.2))
+    ax.axis('off')
+    ax.set_title(f'H1 · Average Execution Cost (bps) & Flow Share\n'
+                 f'Iterations: {n_iter}  |  Trades: {n_trades}',
+                 fontsize=13, fontweight='bold', pad=14)
+
+    tbl = ax.table(cellText=all_rows, colLabels=col_labels,
+                   loc='center', cellLoc='center')
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(12)
+    tbl.scale(1.0, 1.7)
+
+    n_cols = len(col_labels)
+    # Header
+    for j in range(n_cols):
+        tbl[0, j].set_facecolor('#4c72b0')
+        tbl[0, j].set_text_props(color='white', fontweight='bold')
+    # Flow share row highlight
+    flow_idx = len(cost_rows) + 1  # +1 for header
+    for j in range(n_cols):
+        tbl[flow_idx, j].set_facecolor('#e8f0fe')
+        tbl[flow_idx, j].set_text_props(fontweight='bold')
+    # Alternate cost rows
+    for i in range(1, len(cost_rows) + 1):
+        color = '#f0f4f8' if i % 2 == 0 else 'white'
+        for j in range(n_cols):
+            tbl[i, j].set_facecolor(color)
+
+    path = os.path.join(out_dir, 'h1_summary_table.png')
+    fig.savefig(path, dpi=DPI, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
+
+# ===================================================================
 #  Convenience wrapper
 # ===================================================================
 
@@ -447,7 +981,8 @@ def generate_all_dashboards(logger: 'MetricsLogger',
                             out_dir: str = 'output',
                             stress_start: int = 200,
                             Q: float = 5,
-                            rolling: int = 10) -> list:
+                            rolling: int = 10,
+                            logger_no_amm: 'MetricsLogger' = None) -> list:
     """Generate all dashboards, return list of file paths."""
     os.makedirs(out_dir, exist_ok=True)
 
@@ -457,4 +992,95 @@ def generate_all_dashboards(logger: 'MetricsLogger',
         dashboard_h2(logger, out_dir=out_dir, Q=Q, rolling=rolling,
                      stress_start=stress_start),
     ]
+    if logger_no_amm is not None:
+        paths.append(dashboard_comparison(
+            logger, logger_no_amm,
+            out_dir=out_dir, rolling=rolling, stress_start=stress_start,
+        ))
     return paths
+
+
+# ===================================================================
+#  Individual plot saver
+# ===================================================================
+
+def save_all_individual_plots(logger: 'MetricsLogger',
+                              out_dir: str = 'output',
+                              stress_start: int = 200,
+                              Q: float = 5,
+                              rolling: int = 10,
+                              logger_no_amm: 'MetricsLogger' = None) -> list:
+    """Call every venue_plots function, intercept plt.show → savefig."""
+    os.makedirs(out_dir, exist_ok=True)
+    saved: list = []
+
+    # Map: (function, kwargs, filename)
+    plot_calls = [
+        # Context
+        (_vp.plot_environment,              {},                                      'environment'),
+        (_vp.plot_fx_price,                 {'rolling': rolling},                    'fx_price'),
+        (_vp.plot_clob_spread,              {'rolling': rolling},                    'clob_spread'),
+        # H1
+        (_vp.plot_execution_cost_curves,    {},                                      'h1_cost_curves'),
+        (_vp.plot_cost_decomposition,       {'Q': Q},                                'h1_cost_decomposition'),
+        (_vp.plot_total_market_depth,       {'rolling': rolling},                    'h1_total_depth'),
+        # H2
+        (_vp.plot_cost_timeseries,          {'Q': Q, 'rolling': rolling},            'h2_cost_timeseries'),
+        (_vp.plot_flow_allocation,          {'rolling': rolling},                    'h2_flow_allocation'),
+        (_vp.plot_clob_spread_vs_amm_cost,  {'Q': Q, 'rolling': rolling},           'h2_spread_vs_amm'),
+        (_vp.plot_commonality,              {'Q': Q, 'window': 30},                 'h2_commonality'),
+        (_vp.plot_amm_liquidity,            {},                                      'h2_amm_liquidity'),
+        (_vp.plot_stress_flow_migration,    {'stress_start': stress_start},          'h2_stress_migration'),
+        # Auxiliary
+        (_vp.plot_amm_reserves,             {'pool_name': 'cpmm'},                  'aux_cpmm_reserves'),
+        (_vp.plot_amm_reserves,             {'pool_name': 'hfmm'},                  'aux_hfmm_reserves'),
+        (_vp.plot_volume_slippage_profile,  {'pool_name': 'cpmm'},                  'aux_cpmm_vol_slip'),
+        (_vp.plot_volume_slippage_profile,  {'pool_name': 'hfmm'},                  'aux_hfmm_vol_slip'),
+    ]
+
+    # Direct-save plots (they handle savefig internally)
+    direct_saves = [
+        (plot_market_quality_table, {'stress_start': stress_start}),
+        (plot_clob_depth,           {'rolling': rolling}),
+        (plot_quoted_spread,        {'rolling': rolling}),
+        (plot_h1_summary_table,     {}),
+    ]
+    for fn, kw in direct_saves:
+        try:
+            p = fn(logger, out_dir=out_dir, **kw)
+            saved.append(p)
+        except Exception as exc:
+            print(f'  ⚠ {fn.__name__}: {exc}')
+
+    # Temporarily replace plt.show so the plot functions save instead
+    _real_show = plt.show
+
+    for fn, kwargs, fname in plot_calls:
+        # Intercept show: grab current figure, save, close
+        path = os.path.join(out_dir, f'{fname}.png')
+
+        def _save_show():
+            fig = plt.gcf()
+            fig.savefig(path, dpi=DPI, bbox_inches='tight')
+            plt.close(fig)
+
+        plt.show = _save_show  # type: ignore[assignment]
+        try:
+            fn(logger, **kwargs)
+        except Exception as exc:
+            print(f'  ⚠ {fname}: {exc}')
+            continue
+        finally:
+            plt.show = _real_show  # type: ignore[assignment]
+
+        saved.append(path)
+
+    # ── Comparison individual plots (With vs Without AMM) ────────────
+    if logger_no_amm is not None:
+        cmp_paths = save_comparison_individual(
+            logger, logger_no_amm,
+            out_dir=out_dir, rolling=rolling, stress_start=stress_start,
+        )
+        saved.extend(cmp_paths)
+
+    return saved
