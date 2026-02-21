@@ -1,6 +1,6 @@
 # Agent-Based FX Market Model
 
-The project simulates FX market with multiple execution venues (CLOB + AM), stress scenario and execution metrics.
+The project simulates FX market with multiple execution venues (CLOB + AMM), stress scenario and execution metrics.
 
 ## Model structure
 
