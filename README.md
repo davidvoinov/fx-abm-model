@@ -1,15 +1,23 @@
 # Agent-Based FX Market Model
 
-Проект моделирует FX-рынок с несколькими площадками исполнения (CLOB + AM), стресс-сценарием и метриками исполнения
+The project simulates FX market with multiple execution venues (CLOB + AM), stress scenario and execution metrics.
 
-## Что внутри
+## Model structure
 
-- `main_fx.py` — основной entrypoint для запуска симуляции и построения графиков
-- `main.py` — перебор конфигураций агентов (исследовательский скрипт)
-- `AgentBasedModel/` — ядро модели: агенты, площадки, симулятор, метрики, визуализация
-- `test_full.py`, `test_theta.py` — smoke/validation-скрипты
+```text
+AgentBasedModel/
+  agents/         # different types of CLOB/AMM traders
+  environment/    # stress periods, exogeneous volatility, funding luquidity
+  events/         # market shocks
+  metrics/        # metrics aggregation
+  simulator/      # arbitary scenarios
+  states/         # market conditions
+  utils/          # math
+  venues/         # CLOB/AMM architecrure
+  visualization/  # graphs and dashboards
+```
 
-## Быстрый старт
+## Quick starts
 
 ```bash
 python3 -m venv .venv
@@ -17,67 +25,3 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python main_fx.py
 ```
-
-## Минимальный сценарий для разработки
-
-```bash
-# запуск основной модели
-python main_fx.py
-
-# проверки/валидация
-python test_theta.py
-python test_full.py
-```
-
-## Regression baseline (сравнение прогонов)
-
-Для сравнения результатов между коммитами используется фиксированный baseline:
-
-- baseline файл: `tests/baselines/fx_regression_baseline.json`
-- сбор текущих метрик: `python -m tests.regression.collect_metrics`
-- проверка против baseline: `python -m tests.regression.compare_baseline`
-
-Если вы осознанно меняете поведение модели и ожидаете новые метрики,
-обновите baseline отдельным коммитом:
-
-```bash
-python -m tests.regression.collect_metrics --write tests/baselines/fx_regression_baseline.json
-```
-
-## Рекомендуемый workflow в команде
-
-1. Создавайте ветку от `main`: `feature/<topic>` или `fix/<topic>`
-2. Делайте маленькие атомарные коммиты
-3. Перед PR прогоняйте локально `python test_theta.py` (и по возможности `test_full.py`)
-4. Открывайте Pull Request в `main` с описанием:
-   - что изменено,
-   - как проверить,
-   - какие метрики/графики затронуты.
-
-## Структура пакета
-
-```text
-AgentBasedModel/
-  agents/         # трейдеры и поведенческие стратегии
-  environment/    # процесс среды/шоки
-  events/         # рыночные события
-  metrics/        # логирование и агрегации метрик
-  simulator/      # симуляторы (общий + FX)
-  states/         # состояние рынка
-  utils/          # математика, ордера
-  venues/         # CLOB и AMM-механизмы
-  visualization/  # графики и аналитика
-```
-
-## Публикация на GitHub
-
-```bash
-git init
-git add .
-git commit -m "Initial commit: FX ABM model"
-git branch -M main
-git remote add origin https://github.com/<you>/<repo>.git
-git push -u origin main
-```
-
-После публикации добавьте коллег в `Settings → Collaborators` и включите branch protection для `main` (merge только через PR).
