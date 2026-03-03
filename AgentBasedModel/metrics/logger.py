@@ -52,6 +52,7 @@ class MetricsLogger:
 
         # Prices
         self.clob_mid_series: List[float] = []
+        self.fair_price_series: List[float] = []   # exogenous S_t (GBM)
         # {pool_name: [mid_price_per_iter]}
         self.amm_mid_series: Dict[str, List[float]] = {}
 
@@ -138,6 +139,10 @@ class MetricsLogger:
         self.clob_qspr.append(clob.quoted_spread_bps())
         self.clob_depth.append(clob.total_depth())
 
+        # Exogenous fair price (GBM) — authoritative when available
+        fp = getattr(env, 'fair_price', None)
+        self.fair_price_series.append(fp if fp is not None else clob_mid)
+
         # CLOB cost curves
         for Q in self.Q_grid:
             q_info = clob.quote_buy(Q)
@@ -145,8 +150,8 @@ class MetricsLogger:
             self.clob_espr_curves[Q].append(q_info.get('espr_bps', 0))
             self.clob_impact_curves[Q].append(q_info.get('impact_bps', 0))
 
-        # AMM metrics
-        S_t = clob_mid
+        # AMM metrics — use fair price as reference when available
+        S_t = fp if fp is not None else clob_mid
         for name, pool in amm_pools.items():
             self._ensure_pool(name)
             self.amm_mid_series[name].append(pool.mid_price())

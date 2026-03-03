@@ -30,7 +30,7 @@ def build_snapshot() -> dict:
         stress_start=40,
         stress_end=90,
         price=100,
-        beta=1.0,
+        amm_share_pct=25.0,
         deterministic=True,
     )
     sim.simulate(N_ITER, silent=True)

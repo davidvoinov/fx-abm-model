@@ -54,7 +54,7 @@ sim = Simulator.default_fx(
     c_low=0.001,
     c_high=0.02,
     price=PRICE,
-    beta=1.0,
+    amm_share_pct=25.0,
 )
 sim.simulate(N_ITER, silent=False)
 logger = sim.logger

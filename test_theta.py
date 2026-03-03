@@ -12,7 +12,7 @@ sim = Simulator.default_fx(
     n_retail=10, n_institutional=3,
     cpmm_reserves=500, hfmm_reserves=500,
     stress_start=200, stress_end=350,
-    price=100, beta=1.0
+    price=100, amm_share_pct=25.0
 )
 sim.simulate(300, silent=False)
 

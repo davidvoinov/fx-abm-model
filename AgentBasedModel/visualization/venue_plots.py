@@ -375,8 +375,9 @@ def plot_stress_flow_migration(logger: 'MetricsLogger',
     ax.set_xticks(x_pos)
     ax.set_xticklabels([v.upper() for v in venues])
     ax.set_ylabel('Share of Total Volume')
-    ax.set_ylim(0, max(max(before_shares.values(), default=0),
-                        max(stress_shares.values(), default=0)) * 1.4)
+    mx = max(max(before_shares.values(), default=0),
+             max(stress_shares.values(), default=0))
+    ax.set_ylim(0, mx * 1.4 if mx > 0 else 0.1)
 
     # Add value labels
     for bar in bars1:
@@ -481,6 +482,11 @@ def plot_volume_slippage_profile(logger: 'MetricsLogger',
     ax.set_ylabel('Max trade size  $Q$')
 
     if pool_name not in logger.amm_vol_slip:
+        ax.text(0.5, 0.5, f'No {pool_name.upper()} pool in this run',
+                ha='center', va='center', transform=ax.transAxes,
+                fontsize=12, color='grey')
+        plt.tight_layout()
+        plt.show()
         return
 
     thresholds = logger.slippage_thresholds

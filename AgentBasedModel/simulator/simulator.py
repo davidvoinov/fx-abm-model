@@ -34,10 +34,16 @@ class Simulator:
                  lp_providers: List[AMMProvider] = None,
                  arbitrageur: AMMArbitrageur = None,
                  logger: Any = None,
+                 shock_iter: Optional[int] = None,
+                 shock_pct: float = -20.0,
                  ):
         self.exchange = exchange
         self.events = [event.link(self) for event in events] if events else None
         self.traders = traders  # used in classic mode (+ SimulatorInfo)
+
+        # Price shock (multi-venue mode)
+        self.shock_iter = shock_iter
+        self.shock_pct = shock_pct
 
         # Multi-venue
         self.clob = clob
@@ -88,7 +94,8 @@ class Simulator:
                     event.call(it)
 
             # Capture info
-            self.info.capture()
+            if self.info is not None:
+                self.info.capture()
 
             # Behaviour changes (Universalist / Chartist)
             for trader in self.traders:
@@ -111,7 +118,29 @@ class Simulator:
     # ---- multi-venue loop -----------------------------------------------
 
     def _simulate_multi(self, n_iter: int, silent: bool) -> Simulator:
+        from itertools import chain as _chain
+
         for t in tqdm(range(n_iter), desc='Simulation', disable=silent):
+
+            # 0. Price shock
+            if self.shock_iter is not None and t == self.shock_iter:
+                # Apply to exogenous fair price
+                if self.env is not None:
+                    self.env.apply_shock(self.shock_pct)
+
+                # Also shift CLOB orders (live book only)
+                if self.exchange is not None:
+                    try:
+                        mid = self.exchange.price()
+                    except Exception:
+                        mid = 100.0
+                    dp = mid * (self.shock_pct / 100.0)
+                    for order in _chain(*self.exchange.order_book.values()):
+                        order.price = round(order.price + dp, 2)
+                    if self.mm is not None:
+                        self.mm.call()
+                    for tr in self.clob_noise[:3]:
+                        tr.call()
 
             # 1. Environment step → σ_t, c_t
             if self.env is not None:
@@ -185,81 +214,173 @@ class Simulator:
                    c_low: float = 0.001,
                    c_high: float = 0.02,
                    price: float = 100.0,
-                   beta: float = 1.0,
+                   amm_share_pct: float = 25.0,
                    deterministic: bool = False,
+                   # ── intra-AMM venue selection ────────────────
+                   beta_amm: float = 0.05,
+                   cpmm_bias_bps: float = 5.0,
+                   cost_noise_std: float = 1.5,
+                   # ── venue configuration ──────────────────────
+                   enable_clob_mm: bool = True,
+                   enable_amm: bool = True,
+                   clob_liq: float = 1.0,
+                   amm_liq: float = 1.0,
+                   shock_iter: Optional[int] = None,
+                   shock_pct: float = -20.0,
                    ) -> Simulator:
-        """Build a ready-to-run multi-venue FX simulator with sensible defaults."""
+        """
+        Build a ready-to-run multi-venue FX simulator.
+
+        Venue configuration
+        -------------------
+        enable_clob_mm : bool
+            If False, no MarketMaker quotes on the CLOB.
+        enable_amm : bool
+            If False, no AMM pools / LP / arbitrageur are created.
+        clob_liq : float  (0 … ∞, default 1.0)
+            Multiplier that scales CLOB-side liquidity:
+            ``clob_volume``, ``n_noise``, and MM depth params ``d0``
+            are all multiplied by this factor.
+        amm_liq : float  (0 … ∞, default 1.0)
+            Multiplier that scales AMM-side liquidity:
+            ``cpmm_reserves`` and ``hfmm_reserves`` are multiplied
+            by this factor.
+
+        Flow allocation
+        ---------------
+        amm_share_pct : float (0–100, default 25)
+            Target probability (%) of routing a trade to AMM vs CLOB.
+            E.g. 25 means ~25% AMM, ~75% CLOB.
+
+        Intra-AMM venue selection
+        -------------------------
+        beta_amm : float
+            Logit sensitivity for CPMM vs HFMM choice (lower → more
+            uniform; higher → cost-driven).  Default 0.3.
+        cpmm_bias_bps : float
+            Non-monetary utility discount subtracted from perceived
+            CPMM cost (bps).  Models convenience / accessibility.
+        cost_noise_std : float
+            Std of Gaussian noise added to AMM cost estimates (bps).
+            Models imperfect information about pool costs.
+
+        Convenience shortcuts
+        ---------------------
+        * **CLOB-only**:  ``enable_amm=False``
+        * **AMM-only**:   ``enable_clob_mm=False, clob_liq=0.1``
+          In this mode a **ShadowCLOB** replaces the live book: the
+          CLOB never depletes and arb/metrics use the exogenous
+          GBM fair price S_t.
+        * **70/30 CLOB-heavy**: ``clob_liq=1.4, amm_liq=0.6``
+        """
         from AgentBasedModel.venues.amm import CPMMPool, HFMMPool
-        from AgentBasedModel.venues.clob import CLOBVenue
+        from AgentBasedModel.venues.clob import CLOBVenue, ShadowCLOB
         from AgentBasedModel.environment.processes import MarketEnvironment
         from AgentBasedModel.metrics.logger import MetricsLogger
 
-        # Exchange (CLOB) — moderate depth FX book
-        exchange = ExchangeAgent(price=price, std=clob_std, volume=clob_volume)
+        # ── Decide CLOB mode ────────────────────────────────────────
+        # "Shadow" mode: no live MM, thin CLOB → use ShadowCLOB for
+        # metrics and arb reference, keep tiny live book for backward
+        # compatibility with agents that still need exchange.price().
+        shadow_clob = (enable_amm and not enable_clob_mm)
 
-        # AMM pools
-        cpmm = CPMMPool(x=cpmm_reserves, y=cpmm_reserves * price, fee=cpmm_fee)
-        hfmm = HFMMPool(x=hfmm_reserves, y=hfmm_reserves * price,
-                         A=hfmm_A, fee=hfmm_fee, rate=price)
+        # ── Apply liquidity scaling ──────────────────────────────────
+        eff_clob_volume = max(10, int(clob_volume * clob_liq))
+        eff_n_noise = max(1, int(n_noise * clob_liq))
+        eff_d0 = 50.0 * clob_liq
+        eff_cpmm_res = cpmm_reserves * amm_liq
+        eff_hfmm_res = hfmm_reserves * amm_liq
 
-        # Wrap CLOB
-        clob = CLOBVenue(exchange)
+        # Exchange (CLOB) — always present (reference price + classic agents)
+        exchange = ExchangeAgent(price=price, std=clob_std,
+                                 volume=eff_clob_volume)
 
-        # Environment
+        # Environment — always pass price so GBM S_t is available
         env = MarketEnvironment(
             sigma_low=sigma_low, sigma_high=sigma_high,
             c_low=c_low, c_high=c_high,
             stress_start=stress_start, stress_end=stress_end,
             mode='piecewise',
+            price=price,
         )
 
-        amm_pools = {'cpmm': cpmm, 'hfmm': hfmm}
+        # CLOB wrapper: live or shadow
+        if shadow_clob:
+            clob = ShadowCLOB(env)
+        else:
+            clob = CLOBVenue(exchange)
 
-        # CLOB noise traders (keep the book alive)
-        clob_noise = [Random(exchange, cash=1e4) for _ in range(n_noise)]
+        # ── AMM pools (optional) ────────────────────────────────────
+        amm_pools: Dict[str, Any] = {}
+        lp_providers: List = []
+        arb = None
 
-        # Market maker — σ/c-dependent spread (Brunnermeier-Pedersen)
-        mm = MarketMaker(exchange, cash=1e4, env=env,
-                         alpha0=3.0, alpha1=300.0, alpha2=200.0,
-                         d0=50.0, d1=500.0, d2=250.0, d_min=5.0)
+        if enable_amm:
+            cpmm = CPMMPool(x=eff_cpmm_res,
+                            y=eff_cpmm_res * price, fee=cpmm_fee)
+            hfmm = HFMMPool(x=eff_hfmm_res,
+                            y=eff_hfmm_res * price,
+                            A=hfmm_A, fee=hfmm_fee, rate=price)
+            amm_pools = {'cpmm': cpmm, 'hfmm': hfmm}
+            lp_providers = [
+                AMMProvider(cpmm, env, phi1=0.5, phi2=2.0, phi3=1.0),
+                AMMProvider(hfmm, env, phi1=0.5, phi2=2.0, phi3=1.0),
+            ]
+            arb = AMMArbitrageur(clob, amm_pools, env=env)
 
-        # Liquidity takers with venue routing
+        # ── CLOB noise traders (keep the book alive) ────────────────
+        clob_noise = [Random(exchange, cash=1e4)
+                      for _ in range(eff_n_noise)]
+
+        # ── Market Maker (optional) ─────────────────────────────────
+        mm = None
+        if enable_clob_mm:
+            mm = MarketMaker(exchange, cash=1e4, env=env,
+                             alpha0=3.0, alpha1=300.0, alpha2=200.0,
+                             d0=eff_d0, d1=500.0, d2=250.0, d_min=5.0)
+
+        # ── Liquidity takers with venue routing ─────────────────────
         fx_traders: List = []
         for _ in range(n_fx_takers):
             fx_traders.append(Random(
                 exchange, cash=1e4,
-                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
+                clob=clob, amm_pools=amm_pools, env=env,
+                amm_share_pct=amm_share_pct,
                 deterministic_venue=deterministic,
+                beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
+                cost_noise_std=cost_noise_std,
                 trade_prob=0.3, q_min=1, q_max=5, label='Noise',
             ))
         for _ in range(n_fx_fund):
             fx_traders.append(Fundamentalist(
                 exchange, cash=1e4,
-                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
+                clob=clob, amm_pools=amm_pools, env=env,
+                amm_share_pct=amm_share_pct,
                 deterministic_venue=deterministic,
+                beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
+                cost_noise_std=cost_noise_std,
                 fundamental_rate=price, fx_gamma=5e-3, fx_q_max=10,
             ))
         for _ in range(n_retail):
             fx_traders.append(Random(
                 exchange, cash=1e4,
-                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
+                clob=clob, amm_pools=amm_pools, env=env,
+                amm_share_pct=amm_share_pct,
                 deterministic_venue=deterministic,
+                beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
+                cost_noise_std=cost_noise_std,
                 trade_prob=0.4, q_min=1, q_max=2, label='Retail',
             ))
         for _ in range(n_institutional):
             fx_traders.append(Random(
                 exchange, cash=5e4,
-                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
+                clob=clob, amm_pools=amm_pools, env=env,
+                amm_share_pct=amm_share_pct,
                 deterministic_venue=deterministic,
+                beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
+                cost_noise_std=cost_noise_std,
                 trade_prob=0.15, q_min=15, q_max=50, label='Institutional',
             ))
-
-        # LP providers
-        lp_cpmm = AMMProvider(cpmm, env, phi1=0.5, phi2=2.0, phi3=1.0)
-        lp_hfmm = AMMProvider(hfmm, env, phi1=0.5, phi2=2.0, phi3=1.0)
-
-        # Arbitrageur
-        arb = AMMArbitrageur(clob, amm_pools)
 
         # Logger
         logger = MetricsLogger(
@@ -275,101 +396,18 @@ class Simulator:
             fx_traders=fx_traders,
             clob_noise=clob_noise,
             market_maker=mm,
-            lp_providers=[lp_cpmm, lp_hfmm],
+            lp_providers=lp_providers,
             arbitrageur=arb,
             logger=logger,
+            shock_iter=shock_iter,
+            shock_pct=shock_pct,
         )
 
     @classmethod
-    def default_fx_no_amm(cls,
-                          n_noise: int = 30,
-                          n_fx_takers: int = 15,
-                          n_fx_fund: int = 5,
-                          n_retail: int = 10,
-                          n_institutional: int = 3,
-                          clob_std: float = 2.0,
-                          clob_volume: int = 1000,
-                          stress_start: Optional[int] = 200,
-                          stress_end: Optional[int] = 350,
-                          sigma_low: float = 0.01,
-                          sigma_high: float = 0.05,
-                          c_low: float = 0.001,
-                          c_high: float = 0.02,
-                          price: float = 100.0,
-                          beta: float = 1.0,
-                          deterministic: bool = False,
-                          ) -> Simulator:
-        """Build a CLOB-only FX simulator (no AMM pools) for counterfactual comparison."""
-        from AgentBasedModel.venues.clob import CLOBVenue
-        from AgentBasedModel.environment.processes import MarketEnvironment
-        from AgentBasedModel.metrics.logger import MetricsLogger
-
-        exchange = ExchangeAgent(price=price, std=clob_std, volume=clob_volume)
-        clob = CLOBVenue(exchange)
-
-        env = MarketEnvironment(
-            sigma_low=sigma_low, sigma_high=sigma_high,
-            c_low=c_low, c_high=c_high,
-            stress_start=stress_start, stress_end=stress_end,
-            mode='piecewise',
-        )
-
-        amm_pools: Dict[str, Any] = {}   # empty — no AMMs
-
-        clob_noise = [Random(exchange, cash=1e4) for _ in range(n_noise)]
-
-        mm = MarketMaker(exchange, cash=1e4, env=env,
-                         alpha0=3.0, alpha1=300.0, alpha2=200.0,
-                         d0=50.0, d1=500.0, d2=250.0, d_min=5.0)
-
-        # All traders route to CLOB only (amm_pools is empty dict)
-        fx_traders: List = []
-        for _ in range(n_fx_takers):
-            fx_traders.append(Random(
-                exchange, cash=1e4,
-                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
-                deterministic_venue=deterministic,
-                trade_prob=0.3, q_min=1, q_max=5, label='Noise',
-            ))
-        for _ in range(n_fx_fund):
-            fx_traders.append(Fundamentalist(
-                exchange, cash=1e4,
-                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
-                deterministic_venue=deterministic,
-                fundamental_rate=price, fx_gamma=5e-3, fx_q_max=10,
-            ))
-        for _ in range(n_retail):
-            fx_traders.append(Random(
-                exchange, cash=1e4,
-                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
-                deterministic_venue=deterministic,
-                trade_prob=0.4, q_min=1, q_max=2, label='Retail',
-            ))
-        for _ in range(n_institutional):
-            fx_traders.append(Random(
-                exchange, cash=5e4,
-                clob=clob, amm_pools=amm_pools, env=env, beta=beta,
-                deterministic_venue=deterministic,
-                trade_prob=0.15, q_min=15, q_max=50, label='Institutional',
-            ))
-
-        logger = MetricsLogger(
-            Q_grid=[1, 2, 5, 10, 20, 50],
-            slippage_thresholds=[5, 10, 25, 50],
-        )
-
-        return cls(
-            exchange=exchange,
-            clob=clob,
-            amm_pools=amm_pools,
-            env=env,
-            fx_traders=fx_traders,
-            clob_noise=clob_noise,
-            market_maker=mm,
-            lp_providers=[],
-            arbitrageur=None,
-            logger=logger,
-        )
+    def default_fx_no_amm(cls, **kwargs) -> Simulator:
+        """Shortcut: CLOB-only FX simulator (no AMM)."""
+        kwargs.setdefault('enable_amm', False)
+        return cls.default_fx(**kwargs)
 
 
 class SimulatorInfo:

@@ -174,8 +174,11 @@ class Trader:
                  clob: CLOBVenue = None,
                  amm_pools: Dict[str, CPMMPool | HFMMPool] = None,
                  env: MarketEnvironment = None,
-                 beta: float = 1.0,
-                 deterministic_venue: bool = False):
+                 amm_share_pct: float = 25.0,
+                 deterministic_venue: bool = False,
+                 beta_amm: float = 0.05,
+                 cpmm_bias_bps: float = 5.0,
+                 cost_noise_std: float = 1.5):
         """
         Trader that is activated on call to perform action.
 
@@ -185,8 +188,11 @@ class Trader:
         :param clob: CLOBVenue wrapper (enables multi-venue mode)
         :param amm_pools: dict of AMM pools (enables multi-venue mode)
         :param env: MarketEnvironment for σ_t, c_t
-        :param beta: logit sensitivity for venue choice
+        :param amm_share_pct: target probability (0–100) of routing to AMM vs CLOB
         :param deterministic_venue: if True, use argmin instead of logit
+        :param beta_amm: logit sensitivity for intra-AMM choice (CPMM vs HFMM)
+        :param cpmm_bias_bps: non-monetary utility discount applied to CPMM cost (bps)
+        :param cost_noise_std: std of Gaussian noise added to AMM cost estimates (bps)
         """
         self.type = 'Unknown'
         self.name = f'Trader{self.id}'
@@ -203,8 +209,11 @@ class Trader:
         self.clob = clob
         self.amm_pools = amm_pools or {}
         self.env = env
-        self.beta = beta
+        self.amm_share_pct = max(0.0, min(100.0, amm_share_pct))
         self.deterministic_venue = deterministic_venue
+        self.beta_amm = beta_amm
+        self.cpmm_bias_bps = cpmm_bias_bps
+        self.cost_noise_std = cost_noise_std
         self.trades: List[dict] = []
 
     @property
@@ -255,9 +264,15 @@ class Trader:
 
     def estimate_costs(self, Q: float, side: str = 'buy') -> Dict[str, float]:
         """Return {venue_name: cost_bps} for quantity Q."""
-        S_t = self.clob.mid_price()
+        try:
+            S_t = self.clob.mid_price()
+        except Exception:
+            S_t = 100.0  # fallback when book is empty
         costs: Dict[str, float] = {}
-        costs['clob'] = self.clob.cost_bps(Q, side)
+        try:
+            costs['clob'] = self.clob.cost_bps(Q, side)
+        except Exception:
+            costs['clob'] = float('inf')
         for name, pool in self.amm_pools.items():
             try:
                 q = pool.quote_buy(Q, S_t) if side == 'buy' else pool.quote_sell(Q, S_t)
@@ -267,18 +282,63 @@ class Trader:
         return costs
 
     def choose_venue(self, Q: float, side: str = 'buy') -> str:
-        """Select venue: deterministic argmin or logit softmax."""
+        """Two-step venue selection.
+
+        Step 1 — CLOB vs AMM with fixed probability ``amm_share_pct``.
+        Step 2 — within AMM, CPMM vs HFMM (softmax with β_amm),
+            using bias-adjusted and noise-perturbed costs.
+
+        Falls back to CLOB when there are no AMM pools.
+        """
         costs = self.estimate_costs(Q, side)
+
+        # Deterministic shortcut
         if self.deterministic_venue:
             return min(costs, key=costs.get)
+
+        # Identify AMM venues
+        amm_names = [n for n in costs if n != 'clob']
+
+        # If no AMM pools → always CLOB
+        if not amm_names:
+            return 'clob'
+
+        # ── Step 1: CLOB vs AMM (direct probability) ─────────────────
+        if random.random() * 100.0 >= self.amm_share_pct:
+            return 'clob'
+
+        # ── Step 2: within AMM — CPMM vs HFMM ────────────────────────
+        amm_raw_costs = {n: costs[n] for n in amm_names}
+        # Apply bias and noise
+        adj_costs: Dict[str, float] = {}
+        for n, c in amm_raw_costs.items():
+            adj = c
+            # Bias: reduce perceived CPMM cost
+            if n == 'cpmm':
+                adj -= self.cpmm_bias_bps
+            # Noise: estimation error
+            if self.cost_noise_std > 0:
+                adj += random.gauss(0, self.cost_noise_std)
+            adj_costs[n] = adj
+
+        return self._softmax_pick(adj_costs, self.beta_amm)
+
+    # ---- helper ----------------------------------------------------------
+
+    @staticmethod
+    def _softmax_pick(costs: Dict[str, float], beta: float) -> str:
+        """Pick a key from *costs* dict via logit softmax with sensitivity *beta*."""
         items = list(costs.items())
-        min_c = min(c for _, c in items)
+        finite = [c for _, c in items if c != float('inf')]
+        if not finite:
+            return items[0][0]
+        min_c = min(finite)
         weights = []
         for name, c in items:
             if c == float('inf'):
                 weights.append(0.0)
             else:
-                weights.append(_math.exp(-self.beta * (c - min_c)))
+                weights.append(_math.exp(-beta * (c - min_c)))
         total = sum(weights)
         if total == 0:
             return items[0][0]
@@ -321,18 +381,21 @@ class Trader:
 
     def _execute_clob(self, Q: float, side: str) -> dict:
         """Market order on CLOB with cost quoting."""
-        if side == 'buy':
-            quote_info = self.clob.quote_buy(Q)
-            if quote_info['cost_bps'] == float('inf'):
+        try:
+            if side == 'buy':
+                quote_info = self.clob.quote_buy(Q)
+                if quote_info['cost_bps'] == float('inf'):
+                    return quote_info
+                self._buy_market(round(Q))
                 return quote_info
-            self._buy_market(round(Q))
-            return quote_info
-        else:
-            quote_info = self.clob.quote_sell(Q)
-            if quote_info['cost_bps'] == float('inf'):
+            else:
+                quote_info = self.clob.quote_sell(Q)
+                if quote_info['cost_bps'] == float('inf'):
+                    return quote_info
+                self._sell_market(round(Q))
                 return quote_info
-            self._sell_market(round(Q))
-            return quote_info
+        except Exception:
+            return self.clob._inf_quote()
 
     def _make_trade_record(self, venue: str, side: str, Q: float,
                            result: dict, cls_info: dict) -> dict:
@@ -360,8 +423,11 @@ class Random(Trader):
                  clob: CLOBVenue = None,
                  amm_pools: Dict[str, CPMMPool | HFMMPool] = None,
                  env: MarketEnvironment = None,
-                 beta: float = 1.0,
+                 amm_share_pct: float = 25.0,
                  deterministic_venue: bool = False,
+                 beta_amm: float = 0.05,
+                 cpmm_bias_bps: float = 5.0,
+                 cost_noise_std: float = 1.5,
                  # FX-noise-taker params (only used in multi-venue mode)
                  trade_prob: float = 0.3,
                  q_min: int = 1,
@@ -369,7 +435,9 @@ class Random(Trader):
                  label: str = 'Random'):
         super().__init__(market, cash, assets,
                          clob=clob, amm_pools=amm_pools, env=env,
-                         beta=beta, deterministic_venue=deterministic_venue)
+                         amm_share_pct=amm_share_pct, deterministic_venue=deterministic_venue,
+                         beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
+                         cost_noise_std=cost_noise_std)
         self.type = label if self.multi_venue else 'Random'
         self.trade_prob = trade_prob
         self.q_min = q_min
@@ -478,8 +546,11 @@ class Fundamentalist(Trader):
                  clob: CLOBVenue = None,
                  amm_pools: Dict[str, CPMMPool | HFMMPool] = None,
                  env: MarketEnvironment = None,
-                 beta: float = 1.0,
+                 amm_share_pct: float = 25.0,
                  deterministic_venue: bool = False,
+                 beta_amm: float = 0.05,
+                 cpmm_bias_bps: float = 5.0,
+                 cost_noise_std: float = 1.5,
                  # FX-fundamentalist params (used only in multi-venue mode)
                  fundamental_rate: float = 100.0,
                  fx_gamma: float = 5e-3,
@@ -495,7 +566,9 @@ class Fundamentalist(Trader):
         """
         super().__init__(market, cash, assets,
                          clob=clob, amm_pools=amm_pools, env=env,
-                         beta=beta, deterministic_venue=deterministic_venue)
+                         amm_share_pct=amm_share_pct, deterministic_venue=deterministic_venue,
+                         beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
+                         cost_noise_std=cost_noise_std)
         self.type = 'Fundamentalist'
         self.access = access
         self.fundamental_rate = fundamental_rate
@@ -761,15 +834,20 @@ class MarketMaker(Trader):
                  clob: CLOBVenue = None,
                  amm_pools: Dict[str, CPMMPool | HFMMPool] = None,
                  env: MarketEnvironment = None,
-                 beta: float = 1.0,
+                 amm_share_pct: float = 25.0,
                  deterministic_venue: bool = False,
+                 beta_amm: float = 0.05,
+                 cpmm_bias_bps: float = 5.0,
+                 cost_noise_std: float = 1.5,
                  # Brunnermeier-Pedersen params (used when env is set)
                  alpha0: float = 2.0, alpha1: float = 100.0, alpha2: float = 50.0,
                  d0: float = 50.0, d1: float = 200.0, d2: float = 100.0,
                  d_min: float = 5.0):
         super().__init__(market, cash, assets,
                          clob=clob, amm_pools=amm_pools, env=env,
-                         beta=beta, deterministic_venue=deterministic_venue)
+                         amm_share_pct=amm_share_pct, deterministic_venue=deterministic_venue,
+                         beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
+                         cost_noise_std=cost_noise_std)
         self.type = 'Market Maker'
         self.softlimit = softlimit
         self.ul = softlimit
@@ -891,23 +969,144 @@ class AMMProvider:
 class AMMArbitrageur:
     """
     Arbitrageur that trades on AMM pools to align their mid-price with
-    the CLOB reference price S_t (minus a fee-band tolerance).
+    a reference price S_t.
+
+    Reference price cascade
+    -----------------------
+    1. **env.fair_price** — exogenous GBM price (always authoritative
+       when available; used in AMM-only mode).
+    2. **CLOB mid** — if fair_price is absent and book is healthy.
+    3. **Blend** — weighted average of CLOB and AMM consensus when
+       spread is moderately wide.
+    4. **AMM consensus** — pure average of pool mid-prices as last
+       resort.
+
+    Robustness features
+    -------------------
+    * **Max correction cap**: per-iteration price correction is capped
+      at ``max_correction_pct`` to prevent reserve drainage from a
+      single erratic tick.
+    * **Reserve-health guard**: arbitrage is skipped for a pool whose
+      reserve value-ratio is dangerously out of balance.
+    * **HFMM rate update**: after arbitrage the HFMM ``rate`` is
+      re-centered when the mid-price drifts > 1 % from the peg.
     """
 
-    def __init__(self, clob: CLOBVenue,
-                 amm_pools: Dict[str, CPMMPool | HFMMPool]):
+    def __init__(self, clob,
+                 amm_pools: Dict[str, CPMMPool | HFMMPool],
+                 env: MarketEnvironment = None,
+                 max_spread_bps: float = 500.0,
+                 max_correction_pct: float = 2.0):
         self.clob = clob
         self.amm_pools = amm_pools
+        self.env = env
         self.type = 'AMMArbitrageur'
+        self.max_spread_bps = max_spread_bps
+        self.max_correction_pct = max_correction_pct / 100.0
+
+    # ---- helpers ---------------------------------------------------------
+
+    def _amm_consensus(self) -> Optional[float]:
+        """Average mid-price across all AMM pools."""
+        mids = []
+        for p in self.amm_pools.values():
+            try:
+                mids.append(p.mid_price())
+            except Exception:
+                pass
+        return sum(mids) / len(mids) if mids else None
+
+    def _reference_price(self) -> Optional[float]:
+        """
+        Determine the best available reference price.
+
+        Priority:
+        1. env.fair_price (exogenous GBM — always trustworthy)
+        2. CLOB mid (if book is healthy)
+        3. Blend of CLOB + AMM consensus
+        4. Pure AMM consensus
+        """
+        # (1) Exogenous fair price — highest priority
+        if self.env is not None:
+            fp = self.env.fair_price
+            if fp is not None:
+                return fp
+
+        # (2–4) CLOB / blend / AMM fallback
+        S_clob = None
+        try:
+            S_clob = self.clob.mid_price()
+        except Exception:
+            pass
+
+        S_amm = self._amm_consensus()
+
+        if S_clob is None and S_amm is None:
+            return None
+        if S_clob is None:
+            return S_amm
+        if S_amm is None:
+            return S_clob
+
+        # Sanity: if CLOB is implausible relative to AMM (>50 % off)
+        clob_dev = abs(S_clob - S_amm) / S_amm if S_amm > 0 else 0
+        if clob_dev > 0.5:
+            return S_amm
+
+        try:
+            spread_bps = self.clob.quoted_spread_bps()
+        except Exception:
+            spread_bps = float('inf')
+
+        if not _math.isfinite(spread_bps) or spread_bps > 2000:
+            return S_amm
+        if spread_bps > self.max_spread_bps:
+            w = max(0.0, 1.0 - (spread_bps - self.max_spread_bps)
+                    / (2000 - self.max_spread_bps))
+            return w * S_clob + (1.0 - w) * S_amm
+        return S_clob
+
+    @staticmethod
+    def _reserve_healthy(pool, threshold: float = 0.1) -> bool:
+        """Check that pool reserves are not dangerously one-sided."""
+        try:
+            mp = pool.mid_price()
+            if mp <= 0 or pool.x <= 0:
+                return False
+            value_ratio = pool.y / (pool.x * mp)
+            return threshold < value_ratio < (1.0 / threshold)
+        except Exception:
+            return False
+
+    # ---- main entry point ------------------------------------------------
 
     def arbitrage(self):
         """For each AMM pool, align its price to S_t if profitable."""
-        try:
-            S_t = self.clob.mid_price()
-        except Exception:
+        S_t = self._reference_price()
+        if S_t is None:
             return
+
         for name, pool in self.amm_pools.items():
             try:
-                pool.arbitrage_to_target(S_t)
+                # Skip if reserves are dangerously unbalanced
+                if not self._reserve_healthy(pool):
+                    if hasattr(pool, 'update_rate'):
+                        pool.update_rate()
+                    continue
+
+                current = pool.mid_price()
+                if current <= 0:
+                    continue
+                dev = (S_t - current) / current
+                if abs(dev) > self.max_correction_pct:
+                    S_capped = current * (1.0 + _math.copysign(
+                        self.max_correction_pct, dev))
+                else:
+                    S_capped = S_t
+
+                pool.arbitrage_to_target(S_capped)
+
+                if hasattr(pool, 'update_rate'):
+                    pool.update_rate()
             except Exception:
                 pass

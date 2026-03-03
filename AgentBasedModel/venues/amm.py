@@ -231,7 +231,9 @@ class CPMMPool:
             return Q
         else:
             # Pool needs more x → sell base to pool
-            Q = abs(delta_x)
+            # Cap: never drain more than 50 % of quote reserves
+            max_sell = self.y * 0.5 / max(S_t, 1e-9)
+            Q = min(abs(delta_x), max_sell)
             self.execute_sell(Q)
             return -Q
 
@@ -575,9 +577,40 @@ class HFMMPool:
             self.execute_buy(Q)
             return Q
         else:
-            Q = abs(delta)
+            # Cap: never drain more than 50 % of quote reserves
+            max_sell = self.y * 0.5 / max(S_t, 1e-9)
+            Q = min(abs(delta), max_sell)
             self.execute_sell(Q)
             return -Q
+
+    # ---- rate management -------------------------------------------------
+
+    def update_rate(self, threshold: float = 0.01):
+        """
+        Recenter the StableSwap curve around the current mid-price.
+
+        Over time the external price drifts away from the initial ``rate``
+        used to normalise reserves.  This pushes the pool onto the steep
+        part of the invariant curve and makes it behave like a CPMM
+        (losing capital efficiency).
+
+        Calling this method re-derives ``rate`` and ``D`` from the
+        current physical reserves so the curve is once again centered.
+
+        Parameters
+        ----------
+        threshold : float
+            Minimum relative drift |mid − rate| / rate before an update
+            is triggered (default 1 %).  Prevents unnecessary churn.
+        """
+        mp = self.mid_price()
+        if mp <= 0:
+            return
+        if abs(mp - self.rate) / self.rate < threshold:
+            return
+        self.rate = mp
+        self._sync_norm()
+        self.D = _hfmm_get_D(self._xn, self._yn, self.A)
 
     # ---- volume–slippage profile -----------------------------------------
 
