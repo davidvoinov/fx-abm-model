@@ -146,6 +146,13 @@ class Simulator:
             if self.env is not None:
                 self.env.step()
 
+            # 1b. Pre-trade arbitrage — align AMM prices *before* FX
+            #     takers observe quotes.  This second pass (together with
+            #     the post-trade pass in step 7) keeps pool mid-prices
+            #     close to S_t even under high-σ GBM dynamics.
+            if self.arbitrageur is not None:
+                self.arbitrageur.arbitrage()
+
             # 2. CLOB market maker quotes
             if self.mm is not None:
                 self.mm.call()
@@ -202,9 +209,9 @@ class Simulator:
                    n_institutional: int = 3,
                    clob_std: float = 2.0,
                    clob_volume: int = 1000,
-                   cpmm_reserves: float = 500.0,
-                   hfmm_reserves: float = 500.0,
-                   hfmm_A: float = 100.0,
+                   cpmm_reserves: float = 1500.0,
+                   hfmm_reserves: float = 300.0,
+                   hfmm_A: float = 10.0,
                    cpmm_fee: float = 0.003,
                    hfmm_fee: float = 0.001,
                    stress_start: Optional[int] = 200,

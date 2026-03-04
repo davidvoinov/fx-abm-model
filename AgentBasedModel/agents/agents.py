@@ -996,7 +996,7 @@ class AMMArbitrageur:
                  amm_pools: Dict[str, CPMMPool | HFMMPool],
                  env: MarketEnvironment = None,
                  max_spread_bps: float = 500.0,
-                 max_correction_pct: float = 2.0):
+                 max_correction_pct: float = 10.0):
         self.clob = clob
         self.amm_pools = amm_pools
         self.env = env
