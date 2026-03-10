@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-Visual unit-test report — generates diagnostic plots for CLOB, CPMM, HFMM
-and routing, saving them into  output/unit_tests/  as PNG dashboards.
+QA-notebook — diagnostic plots for each unit-test block.
+
+For every block (CLOB, CPMM, HFMM, Routing) the script:
+  1. Runs the same scenarios as run_unit_report.py
+  2. Collects results into pandas DataFrames / CSV
+  3. Builds 1-2 focused diagnostic charts per sub-topic
 
 Run:
     python tests/visualize_unit_tests.py
 """
+
 import sys, os, math, random
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 
 from AgentBasedModel.utils.orders import Order, OrderList
 from AgentBasedModel.agents.agents import ExchangeAgent, Trader
@@ -34,8 +39,7 @@ ACCENT3 = '#4CAF50'
 ACCENT4 = '#E91E63'
 GRAY    = '#9E9E9E'
 
-
-# ─── helpers ──────────────────────────────────────────────────────────
+# --- helpers --------------------------------------------------------------
 
 def _make_exchange(bids, asks):
     ex = ExchangeAgent.__new__(ExchangeAgent)
@@ -58,421 +62,470 @@ def _savefig(fig, name):
     path = os.path.join(OUT_DIR, name)
     fig.savefig(path, dpi=180, bbox_inches='tight', facecolor='white')
     plt.close(fig)
-    print(f"  ✓ saved  {path}")
+    print(f"  saved  {path}")
+
+
+def _save_csv(df, name):
+    path = os.path.join(OUT_DIR, name)
+    df.to_csv(path, index=False)
+    print(f"  csv    {path}")
 
 
 # =====================================================================
-#  1.  CLOB DASHBOARD
+#  1.  CLOB DIAGNOSTICS
 # =====================================================================
 
 def plot_clob():
-    print("\n[CLOB] generating dashboard …")
+    print("\n[CLOB] collecting data & generating plots")
+
+    mid_manual = (99.0 + 101.0) / 2.0   # 100.0
+    qspr_manual = 10_000 * (101.0 - 99.0) / mid_manual  # 200 bps
+
+    # -- 1.1  mid / spread / effective-spread error table ---------------
     ex = _make_exchange(BIDS, ASKS)
     clob = CLOBVenue(ex, f_broker=0.0, f_venue=0.0)
+
+    scenarios_11 = []
+
+    # Scenario 0: basic mid & qspr
+    scenarios_11.append(dict(
+        scenario_id='mid+qspr',
+        mid_code=clob.mid_price(),
+        mid_manual=mid_manual,
+        qspr_code=clob.quoted_spread_bps(),
+        qspr_manual=qspr_manual,
+        espr_code=0.0,
+        espr_manual=0.0,
+    ))
+
+    # Effective spread scenarios: small (Q=5), medium (Q=25), large (Q=60)
+    for label, Q in [('Q=5 (1 lvl)', 5), ('Q=25 (2 lvl)', 25), ('Q=60 (3 lvl)', 60)]:
+        q = clob.quote_buy(Q)
+        if q['cost_bps'] < float('inf'):
+            remaining = Q
+            cost = 0.0
+            for p, v in ASKS:
+                fill = min(remaining, v)
+                cost += fill * p
+                remaining -= fill
+                if remaining <= 0:
+                    break
+            vwap_manual = cost / Q
+            espr_manual = 2 * 10_000 * (vwap_manual - mid_manual) / mid_manual
+            scenarios_11.append(dict(
+                scenario_id=label,
+                mid_code=clob.mid_price(),
+                mid_manual=mid_manual,
+                qspr_code=clob.quoted_spread_bps(),
+                qspr_manual=qspr_manual,
+                espr_code=q['espr_bps'],
+                espr_manual=espr_manual,
+            ))
+
+    df11 = pd.DataFrame(scenarios_11)
+    df11['mid_err'] = df11['mid_code'] - df11['mid_manual']
+    df11['qspr_err'] = df11['qspr_code'] - df11['qspr_manual']
+    df11['espr_err'] = df11['espr_code'] - df11['espr_manual']
+    _save_csv(df11, 'clob_mid_spread.csv')
+
+    # -- 1.2  impact & all-in cost vs Q ---------------------------------
     clob_fee = CLOBVenue(_make_exchange(BIDS, ASKS), f_broker=2.0, f_venue=1.0)
 
-    fig = plt.figure(figsize=(16, 10))
-    gs  = gridspec.GridSpec(2, 3, hspace=0.35, wspace=0.35)
-
-    # --- (a) Order book depth ---
-    ax = fig.add_subplot(gs[0, 0])
-    d = clob.depth(n_levels=3)
-    bid_p = [p for p, _ in d['bid']]
-    bid_v = [v for _, v in d['bid']]
-    ask_p = [p for p, _ in d['ask']]
-    ask_v = [v for _, v in d['ask']]
-    ax.barh(range(len(bid_p)), bid_v, color=ACCENT3, alpha=0.8, label='Bids')
-    ax.set_yticks(range(len(bid_p)))
-    ax.set_yticklabels([f'{p:.0f}' for p in bid_p])
-    ax2 = ax.twinx()
-    ax2.barh(range(len(ask_p)), [-v for v in ask_v], color=ACCENT4, alpha=0.8, label='Asks')
-    ax2.set_yticks(range(len(ask_p)))
-    ax2.set_yticklabels([f'{p:.0f}' for p in ask_p])
-    ax.set_xlabel('Volume')
-    ax.set_title('(a) Order Book Depth')
-    ax.axvline(0, color='k', lw=0.5)
-    mid = clob.mid_price()
-    ax.annotate(f'mid = {mid:.1f}', xy=(0.5, 0.95), xycoords='axes fraction',
-                ha='center', fontsize=9, color=GRAY)
-
-    # --- (b) VWAP curve (buy side) ---
-    ax = fig.add_subplot(gs[0, 1])
-    Qs = np.arange(1, 61)
-    vwaps = []
-    for Q in Qs:
-        q = clob.quote_buy(int(Q))
-        vwaps.append(q['exec_price'] if q['cost_bps'] < float('inf') else np.nan)
-    ax.plot(Qs, vwaps, color=ACCENT, lw=2)
-    ax.axhline(mid, ls='--', color=GRAY, lw=1, label=f'mid = {mid:.0f}')
-    ax.set_xlabel('Buy quantity Q')
-    ax.set_ylabel('VWAP (exec price)')
-    ax.set_title('(b) VWAP vs Quantity')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # --- (c) Half-spread & impact ---
-    ax = fig.add_subplot(gs[0, 2])
-    Qs_c = np.arange(1, 61)
-    half_sp, impact = [], []
-    for Q in Qs_c:
-        q = clob.quote_buy(int(Q))
-        if q['cost_bps'] < float('inf'):
-            half_sp.append(q['half_spread_bps'])
-            impact.append(q['impact_bps'])
-        else:
-            half_sp.append(np.nan)
-            impact.append(np.nan)
-    ax.plot(Qs_c, half_sp, color=ACCENT, lw=2, label='half-spread (bps)')
-    ax.plot(Qs_c, impact, color=ACCENT2, lw=2, label='impact (bps)')
-    ax.set_xlabel('Buy quantity Q')
-    ax.set_ylabel('bps')
-    ax.set_title('(c) Half-Spread & Impact')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # --- (d) All-in cost decomposition (zero fee vs 3 bps fee) ---
-    ax = fig.add_subplot(gs[1, 0])
-    Qs_d = [1, 5, 10, 25, 50]
-    hs_nf, hs_f, fee_v = [], [], []
-    for Q in Qs_d:
+    rows_12 = []
+    for Q in list(range(1, 61)):
         q0 = clob.quote_buy(Q)
-        q1 = clob_fee.quote_buy(Q)
-        h = q0['half_spread_bps'] if q0['cost_bps'] < float('inf') else 0
-        hs_nf.append(h)
-        h1 = q1['half_spread_bps'] if q1['cost_bps'] < float('inf') else 0
-        hs_f.append(h1)
-        fee_v.append(q1['fee_bps'] if q1['cost_bps'] < float('inf') else 0)
-    x = np.arange(len(Qs_d))
+        qf = clob_fee.quote_buy(Q)
+
+        # manual impact
+        consumed = 0
+        new_best_ask = None
+        for idx_a, (p, v) in enumerate(ASKS):
+            consumed += v
+            if consumed > Q:
+                new_best_ask = p
+                break
+            elif consumed == Q:
+                new_best_ask = ASKS[idx_a + 1][0] if idx_a + 1 < len(ASKS) else None
+                break
+        if new_best_ask is None and consumed <= Q:
+            impact_manual = float('nan')
+        elif new_best_ask is None:
+            impact_manual = 0.0
+        else:
+            new_mid = (BIDS[0][0] + new_best_ask) / 2.0
+            impact_manual = 10_000 * (new_mid - mid_manual) / mid_manual
+
+        # manual cost (half_spread + fee)
+        if q0['cost_bps'] < float('inf'):
+            rem = Q
+            total_c = 0.0
+            for p, v in ASKS:
+                fill = min(rem, v)
+                total_c += fill * p
+                rem -= fill
+                if rem <= 0:
+                    break
+            vwap_m = total_c / Q
+            hs_manual = 10_000 * (vwap_m - mid_manual) / mid_manual
+            cost_manual_f = hs_manual + 3.0  # broker 2 + venue 1
+        else:
+            cost_manual_f = float('nan')
+
+        rows_12.append(dict(
+            Q=Q,
+            impact_code=q0['impact_bps'] if q0['cost_bps'] < float('inf') else float('nan'),
+            impact_manual=impact_manual,
+            cost_code=qf['cost_bps'] if qf['cost_bps'] < float('inf') else float('nan'),
+            cost_manual=cost_manual_f if qf['cost_bps'] < float('inf') else float('nan'),
+        ))
+
+    df12 = pd.DataFrame(rows_12)
+    _save_csv(df12, 'clob_impact_cost.csv')
+
+    # -- Charts ---------------------------------------------------------
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('1. CLOB  -  Diagnostic Plots', fontsize=14, weight='bold')
+
+    # (a) mid & qspr errors
+    ax = axes[0, 0]
+    x = np.arange(len(df11))
     w = 0.35
-    ax.bar(x - w/2, hs_nf, w, label='half-spread (no fee)', color=ACCENT, alpha=0.8)
-    ax.bar(x + w/2, hs_f, w, label='half-spread', color=ACCENT3, alpha=0.8)
-    ax.bar(x + w/2, fee_v, w, bottom=hs_f, label='fee (3 bps)', color=ACCENT2, alpha=0.8)
+    ax.bar(x - w/2, df11['mid_err'], w, color=ACCENT, label='mid error')
+    ax.bar(x + w/2, df11['qspr_err'], w, color=ACCENT2, label='qspr error (bps)')
+    ax.axhline(0, color='k', lw=0.5)
     ax.set_xticks(x)
-    ax.set_xticklabels([str(q) for q in Qs_d])
-    ax.set_xlabel('Quantity')
-    ax.set_ylabel('bps')
-    ax.set_title('(d) Cost Decomposition')
-    ax.legend(fontsize=7)
+    ax.set_xticklabels(df11['scenario_id'], fontsize=8, rotation=15)
+    ax.set_ylabel('Error')
+    ax.set_title('1.1a  Mid & Quoted-Spread Error')
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3, axis='y')
 
-    # --- (e) Cumulative depth corridor ---
-    ax = fig.add_subplot(gs[1, 1])
-    bps_range = np.arange(50, 510, 50)
-    bid_depth, ask_depth = [], []
-    for b in bps_range:
-        td = clob.total_depth(bps_from_mid=b)
-        bid_depth.append(td['bid'])
-        ask_depth.append(td['ask'])
-    ax.step(bps_range, bid_depth, color=ACCENT3, lw=2, where='mid', label='bid depth')
-    ax.step(bps_range, ask_depth, color=ACCENT4, lw=2, where='mid', label='ask depth')
-    ax.set_xlabel('Corridor (bps from mid)')
-    ax.set_ylabel('Cumul. depth (units)')
-    ax.set_title('(e) Depth by Corridor')
+    # (b) effective spread error
+    ax = axes[0, 1]
+    df_espr = df11[df11['espr_manual'] != 0].copy()
+    if len(df_espr) > 0:
+        x2 = np.arange(len(df_espr))
+        ax.bar(x2, df_espr['espr_err'].values, color=ACCENT4, alpha=0.8)
+        ax.axhline(0, color='k', lw=0.5)
+        ax.set_xticks(x2)
+        ax.set_xticklabels(df_espr['scenario_id'].values, fontsize=8)
+    ax.set_ylabel('espr_code - espr_manual (bps)')
+    ax.set_title('1.1b  Effective Spread Error by Scenario')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # (c) Impact vs Q
+    ax = axes[1, 0]
+    valid = df12.dropna(subset=['impact_code', 'impact_manual'])
+    ax.plot(valid['Q'], valid['impact_code'], '-', color=ACCENT, lw=2, label='impact (code)')
+    ax.plot(valid['Q'], valid['impact_manual'], '--', color=ACCENT2, lw=2, label='impact (manual)')
+    ax.set_xlabel('Quantity Q')
+    ax.set_ylabel('Impact (bps)')
+    ax.set_title('1.2a  Price Impact vs Q')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # --- (f) Summary stats table ---
-    ax = fig.add_subplot(gs[1, 2])
-    ax.axis('off')
-    rows = [
-        ['Mid-price', f'{mid:.2f}'],
-        ['Quoted spread', f'{clob.quoted_spread_bps():.0f} bps'],
-        ['Best bid / ask', f'{BIDS[0][0]:.0f} / {ASKS[0][0]:.0f}'],
-        ['Total bid depth', f'{sum(v for _,v in BIDS):.0f}'],
-        ['Total ask depth', f'{sum(v for _,v in ASKS):.0f}'],
-        ['Fee (broker+venue)', '0 / 3 bps'],
-    ]
-    tbl = ax.table(cellText=rows, colLabels=['Metric', 'Value'],
-                   loc='center', cellLoc='left')
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(10)
-    tbl.scale(1.0, 1.6)
-    for (r, c), cell in tbl.get_celld().items():
-        if r == 0:
-            cell.set_facecolor('#E3F2FD')
-            cell.set_text_props(weight='bold')
-    ax.set_title('(f) Summary', pad=20)
+    # (d) All-in cost vs Q
+    ax = axes[1, 1]
+    valid2 = df12.dropna(subset=['cost_code', 'cost_manual'])
+    ax.plot(valid2['Q'], valid2['cost_code'], '-', color=ACCENT, lw=2, label='cost (code, 3 bps fee)')
+    ax.plot(valid2['Q'], valid2['cost_manual'], '--', color=ACCENT2, lw=2, label='cost (manual)')
+    ax.set_xlabel('Quantity Q')
+    ax.set_ylabel('All-in cost (bps)')
+    ax.set_title('1.2b  All-in Cost vs Q')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
-    fig.suptitle('CLOB Venue — Unit Test Diagnostics', fontsize=14, weight='bold', y=1.01)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     _savefig(fig, 'clob_diagnostics.png')
 
 
 # =====================================================================
-#  2.  CPMM DASHBOARD
+#  2.  CPMM DIAGNOSTICS
 # =====================================================================
 
 def plot_cpmm():
-    print("\n[CPMM] generating dashboard …")
+    print("\n[CPMM] collecting data & generating plots")
+
+    # -- 2.1  Invariant k & buy->sell roundtrip -------------------------
     p = CPMMPool(x=1000.0, y=100_000.0, fee=0.003)
+    k0 = p.k
 
-    fig = plt.figure(figsize=(16, 10))
-    gs = gridspec.GridSpec(2, 3, hspace=0.35, wspace=0.35)
+    rows_inv = []
+    rows_inv.append(dict(step=0, x=p.x, y=p.y, k_code=p.x * p.y, k0=k0, cycle_id=0))
 
-    # --- (a) Bonding curve x·y = k ---
-    ax = fig.add_subplot(gs[0, 0])
-    xs = np.linspace(200, 3000, 300)
-    ys = p.k / xs
-    ax.plot(xs, ys, color=ACCENT, lw=2)
-    ax.plot(p.x, p.y, 'o', color=ACCENT4, ms=8, zorder=5, label=f'current ({p.x:.0f}, {p.y:.0f})')
-    ax.set_xlabel('x (base)')
-    ax.set_ylabel('y (quote)')
-    ax.set_title(f'(a) Bonding Curve  x·y = {p.k:.0e}')
+    # 10 buys then 10 sells
+    for i in range(1, 11):
+        p.execute_buy(2.0)
+        rows_inv.append(dict(step=i, x=p.x, y=p.y, k_code=p.x * p.y, k0=k0, cycle_id=0))
+    for i in range(11, 21):
+        p.execute_sell(2.0)
+        rows_inv.append(dict(step=i, x=p.x, y=p.y, k_code=p.x * p.y, k0=k0, cycle_id=0))
+
+    # Multiple round-trip cycles for boxplot
+    cycle_deltas = []
+    for c in range(1, 31):
+        pc = CPMMPool(x=1000.0, y=100_000.0, fee=0.003)
+        kc0 = pc.k
+        Q = 0.5 + c * 0.3
+        pc.execute_buy(Q)
+        pc.execute_sell(Q)
+        cycle_deltas.append(dict(cycle_id=c, k_delta=pc.x * pc.y - kc0))
+
+    df_inv = pd.DataFrame(rows_inv)
+    df_cyc = pd.DataFrame(cycle_deltas)
+    _save_csv(df_inv, 'cpmm_invariant.csv')
+    _save_csv(df_cyc, 'cpmm_roundtrip.csv')
+
+    # -- 2.2  Slippage & cost vs Q -------------------------------------
+    p2 = CPMMPool(x=1000.0, y=100_000.0, fee=0.003)
+    S = p2.mid_price()
+
+    rows_slip = []
+    for Q in np.concatenate([np.linspace(0.5, 10, 20), np.linspace(15, 300, 40)]):
+        qb = p2.quote_buy(Q, S_t=S)
+        if qb['cost_bps'] >= float('inf'):
+            continue
+        x_new = p2.x - Q
+        y_new = p2.k / x_new
+        dy_eff = y_new - p2.y
+        p_exec_nf = dy_eff / Q
+        slip_manual = 10_000 * (p_exec_nf - S) / S
+        cost_manual = slip_manual + 10_000 * p2.fee + p2.gas_cost_bps
+
+        rows_slip.append(dict(
+            Q=Q,
+            price_code=qb['exec_price'],
+            price_expected=S,
+            slip_code=qb['slippage_bps'],
+            slip_manual=slip_manual,
+            cost_code=qb['cost_bps'],
+            cost_manual=cost_manual,
+            fee_bps=qb['fee_bps'],
+        ))
+
+    df_slip = pd.DataFrame(rows_slip)
+    _save_csv(df_slip, 'cpmm_slippage.csv')
+
+    # -- Charts ---------------------------------------------------------
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle('2. CPMM  -  Diagnostic Plots', fontsize=14, weight='bold')
+
+    # (a) Invariant k vs step
+    ax = axes[0, 0]
+    ax.plot(df_inv['step'], df_inv['k_code'], 'o-', color=ACCENT, ms=4, lw=1.5)
+    ax.axhline(k0, ls='--', color=ACCENT4, lw=1, label=f'k0 = {k0:.2e}')
+    ax.set_xlabel('Trade step')
+    ax.set_ylabel('k = x*y')
+    ax.set_title('2.1a  Invariant k')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # --- (b) Slippage curve ---
-    ax = fig.add_subplot(gs[0, 1])
-    Qs = np.linspace(0.5, 200, 80)
-    slip_buy, slip_sell = [], []
-    for Q in Qs:
-        qb = p.quote_buy(Q, S_t=100.0)
-        qs = p.quote_sell(Q, S_t=100.0)
-        slip_buy.append(qb['slippage_bps'] if qb['cost_bps'] < float('inf') else np.nan)
-        slip_sell.append(qs['slippage_bps'] if qs['cost_bps'] < float('inf') else np.nan)
-    ax.plot(Qs, slip_buy, color=ACCENT, lw=2, label='buy slippage')
-    ax.plot(Qs, np.abs(slip_sell), color=ACCENT2, lw=2, ls='--', label='|sell slippage|')
-    ax.set_xlabel('Quantity Q')
-    ax.set_ylabel('Slippage (bps)')
-    ax.set_title('(b) Slippage vs Quantity')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # --- (c) Exec price curve ---
-    ax = fig.add_subplot(gs[0, 2])
-    exec_buy, exec_sell = [], []
-    for Q in Qs:
-        qb = p.quote_buy(Q, S_t=100.0)
-        qs = p.quote_sell(Q, S_t=100.0)
-        exec_buy.append(qb['exec_price'] if qb['cost_bps'] < float('inf') else np.nan)
-        exec_sell.append(qs['exec_price'] if qs['cost_bps'] < float('inf') else np.nan)
-    ax.plot(Qs, exec_buy, color=ACCENT, lw=2, label='buy exec price')
-    ax.plot(Qs, exec_sell, color=ACCENT2, lw=2, ls='--', label='sell exec price')
-    ax.axhline(100.0, ls=':', color=GRAY, lw=1, label='mid = 100')
-    ax.set_xlabel('Quantity Q')
-    ax.set_ylabel('Execution Price')
-    ax.set_title('(c) Exec Price vs Quantity')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # --- (d) Cost decomposition ---
-    ax = fig.add_subplot(gs[1, 0])
-    Qs_d = [1, 5, 10, 50, 100, 200]
-    slips, fees = [], []
-    for Q in Qs_d:
-        q = p.quote_buy(Q, S_t=100.0)
-        if q['cost_bps'] < float('inf'):
-            slips.append(q['slippage_bps'])
-            fees.append(q['fee_bps'])
-        else:
-            slips.append(0)
-            fees.append(0)
-    x_pos = np.arange(len(Qs_d))
-    ax.bar(x_pos, slips, color=ACCENT, alpha=0.8, label='slippage')
-    ax.bar(x_pos, fees, bottom=slips, color=ACCENT2, alpha=0.8, label='fee (30 bps)')
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels([str(q) for q in Qs_d])
-    ax.set_xlabel('Quantity')
-    ax.set_ylabel('bps')
-    ax.set_title('(d) Buy Cost = Slippage + Fee')
-    ax.legend(fontsize=8)
+    # (b) Round-trip k deviation boxplot
+    ax = axes[0, 1]
+    ax.boxplot(df_cyc['k_delta'].values, vert=True, patch_artist=True,
+               boxprops=dict(facecolor=ACCENT, alpha=0.5))
+    ax.axhline(0, ls='--', color=GRAY, lw=1)
+    ax.set_ylabel('k_after_cycle - k0')
+    ax.set_title('2.1b  Round-trip k Deviation (30 cycles)')
     ax.grid(True, alpha=0.3, axis='y')
 
-    # --- (e) Invariant preservation (sequential trades) ---
-    ax = fig.add_subplot(gs[1, 1])
-    p2 = CPMMPool(x=1000.0, y=100_000.0, fee=0.003)
-    k0 = p2.k
-    ks = [k0]
-    mids = [p2.mid_price()]
-    labels = ['init']
-    for i in range(1, 11):
-        p2.execute_buy(2.0)
-        ks.append(p2.x * p2.y)
-        mids.append(p2.mid_price())
-        labels.append(f'buy {i}')
-    for i in range(1, 11):
-        p2.execute_sell(2.0)
-        ks.append(p2.x * p2.y)
-        mids.append(p2.mid_price())
-        labels.append(f'sell {i}')
-    steps = range(len(ks))
-    k_pct = [(k / k0 - 1) * 1e6 for k in ks]  # in ppm
-    ax.plot(steps, k_pct, 'o-', color=ACCENT, ms=4, lw=1.5)
+    # (c) Slippage vs Q
+    ax = axes[0, 2]
+    ax.plot(df_slip['Q'], df_slip['slip_code'], '-', color=ACCENT, lw=2, label='slip (code)')
+    ax.plot(df_slip['Q'], df_slip['slip_manual'], '--', color=ACCENT2, lw=2, label='slip (manual)')
+    ax.set_xlabel('Q')
+    ax.set_ylabel('Slippage (bps)')
+    ax.set_title('2.2a  Slippage vs Q')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    if df_slip['Q'].max() > 50:
+        ax.set_xscale('log')
+
+    # (d) Slippage error
+    ax = axes[1, 0]
+    ax.plot(df_slip['Q'], df_slip['slip_code'] - df_slip['slip_manual'],
+            '-', color=ACCENT4, lw=1.5)
     ax.axhline(0, ls='--', color=GRAY, lw=1)
-    ax.set_xlabel('Trade #')
-    ax.set_ylabel('Δk / k₀  (ppm)')
-    ax.set_title('(e) k-Invariant Drift')
+    ax.set_xlabel('Q')
+    ax.set_ylabel('slip_code - slip_manual (bps)')
+    ax.set_title('2.2b  Slippage Error')
+    ax.grid(True, alpha=0.3)
+    if df_slip['Q'].max() > 50:
+        ax.set_xscale('log')
+
+    # (e) Fee vs Q  (should be horizontal line)
+    ax = axes[1, 1]
+    ax.plot(df_slip['Q'], df_slip['fee_bps'], '-', color=ACCENT3, lw=2)
+    ax.axhline(10_000 * 0.003, ls='--', color=GRAY, lw=1, label='30 bps')
+    ax.set_xlabel('Q')
+    ax.set_ylabel('Fee (bps)')
+    ax.set_title('2.2c  Fee vs Q (sanity: horizontal)')
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # --- (f) Volume-slippage max_Q ---
-    ax = fig.add_subplot(gs[1, 2])
-    thresholds = np.arange(20, 520, 20)
-    max_Qs = [p.volume_slippage_max_Q(t, S_t=100.0) for t in thresholds]
-    ax.plot(thresholds, max_Qs, color=ACCENT, lw=2)
-    ax.set_xlabel('Cost threshold (bps)')
-    ax.set_ylabel('Max tradeable Q')
-    ax.set_title('(f) Max Q at Cost Budget')
+    # (f) All-in cost vs Q
+    ax = axes[1, 2]
+    ax.plot(df_slip['Q'], df_slip['cost_code'], '-', color=ACCENT, lw=2, label='cost (code)')
+    ax.plot(df_slip['Q'], df_slip['cost_manual'], '--', color=ACCENT2, lw=2, label='cost (manual)')
+    ax.set_xlabel('Q')
+    ax.set_ylabel('All-in cost (bps)')
+    ax.set_title('2.2d  All-in Cost vs Q')
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
+    if df_slip['Q'].max() > 50:
+        ax.set_xscale('log')
 
-    fig.suptitle('CPMM Pool — Unit Test Diagnostics', fontsize=14, weight='bold', y=1.01)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     _savefig(fig, 'cpmm_diagnostics.png')
 
 
 # =====================================================================
-#  3.  HFMM DASHBOARD
+#  3.  HFMM DIAGNOSTICS
 # =====================================================================
 
 def plot_hfmm():
-    print("\n[HFMM] generating dashboard …")
+    print("\n[HFMM] collecting data & generating plots")
 
-    fig = plt.figure(figsize=(16, 10))
-    gs = gridspec.GridSpec(2, 3, hspace=0.35, wspace=0.35)
+    # -- 3.1  Invariant D & solver stability ----------------------------
+    h = HFMMPool(x=1000.0, y=100_000.0, A=100.0, fee=0.001, rate=100.0)
+    D0 = h.D
 
-    # --- (a) HFMM vs CPMM slippage ---
-    ax = fig.add_subplot(gs[0, 0])
-    cpmm = CPMMPool(x=1000, y=100_000, fee=0.0)
-    hfmm = HFMMPool(x=1000, y=100_000, A=100, fee=0.0, rate=100.0)
-    Qs = np.linspace(0.5, 300, 120)
-    s_c, s_h = [], []
-    for Q in Qs:
-        qc = cpmm.quote_buy(Q, S_t=100.0)
-        qh = hfmm.quote_buy(Q, S_t=100.0)
-        s_c.append(qc['slippage_bps'] if qc['cost_bps'] < float('inf') else np.nan)
-        s_h.append(qh['slippage_bps'] if qh['cost_bps'] < float('inf') else np.nan)
-    ax.plot(Qs, s_c, color=ACCENT2, lw=2, label='CPMM')
-    ax.plot(Qs, s_h, color=ACCENT, lw=2, label='HFMM (A=100)')
-    ax.set_xlabel('Quantity Q')
-    ax.set_ylabel('Slippage (bps)')
-    ax.set_title('(a) HFMM vs CPMM Slippage')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
+    rows_d = []
+    rows_d.append(dict(step=0, x1=h.x, x2=h.y, D_code=D0, D0=D0,
+                        solver_iters=0, solver_error=0.0))
 
-    # --- (b) Amplification parameter sweep ---
-    ax = fig.add_subplot(gs[0, 1])
-    A_vals = [1, 5, 10, 50, 100, 500]
-    Q_test = np.linspace(1, 200, 60)
-    for A in A_vals:
-        h = HFMMPool(x=1000, y=100_000, A=A, fee=0.0, rate=100.0)
-        sl = []
-        for Q in Q_test:
-            q = h.quote_buy(Q, S_t=100.0)
-            sl.append(q['slippage_bps'] if q['cost_bps'] < float('inf') else np.nan)
-        ax.plot(Q_test, sl, lw=1.5, label=f'A={A}')
-    ax.set_xlabel('Quantity Q')
-    ax.set_ylabel('Slippage (bps)')
-    ax.set_title('(b) Slippage by Amplification A')
-    ax.legend(fontsize=7, ncol=2)
-    ax.grid(True, alpha=0.3)
+    for i in range(1, 16):
+        h.execute_buy(3.0)
+        h._sync_norm()
+        D_re = _hfmm_get_D(h._xn, h._yn, h.A)
+        rows_d.append(dict(step=i, x1=h.x, x2=h.y, D_code=D_re, D0=D0,
+                            solver_iters=0, solver_error=abs(D_re - D0)))
+    for i in range(16, 31):
+        h.execute_sell(3.0)
+        h._sync_norm()
+        D_re = _hfmm_get_D(h._xn, h._yn, h.A)
+        rows_d.append(dict(step=i, x1=h.x, x2=h.y, D_code=D_re, D0=D0,
+                            solver_iters=0, solver_error=abs(D_re - D0)))
 
-    # --- (c) StableSwap bonding curve ---
-    ax = fig.add_subplot(gs[0, 2])
-    h100 = HFMMPool(x=1000, y=100_000, A=100, fee=0.0, rate=100.0)
-    D = h100.D
-    # Plot implicit curve: vary xn, solve for yn
-    xns = np.linspace(10, h100.D * 0.99, 400)
-    yns = []
-    for xn in xns:
-        try:
-            yn = _hfmm_get_y(xn, D, 100)
-            yns.append(yn)
-        except Exception:
-            yns.append(np.nan)
-    ax.plot(xns, yns, color=ACCENT, lw=2, label='HFMM (A=100)')
-    # CPMM reference
-    k_norm = (D/2)**2  # at balanced point xn=yn=D/2
-    yn_cpmm = k_norm / xns
-    ax.plot(xns, yn_cpmm, color=ACCENT2, lw=1.5, ls='--', label='CPMM equiv.')
-    # Constant sum
-    ax.plot(xns, D - xns, color=ACCENT3, lw=1, ls=':', label='const-sum')
-    ax.plot(h100._xn, h100._yn, 'o', color=ACCENT4, ms=8, zorder=5, label='current')
-    ax.set_xlabel('xₙ (normalised)')
-    ax.set_ylabel('yₙ (normalised)')
-    ax.set_title('(c) StableSwap Curve')
-    ax.legend(fontsize=7)
-    ax.set_xlim(0, D * 1.05)
-    ax.set_ylim(0, D * 1.05)
-    ax.grid(True, alpha=0.3)
-
-    # --- (d) D-solver across configs ---
-    ax = fig.add_subplot(gs[1, 0])
+    # Solver convergence across diverse configs
     configs = [
         (100, 100, 1), (100, 100, 10), (100, 100, 100), (100, 100, 1000),
-        (1, 1e6, 50), (1e6, 1, 50), (1e-3, 1e-3, 100), (1e8, 1e8, 500),
+        (1, 1_000_000, 50), (1_000_000, 1, 50),
+        (0.001, 0.001, 100), (1e8, 1e8, 500),
     ]
-    labels_d = []
-    Ds = []
-    for x1, x2, A in configs:
-        d = _hfmm_get_D(x1, x2, A)
-        Ds.append(d)
-        labels_d.append(f'({x1:.0e},{x2:.0e},A={A})')
-    ax.barh(range(len(Ds)), np.log10(np.array(Ds) + 1e-30), color=ACCENT, alpha=0.8)
-    ax.set_yticks(range(len(Ds)))
-    ax.set_yticklabels(labels_d, fontsize=7)
-    ax.set_xlabel('log₁₀(D)')
-    ax.set_title('(d) D-solver: log₁₀(D) per Config')
-    ax.grid(True, alpha=0.3, axis='x')
+    solver_rows = []
+    for idx, (x1, x2, A) in enumerate(configs):
+        S = x1 + x2
+        Ann = 4.0 * A
+        D_val = S
+        iters = 0
+        err = float('inf')
+        for it in range(512):
+            P = 4.0 * x1 * x2
+            if P < 1e-30:
+                break
+            D_P = D_val ** 3 / P
+            D_prev = D_val
+            denom = (Ann - 1.0) * D_val + 3.0 * D_P
+            if abs(denom) < 1e-30:
+                break
+            D_val = (Ann * S + 2.0 * D_P) * D_val / denom
+            if D_val < 0:
+                D_val = D_prev * 0.5
+            err = abs(D_val - D_prev)
+            iters = it + 1
+            if err < max(1e-12, abs(D_val) * 1e-14):
+                break
+        solver_rows.append(dict(
+            config_id=idx, x1=x1, x2=x2, A=A,
+            D=D_val, solver_iters=iters, solver_error=err,
+        ))
 
-    # --- (e) Cost comparison table ---
-    ax = fig.add_subplot(gs[1, 1])
-    ax.axis('off')
-    h = HFMMPool(x=1000, y=100_000, A=100, fee=0.001, rate=100.0)
-    c = CPMMPool(x=1000, y=100_000, fee=0.003)
-    rows = []
-    for Q in [1, 5, 10, 50, 100]:
-        qh = h.quote_buy(Q, S_t=100.0)
-        qc = c.quote_buy(Q, S_t=100.0)
-        rows.append([
-            f'{Q}',
-            f'{qh["slippage_bps"]:.2f}',
-            f'{qh["cost_bps"]:.2f}',
-            f'{qc["slippage_bps"]:.2f}',
-            f'{qc["cost_bps"]:.2f}',
-        ])
-    tbl = ax.table(cellText=rows,
-                   colLabels=['Q', 'HFMM slip', 'HFMM cost', 'CPMM slip', 'CPMM cost'],
-                   loc='center', cellLoc='center')
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(9)
-    tbl.scale(1.0, 1.5)
-    for (r, col), cell in tbl.get_celld().items():
-        if r == 0:
-            cell.set_facecolor('#E3F2FD')
-            cell.set_text_props(weight='bold')
-    ax.set_title('(e) HFMM vs CPMM Cost (bps)', pad=20)
+    df_d = pd.DataFrame(rows_d)
+    df_solver = pd.DataFrame(solver_rows)
+    _save_csv(df_d, 'hfmm_invariant.csv')
+    _save_csv(df_solver, 'hfmm_solver.csv')
 
-    # --- (f) D invariant drift under sequential trades ---
-    ax = fig.add_subplot(gs[1, 2])
-    h2 = HFMMPool(x=1000, y=100_000, A=100, fee=0.001, rate=100.0)
-    D0 = h2.D
-    d_drift = [0.0]
-    for i in range(15):
-        h2.execute_buy(3.0)
-        h2._sync_norm()
-        d_re = _hfmm_get_D(h2._xn, h2._yn, h2.A)
-        d_drift.append((d_re / D0 - 1) * 1e6)
-    for i in range(15):
-        h2.execute_sell(3.0)
-        h2._sync_norm()
-        d_re = _hfmm_get_D(h2._xn, h2._yn, h2.A)
-        d_drift.append((d_re / D0 - 1) * 1e6)
-    ax.plot(range(len(d_drift)), d_drift, 'o-', color=ACCENT, ms=3, lw=1.5)
-    ax.axhline(0, ls='--', color=GRAY, lw=1)
-    ax.axvline(15, ls=':', color=ACCENT4, lw=1, alpha=0.5, label='switch sell')
-    ax.set_xlabel('Trade #')
-    ax.set_ylabel('ΔD / D₀  (ppm)')
-    ax.set_title('(f) D-Invariant Drift')
+    # -- 3.2  Comparison HFMM vs CPMM ----------------------------------
+    cpmm_ref = CPMMPool(x=1000, y=100_000, fee=0.0)
+    hfmm_ref = HFMMPool(x=1000, y=100_000, A=100, fee=0.0, rate=100.0)
+
+    rows_cmp = []
+    for Q in np.concatenate([np.linspace(0.5, 10, 20), np.linspace(15, 300, 40)]):
+        qc = cpmm_ref.quote_buy(Q, S_t=100.0)
+        qh = hfmm_ref.quote_buy(Q, S_t=100.0)
+        if qc['cost_bps'] >= float('inf') or qh['cost_bps'] >= float('inf'):
+            continue
+        rows_cmp.append(dict(
+            Q=Q,
+            price_cpmm=qc['exec_price'],
+            price_hfmm=qh['exec_price'],
+            slip_cpmm=qc['slippage_bps'],
+            slip_hfmm=qh['slippage_bps'],
+        ))
+
+    df_cmp = pd.DataFrame(rows_cmp)
+    _save_csv(df_cmp, 'hfmm_vs_cpmm.csv')
+
+    # -- Charts ---------------------------------------------------------
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('3. HFMM  -  Diagnostic Plots', fontsize=14, weight='bold')
+
+    # (a) D vs step
+    ax = axes[0, 0]
+    ax.plot(df_d['step'], df_d['D_code'], 'o-', color=ACCENT, ms=4, lw=1.5)
+    ax.axhline(D0, ls='--', color=ACCENT4, lw=1, label=f'D0 = {D0:.2f}')
+    ax.axvline(15, ls=':', color=GRAY, lw=1, alpha=0.5, label='switch -> sell')
+    ax.set_xlabel('Trade step')
+    ax.set_ylabel('D (recomputed)')
+    ax.set_title('3.1a  D-invariant vs Step')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    fig.suptitle('HFMM Pool — Unit Test Diagnostics', fontsize=14, weight='bold', y=1.01)
+    # (b) Solver iterations per config
+    ax = axes[0, 1]
+    ax.bar(range(len(df_solver)), df_solver['solver_iters'], color=ACCENT, alpha=0.8)
+    labels_s = [f'({r.x1:.0e},{r.x2:.0e},A={int(r.A)})' for _, r in df_solver.iterrows()]
+    ax.set_xticks(range(len(df_solver)))
+    ax.set_xticklabels(labels_s, fontsize=6, rotation=45, ha='right')
+    ax.set_ylabel('Newton iterations')
+    ax.set_title('3.1b  Solver Convergence')
+    ax.grid(True, alpha=0.3, axis='y')
+    for idx_s, row in df_solver.iterrows():
+        if row['solver_error'] > 1e-8:
+            ax.plot(idx_s, row['solver_iters'], 'x', color=ACCENT4, ms=10, mew=2)
+
+    # (c) Execution price vs Q (HFMM vs CPMM)
+    ax = axes[1, 0]
+    ax.plot(df_cmp['Q'], df_cmp['price_hfmm'], '-', color=ACCENT, lw=2, label='HFMM (A=100)')
+    ax.plot(df_cmp['Q'], df_cmp['price_cpmm'], '--', color=ACCENT2, lw=2, label='CPMM')
+    ax.axhline(100.0, ls=':', color=GRAY, lw=1, label='mid = 100')
+    ax.set_xlabel('Quantity Q')
+    ax.set_ylabel('Execution Price')
+    ax.set_title('3.2a  Exec Price: HFMM vs CPMM')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # (d) Slippage HFMM vs CPMM
+    ax = axes[1, 1]
+    ax.plot(df_cmp['Q'], df_cmp['slip_hfmm'], '-', color=ACCENT, lw=2, label='HFMM (A=100)')
+    ax.plot(df_cmp['Q'], df_cmp['slip_cpmm'], '--', color=ACCENT2, lw=2, label='CPMM')
+    ax.set_xlabel('Quantity Q')
+    ax.set_ylabel('Slippage (bps)')
+    ax.set_title('3.2b  Slippage: HFMM vs CPMM')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     _savefig(fig, 'hfmm_diagnostics.png')
 
 
 # =====================================================================
-#  4.  ROUTING DASHBOARD
+#  4.  ROUTING DIAGNOSTICS
 # =====================================================================
 
 def plot_routing():
-    print("\n[ROUTING] generating dashboard …")
+    print("\n[ROUTING] collecting data & generating plots")
 
     def _make_trader_r(amm_share_pct=50, beta_amm=0.05, bias=0.0, noise=0.0, det=False):
         ex = _make_exchange([(99, 50), (98, 50)], [(101, 50), (102, 50)])
@@ -484,138 +537,145 @@ def plot_routing():
                       amm_share_pct=amm_share_pct, deterministic_venue=det,
                       beta_amm=beta_amm, cpmm_bias_bps=bias, cost_noise_std=noise)
 
-    fig = plt.figure(figsize=(16, 10))
-    gs = gridspec.GridSpec(2, 3, hspace=0.35, wspace=0.35)
-
-    # --- (a) Softmax probability distribution ---
-    ax = fig.add_subplot(gs[0, 0])
-    costs = {'A': 10.0, 'B': 20.0, 'Z': 15.0}
-    betas = np.linspace(0.01, 0.5, 50)
-    for venue in ['A', 'B', 'Z']:
-        probs = []
-        for beta in betas:
-            min_c = min(costs.values())
-            w = {k: math.exp(-beta * (c - min_c)) for k, c in costs.items()}
-            total = sum(w.values())
-            probs.append(w[venue] / total)
-        ax.plot(betas, probs, lw=2, label=f'{venue} (cost={costs[venue]})')
-    ax.set_xlabel('β (concentration)')
-    ax.set_ylabel('Selection probability')
-    ax.set_title('(a) Softmax P(venue) vs β')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # --- (b) Empirical vs theoretical softmax ---
-    ax = fig.add_subplot(gs[0, 1])
-    random.seed(42)
+    # -- 4.1  Softmax: theory vs empirical ------------------------------
+    costs = {'CLOB': 10.0, 'CPMM': 20.0, 'HFMM': 15.0}
     beta = 0.1
     N = 50_000
     min_c = min(costs.values())
-    w = {k: math.exp(-beta * (c - min_c)) for k, c in costs.items()}
-    total = sum(w.values())
-    theo = {k: w[k] / total for k in costs}
-    counts = Counter(Trader._softmax_pick(costs, beta) for _ in range(N))
-    obs = {k: counts[k] / N for k in costs}
-    x_pos = np.arange(len(costs))
-    w_bar = 0.35
-    ax.bar(x_pos - w_bar/2, [theo[k] for k in costs], w_bar, color=ACCENT, alpha=0.8, label='theoretical')
-    ax.bar(x_pos + w_bar/2, [obs[k] for k in costs], w_bar, color=ACCENT2, alpha=0.8, label=f'observed (N={N})')
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(list(costs.keys()))
+    weights = {k: math.exp(-beta * (c - min_c)) for k, c in costs.items()}
+    total_w = sum(weights.values())
+    theo = {k: w / total_w for k, w in weights.items()}
+
+    random.seed(42)
+    counts = Counter(Trader._softmax_pick(
+        {k: v for k, v in costs.items()}, beta) for _ in range(N))
+    emp = {k: counts.get(k, 0) / N for k in costs}
+
+    rows_sm = []
+    for v in costs:
+        rows_sm.append(dict(venue=v, p_theoretical=theo[v], p_empirical=emp[v]))
+    df_sm = pd.DataFrame(rows_sm)
+    _save_csv(df_sm, 'routing_softmax.csv')
+
+    # -- 4.2  Regime transitions ----------------------------------------
+    regime_scenarios = {
+        'A: CLOB cheap':  {'CLOB': 5.0,  'CPMM': 25.0, 'HFMM': 20.0},
+        'B: equal costs':  {'CLOB': 15.0, 'CPMM': 15.0, 'HFMM': 15.0},
+        'C: AMM cheap':    {'CLOB': 30.0, 'CPMM': 12.0, 'HFMM': 8.0},
+    }
+    N_reg = 20_000
+    regime_rows = []
+    for scenario_name, sc_costs in regime_scenarios.items():
+        random.seed(42)
+        counts_r = Counter(
+            Trader._softmax_pick(sc_costs, beta) for _ in range(N_reg))
+        for v in sc_costs:
+            regime_rows.append(dict(
+                scenario=scenario_name,
+                venue=v,
+                empirical_share=counts_r.get(v, 0) / N_reg,
+            ))
+    df_reg = pd.DataFrame(regime_rows)
+    _save_csv(df_reg, 'routing_regimes.csv')
+
+    # -- 4.2+  Real two-step routing with amm_share_pct ----------------
+    real_scenarios = {
+        'amm_share=5%':  dict(amm_share_pct=5),
+        'amm_share=50%': dict(amm_share_pct=50),
+        'amm_share=95%': dict(amm_share_pct=95),
+    }
+    N_real = 5_000
+    real_rows = []
+    for sc_name, kwargs in real_scenarios.items():
+        random.seed(42)
+        tr = _make_trader_r(**kwargs)
+        picks = [tr.choose_venue(1.0) for _ in range(N_real)]
+        c = Counter(picks)
+        for v in ['clob', 'cpmm', 'hfmm']:
+            real_rows.append(dict(
+                scenario=sc_name, venue=v,
+                empirical_share=c.get(v, 0) / N_real,
+            ))
+    df_real = pd.DataFrame(real_rows)
+    _save_csv(df_real, 'routing_real_twostep.csv')
+
+    # -- Charts ---------------------------------------------------------
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('4. Routing  -  Diagnostic Plots', fontsize=14, weight='bold')
+
+    # (a) Softmax theory vs empirical
+    ax = axes[0, 0]
+    venues = df_sm['venue'].tolist()
+    x = np.arange(len(venues))
+    w = 0.35
+    ax.bar(x - w/2, df_sm['p_theoretical'], w, color=ACCENT, alpha=0.8, label='theoretical')
+    ax.bar(x + w/2, df_sm['p_empirical'], w, color=ACCENT2, alpha=0.8, label=f'empirical (N={N})')
+    ax.set_xticks(x)
+    ax.set_xticklabels(venues)
     ax.set_ylabel('Probability')
-    ax.set_title(f'(b) Softmax β={beta}: Theory vs Obs')
+    ax.set_title(f'4.1  Softmax beta={beta}: Theory vs Empirical')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3, axis='y')
 
-    # --- (c) Venue share vs amm_share_pct ---
-    ax = fig.add_subplot(gs[0, 2])
-    amm_pcts = [0, 10, 25, 50, 75, 90, 100]
-    clob_shares, cpmm_shares, hfmm_shares = [], [], []
-    N = 2000
-    for pct in amm_pcts:
-        random.seed(42)
-        tr = _make_trader_r(amm_share_pct=pct)
-        picks = [tr.choose_venue(1.0) for _ in range(N)]
-        c = Counter(picks)
-        clob_shares.append(c.get('clob', 0) / N * 100)
-        cpmm_shares.append(c.get('cpmm', 0) / N * 100)
-        hfmm_shares.append(c.get('hfmm', 0) / N * 100)
-    ax.stackplot(amm_pcts, clob_shares, cpmm_shares, hfmm_shares,
-                 labels=['CLOB', 'CPMM', 'HFMM'],
-                 colors=[ACCENT, ACCENT2, ACCENT3], alpha=0.8)
-    ax.set_xlabel('amm_share_pct')
-    ax.set_ylabel('Venue share (%)')
-    ax.set_title('(c) Venue Flow vs amm_share_pct')
-    ax.legend(fontsize=8, loc='center left')
-    ax.set_xlim(0, 100)
-    ax.set_ylim(0, 100)
-    ax.grid(True, alpha=0.3)
-
-    # --- (d) CPMM bias effect ---
-    ax = fig.add_subplot(gs[1, 0])
-    biases = np.arange(0, 110, 10)
-    cpmm_frac = []
-    N = 3000
-    for bias in biases:
-        random.seed(42)
-        tr = _make_trader_r(amm_share_pct=100, bias=bias, beta_amm=0.05)
-        picks = Counter(tr.choose_venue(1.0) for _ in range(N))
-        cpmm_frac.append(picks.get('cpmm', 0) / N * 100)
-    ax.plot(biases, cpmm_frac, 'o-', color=ACCENT, lw=2, ms=5)
-    ax.set_xlabel('cpmm_bias_bps')
-    ax.set_ylabel('CPMM share (%)')
-    ax.set_title('(d) CPMM Bias → CPMM Share')
-    ax.grid(True, alpha=0.3)
-
-    # --- (e) Noise effect ---
-    ax = fig.add_subplot(gs[1, 1])
-    noises = [0, 0.5, 1, 2, 3, 5, 10]
-    hfmm_frac_n = []
-    cpmm_frac_n = []
-    N = 3000
-    for ns in noises:
-        random.seed(42)
-        tr = _make_trader_r(amm_share_pct=100, noise=ns, beta_amm=0.05)
-        picks = Counter(tr.choose_venue(1.0) for _ in range(N))
-        total_n = picks.get('cpmm', 0) + picks.get('hfmm', 0)
-        if total_n > 0:
-            hfmm_frac_n.append(picks.get('hfmm', 0) / total_n * 100)
-            cpmm_frac_n.append(picks.get('cpmm', 0) / total_n * 100)
-        else:
-            hfmm_frac_n.append(50)
-            cpmm_frac_n.append(50)
-    ax.plot(noises, hfmm_frac_n, 'o-', color=ACCENT, lw=2, ms=5, label='HFMM')
-    ax.plot(noises, cpmm_frac_n, 's--', color=ACCENT2, lw=2, ms=5, label='CPMM')
-    ax.set_xlabel('cost_noise_std')
-    ax.set_ylabel('Share among AMMs (%)')
-    ax.set_title('(e) Noise → AMM Split')
+    # (b) Regime transitions (grouped bar)
+    ax = axes[0, 1]
+    scenario_names = list(regime_scenarios.keys())
+    venue_names = list(list(regime_scenarios.values())[0].keys())
+    n_sc = len(scenario_names)
+    n_v = len(venue_names)
+    bar_w = 0.8 / n_v
+    colors = [ACCENT, ACCENT2, ACCENT3]
+    for j, vn in enumerate(venue_names):
+        vals = [df_reg[(df_reg['scenario'] == sc) & (df_reg['venue'] == vn)]['empirical_share'].values[0]
+                for sc in scenario_names]
+        ax.bar(np.arange(n_sc) + j * bar_w - 0.4 + bar_w/2,
+               vals, bar_w, color=colors[j], alpha=0.8, label=vn)
+    ax.set_xticks(np.arange(n_sc))
+    ax.set_xticklabels(scenario_names, fontsize=8)
+    ax.set_ylabel('Empirical share')
+    ax.set_title('4.2a  Regime Transitions (softmax)')
     ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, axis='y')
 
-    # --- (f) Cost comparison ---
-    ax = fig.add_subplot(gs[1, 2])
+    # (c) Real two-step routing
+    ax = axes[1, 0]
+    real_sc_names = list(real_scenarios.keys())
+    real_venues = ['clob', 'cpmm', 'hfmm']
+    n_rsc = len(real_sc_names)
+    n_rv = len(real_venues)
+    bar_w2 = 0.8 / n_rv
+    for j, vn in enumerate(real_venues):
+        vals = [df_real[(df_real['scenario'] == sc) & (df_real['venue'] == vn)]['empirical_share'].values[0]
+                for sc in real_sc_names]
+        ax.bar(np.arange(n_rsc) + j * bar_w2 - 0.4 + bar_w2/2,
+               vals, bar_w2, color=colors[j], alpha=0.8, label=vn)
+    ax.set_xticks(np.arange(n_rsc))
+    ax.set_xticklabels(real_sc_names, fontsize=8)
+    ax.set_ylabel('Empirical share')
+    ax.set_title('4.2b  Two-step Routing by amm_share_pct')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # (d) Cost per venue vs Q
+    ax = axes[1, 1]
     tr = _make_trader_r()
-    Qs = [0.5, 1, 5, 10, 50]
+    Qs = [0.5, 1, 5, 10, 25, 50]
     c_clob, c_cpmm, c_hfmm = [], [], []
     for Q in Qs:
-        costs_e = tr.estimate_costs(Q, 'buy')
-        c_clob.append(costs_e.get('clob', float('nan')))
-        c_cpmm.append(costs_e.get('cpmm', float('nan')))
-        c_hfmm.append(costs_e.get('hfmm', float('nan')))
-    x_pos = np.arange(len(Qs))
-    w_b = 0.25
-    ax.bar(x_pos - w_b, c_clob, w_b, color=ACCENT, alpha=0.8, label='CLOB')
-    ax.bar(x_pos, c_cpmm, w_b, color=ACCENT2, alpha=0.8, label='CPMM')
-    ax.bar(x_pos + w_b, c_hfmm, w_b, color=ACCENT3, alpha=0.8, label='HFMM')
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels([str(q) for q in Qs])
-    ax.set_xlabel('Quantity')
+        ce = tr.estimate_costs(Q, 'buy')
+        c_clob.append(ce.get('clob', float('nan')))
+        c_cpmm.append(ce.get('cpmm', float('nan')))
+        c_hfmm.append(ce.get('hfmm', float('nan')))
+    ax.plot(Qs, c_clob, 'o-', color=ACCENT, lw=2, label='CLOB')
+    ax.plot(Qs, c_cpmm, 's--', color=ACCENT2, lw=2, label='CPMM')
+    ax.plot(Qs, c_hfmm, '^:', color=ACCENT3, lw=2, label='HFMM')
+    ax.set_xlabel('Quantity Q')
     ax.set_ylabel('All-in cost (bps)')
-    ax.set_title('(f) Venue Cost Comparison')
+    ax.set_title('4.2c  Venue Cost Comparison')
     ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3, axis='y')
+    ax.grid(True, alpha=0.3)
 
-    fig.suptitle('Venue Routing — Unit Test Diagnostics', fontsize=14, weight='bold', y=1.01)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     _savefig(fig, 'routing_diagnostics.png')
 
 
@@ -625,15 +685,15 @@ def plot_routing():
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("  Unit Test Visualisation Report")
+    print("  QA Diagnostic Visualisation")
     print("=" * 60)
-    print(f"  Output → {os.path.abspath(OUT_DIR)}/")
+    print(f"  Output -> {os.path.abspath(OUT_DIR)}/")
 
     plot_clob()
     plot_cpmm()
     plot_hfmm()
     plot_routing()
 
-    print(f"\n{'=' * 60}")
-    print(f"  Done — 4 dashboards saved to output/unit_tests/")
-    print(f"{'=' * 60}")
+    print("\n" + "=" * 60)
+    print("  Done -- 4 dashboards + CSV data saved to output/unit_tests/")
+    print("=" * 60)
