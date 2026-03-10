@@ -517,29 +517,29 @@ class SimulatorInfo:
 
         return [Fundamentalist.evaluate(divs[i:i+access], r) for i in range(n)]
 
-    def stock_returns(self, roll: int = None) -> list or float:
+    def stock_returns(self, roll: int = None) -> List[float] | float:
         p = self.prices
         div = self.dividends
         r = [(p[i+1] - p[i]) / p[i] + div[i] / p[i] for i in range(len(p) - 1)]
         return rolling(r, roll) if roll else mean(r)
 
-    def abnormal_returns(self, roll: int = None) -> list:
+    def abnormal_returns(self, roll: int = None) -> List[float]:
         rf = self.exchange.risk_free
         r = [r - rf for r in self.stock_returns()]
         return rolling(r, roll) if roll else r
 
-    def return_volatility(self, window: int = None) -> list or float:
+    def return_volatility(self, window: int = None) -> List[float] | float:
         if window is None:
             return std(self.stock_returns())
         n = len(self.stock_returns(1))
         return [std(self.stock_returns(1)[i:i+window]) for i in range(n - window)]
 
-    def price_volatility(self, window: int = None) -> list or float:
+    def price_volatility(self, window: int = None) -> List[float] | float:
         if window is None:
             return std(self.prices)
         return [std(self.prices[i:i+window]) for i in range(len(self.prices) - window)]
 
-    def liquidity(self, roll: int = None) -> list or float:
+    def liquidity(self, roll: int = None) -> List[float] | float:
         n = len(self.prices)
         spreads = [el['ask'] - el['bid'] for el in self.spreads]
         prices = self.prices
