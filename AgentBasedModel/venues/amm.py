@@ -5,11 +5,18 @@ AMM Pool implementations for FX market simulation.
 - HFMMPool: Hybrid Function Market Maker (Curve StableSwap-like),
   invariant 4A(x+y) + D = 4AD + D^3/(4xy)
 
-All costs are reported in basis points (bps) relative to a reference mid-price S_t.
+Costs are reported in basis points (bps) relative to a benchmark price.
+By default, the benchmark is the pool's own marginal mid-price (internal TCA).
+An optional external benchmark S_t can still be passed for diagnostics.
 """
 
 import math as _math
 from typing import Optional, List, Dict
+
+
+def _clip_tiny_negative_bps(value: float, eps: float = 1e-9) -> float:
+    """Suppress floating-point artifacts close to zero in bps metrics."""
+    return 0.0 if -eps < value < 0.0 else value
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +92,8 @@ class CPMMPool:
         """
         Estimate cost of buying *Q* base currency (trader pays quote).
 
+        If S_t is omitted, slippage is measured versus the pool's local mid.
+
         Returns dict with:
             exec_price   – effective price paid (quote/base)
             delta_y      – total quote paid by trader
@@ -109,8 +118,10 @@ class CPMMPool:
         p_exec = dy / Q
 
         slippage_bps = 10_000.0 * (p_exec_no_fee - S_ref) / S_ref
+        slippage_bps = _clip_tiny_negative_bps(slippage_bps)
         fee_bps = 10_000.0 * self.fee
         cost_bps = slippage_bps + fee_bps + self.gas_cost_bps
+        cost_bps = _clip_tiny_negative_bps(cost_bps)
 
         return dict(exec_price=p_exec, delta_y=dy,
                     slippage_bps=slippage_bps, fee_bps=fee_bps,
@@ -119,6 +130,8 @@ class CPMMPool:
     def quote_sell(self, Q: float, S_t: Optional[float] = None) -> dict:
         """
         Estimate cost of selling *Q* base currency (trader receives quote).
+
+        If S_t is omitted, slippage is measured versus the pool's local mid.
         """
         if Q <= 0:
             return self._zero_quote(S_t)
@@ -138,8 +151,10 @@ class CPMMPool:
 
         p_exec = dy / Q
         slippage_bps = 10_000.0 * (S_ref - p_exec_no_fee) / S_ref
+        slippage_bps = _clip_tiny_negative_bps(slippage_bps)
         fee_bps = 10_000.0 * self.fee
         cost_bps = slippage_bps + fee_bps + self.gas_cost_bps
+        cost_bps = _clip_tiny_negative_bps(cost_bps)
 
         return dict(exec_price=p_exec, delta_y=dy,
                     slippage_bps=slippage_bps, fee_bps=fee_bps,
@@ -425,6 +440,8 @@ class HFMMPool:
     def quote_buy(self, Q: float, S_t: Optional[float] = None) -> dict:
         """
         Cost of buying Q base (trader pays quote, receives base).
+
+        If S_t is omitted, slippage is measured versus the pool's local mid.
         """
         if Q <= 0:
             return self._zero_quote(S_t)
@@ -444,8 +461,10 @@ class HFMMPool:
         p_exec = dy / Q
 
         slippage_bps = 10_000.0 * (p_exec_no_fee - S_ref) / S_ref
+        slippage_bps = _clip_tiny_negative_bps(slippage_bps)
         fee_bps = 10_000.0 * self.fee
         cost_bps = slippage_bps + fee_bps + self.gas_cost_bps
+        cost_bps = _clip_tiny_negative_bps(cost_bps)
 
         return dict(exec_price=p_exec, delta_y=dy,
                     slippage_bps=slippage_bps, fee_bps=fee_bps,
@@ -454,6 +473,8 @@ class HFMMPool:
     def quote_sell(self, Q: float, S_t: Optional[float] = None) -> dict:
         """
         Cost of selling Q base (trader pays base, receives quote).
+
+        If S_t is omitted, slippage is measured versus the pool's local mid.
         """
         if Q <= 0:
             return self._zero_quote(S_t)
@@ -473,8 +494,10 @@ class HFMMPool:
         p_exec = dy / Q
 
         slippage_bps = 10_000.0 * (S_ref - p_exec_no_fee) / S_ref
+        slippage_bps = _clip_tiny_negative_bps(slippage_bps)
         fee_bps = 10_000.0 * self.fee
         cost_bps = slippage_bps + fee_bps + self.gas_cost_bps
+        cost_bps = _clip_tiny_negative_bps(cost_bps)
 
         return dict(exec_price=p_exec, delta_y=dy,
                     slippage_bps=slippage_bps, fee_bps=fee_bps,

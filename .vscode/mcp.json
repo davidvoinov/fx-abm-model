@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "obsidian-vault": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/Users/davidvoinov/ObsidianVault",
+        "/Users/davidvoinov/VS/CP"
+      ]
+    }
+  }
+}

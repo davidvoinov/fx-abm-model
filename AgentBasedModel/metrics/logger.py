@@ -150,8 +150,7 @@ class MetricsLogger:
             self.clob_espr_curves[Q].append(q_info.get('espr_bps', 0))
             self.clob_impact_curves[Q].append(q_info.get('impact_bps', 0))
 
-        # AMM metrics — use fair price as reference when available
-        S_t = fp if fp is not None else clob_mid
+        # AMM metrics — internal TCA vs each pool's own marginal mid
         for name, pool in amm_pools.items():
             self._ensure_pool(name)
             self.amm_mid_series[name].append(pool.mid_price())
@@ -160,13 +159,13 @@ class MetricsLogger:
             self.amm_L_series[name].append(pool.liquidity_measure())
 
             for Q in self.Q_grid:
-                q_info = pool.quote_buy(Q, S_t)
+                q_info = pool.quote_buy(Q)
                 self.amm_cost_curves[name][Q].append(q_info['cost_bps'])
                 self.amm_slippage_curves[name][Q].append(q_info['slippage_bps'])
                 self.amm_fee_curves[name][Q].append(q_info['fee_bps'])
 
             for th in self.slippage_thresholds:
-                max_q = pool.volume_slippage_max_Q(th, S_t)
+                max_q = pool.volume_slippage_max_Q(th)
                 self.amm_vol_slip[name][th].append(max_q)
 
         # Flow allocation

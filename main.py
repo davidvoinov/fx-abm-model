@@ -16,19 +16,9 @@ import math
 import sys
 
 from AgentBasedModel.simulator.simulator import Simulator
-from AgentBasedModel.visualization.venue_plots import (
-    plot_execution_cost_curves,
-    plot_cost_decomposition,
-    plot_total_market_depth,
-    plot_cost_timeseries,
-    plot_flow_allocation,
-    plot_clob_spread_vs_amm_cost,
-    plot_commonality,
-    plot_amm_liquidity,
-    plot_stress_flow_migration,
-    plot_environment,
-    plot_fx_price,
-    plot_clob_spread,
+from AgentBasedModel.visualization.dashboards import (
+    generate_all_dashboards,
+    save_all_individual_plots,
 )
 
 
@@ -41,7 +31,7 @@ PRESETS = {
     "amm_only": dict(
         enable_clob_mm=0,
         clob_liq=0.1,
-        amm_share_pct=95,
+        amm_share_pct=100,
         amm_liq=3.0,
     ),
     "heavy_amm": dict(
@@ -166,16 +156,16 @@ def build_parser() -> argparse.ArgumentParser:
         "  CPMM: x·y = k,  fee = cpmm-fee.\n"
         "  HFMM: StableSwap invariant,  fee = hfmm-fee, amplification = A."
     )
-    g.add_argument("--cpmm-reserves", type=float, default=500.0,
-                   help="CPMM base-currency reserves (default: 500)")
-    g.add_argument("--hfmm-reserves", type=float, default=500.0,
-                   help="HFMM base-currency reserves (default: 500)")
+    g.add_argument("--cpmm-reserves", type=float, default=1500.0,
+                   help="CPMM base-currency reserves (default: 1500)")
+    g.add_argument("--hfmm-reserves", type=float, default=1500.0,
+                   help="HFMM base-currency reserves (default: 1500)")
     g.add_argument("--cpmm-fee", type=float, default=0.003,
                    help="CPMM swap fee as fraction (default: 0.003 = 30 bps)")
     g.add_argument("--hfmm-fee", type=float, default=0.001,
                    help="HFMM swap fee as fraction (default: 0.001 = 10 bps)")
-    g.add_argument("--hfmm-A", type=float, default=100.0,
-                   help="HFMM amplification coefficient A (default: 100)")
+    g.add_argument("--hfmm-A", type=float, default=10.0,
+                   help="HFMM amplification coefficient A (default: 10)")
 
     g = p.add_argument_group(
         "Stress regime",
@@ -412,20 +402,23 @@ def generate_all_plots(sim: Simulator):
     logger = sim.logger
     stress_start = (sim.env.stress_start or 200) if sim.env else 200
 
-    plot_environment(logger)
-    plot_fx_price(logger, rolling=5)
-    plot_clob_spread(logger, rolling=5)
-
-    plot_execution_cost_curves(logger)
-    plot_cost_decomposition(logger, Q=5)
-    plot_total_market_depth(logger, rolling=10)
-
-    plot_cost_timeseries(logger, Q=5, rolling=10)
-    plot_flow_allocation(logger, rolling=10)
-    plot_clob_spread_vs_amm_cost(logger, Q=5, rolling=10)
-    plot_commonality(logger, Q=5, window=30)
-    plot_amm_liquidity(logger)
-    plot_stress_flow_migration(logger, stress_start=stress_start)
+    # Save dashboards + all individual plots to output/main/ (non-interactive).
+    generate_all_dashboards(
+        logger,
+        out_dir='output/main',
+        stress_start=stress_start,
+        Q=5,
+        rolling=10,
+        logger_no_amm=None,
+    )
+    save_all_individual_plots(
+        logger,
+        out_dir='output/main',
+        stress_start=stress_start,
+        Q=5,
+        rolling=10,
+        logger_no_amm=None,
+    )
 
 
 def main():

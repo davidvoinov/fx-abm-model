@@ -263,11 +263,7 @@ class Trader:
     # ---- multi-venue routing (active only when amm_pools is set) ---------
 
     def estimate_costs(self, Q: float, side: str = 'buy') -> Dict[str, float]:
-        """Return {venue_name: cost_bps} for quantity Q."""
-        try:
-            S_t = self.clob.mid_price()
-        except Exception:
-            S_t = 100.0  # fallback when book is empty
+        """Return {venue_name: internal execution cost_bps} for quantity Q."""
         costs: Dict[str, float] = {}
         try:
             costs['clob'] = self.clob.cost_bps(Q, side)
@@ -275,7 +271,8 @@ class Trader:
             costs['clob'] = float('inf')
         for name, pool in self.amm_pools.items():
             try:
-                q = pool.quote_buy(Q, S_t) if side == 'buy' else pool.quote_sell(Q, S_t)
+                # AMM internal TCA: slippage is measured vs local pool mid.
+                q = pool.quote_buy(Q) if side == 'buy' else pool.quote_sell(Q)
                 costs[name] = q['cost_bps']
             except Exception:
                 costs[name] = float('inf')

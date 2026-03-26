@@ -210,7 +210,7 @@ class Simulator:
                    clob_std: float = 2.0,
                    clob_volume: int = 1000,
                    cpmm_reserves: float = 1500.0,
-                   hfmm_reserves: float = 300.0,
+                   hfmm_reserves: float = 1500.0,
                    hfmm_A: float = 10.0,
                    cpmm_fee: float = 0.003,
                    hfmm_fee: float = 0.001,
