@@ -73,6 +73,7 @@ class MetricsLogger:
         self.amm_x_series: Dict[str, List[float]] = {}
         self.amm_y_series: Dict[str, List[float]] = {}
         self.amm_L_series: Dict[str, List[float]] = {}
+        self.amm_depth_series: Dict[str, List[float]] = {}  # effective_depth (base units)
 
         # Volume-slippage profiles for AMM
         # {pool_name: {threshold: [max_Q per iter]}}
@@ -106,6 +107,7 @@ class MetricsLogger:
             self.amm_x_series[name] = []
             self.amm_y_series[name] = []
             self.amm_L_series[name] = []
+            self.amm_depth_series[name] = []
             self.amm_vol_slip[name] = {th: [] for th in self.slippage_thresholds}
 
     def _ensure_venue(self, name: str):
@@ -157,6 +159,7 @@ class MetricsLogger:
             self.amm_x_series[name].append(pool.x)
             self.amm_y_series[name].append(pool.y)
             self.amm_L_series[name].append(pool.liquidity_measure())
+            self.amm_depth_series[name].append(pool.effective_depth())
 
             for Q in self.Q_grid:
                 q_info = pool.quote_buy(Q)

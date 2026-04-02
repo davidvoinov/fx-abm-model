@@ -130,8 +130,8 @@ def plot_total_market_depth(logger: 'MetricsLogger', rolling: int = 10,
 
     # AMM depths (stacked on top)
     amm_total = [0.0] * n
-    for name in logger.amm_L_series:
-        vals = logger.amm_L_series[name][:n]
+    for name in logger.amm_depth_series:
+        vals = logger.amm_depth_series[name][:n]
         while len(vals) < n:
             vals.append(0)
         amm_total = [a + v for a, v in zip(amm_total, vals)]

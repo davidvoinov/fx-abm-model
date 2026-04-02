@@ -839,7 +839,7 @@ class MarketMaker(Trader):
                  # Brunnermeier-Pedersen params (used when env is set)
                  alpha0: float = 2.0, alpha1: float = 100.0, alpha2: float = 50.0,
                  d0: float = 50.0, d1: float = 200.0, d2: float = 100.0,
-                 d_min: float = 5.0):
+                 d_min: float = 5.0, n_levels: int = 1):
         super().__init__(market, cash, assets,
                          clob=clob, amm_pools=amm_pools, env=env,
                          amm_share_pct=amm_share_pct, deterministic_venue=deterministic_venue,
@@ -858,6 +858,7 @@ class MarketMaker(Trader):
         self.d1 = d1
         self.d2 = d2
         self.d_min = d_min
+        self.n_levels = max(1, n_levels)
 
     def _target_spread_bps(self) -> float:
         """Quoted spread in bps as f(σ, c)."""
@@ -884,13 +885,19 @@ class MarketMaker(Trader):
 
             mid = (sp['bid'] + sp['ask']) / 2.0
             half_spread = mid * self._target_spread_bps() / 10_000.0 / 2.0
-            depth = max(1, int(self._target_depth()))
+            total_depth = max(1, int(self._target_depth()))
 
-            bid_price = round(mid - half_spread, 2)
-            ask_price = round(mid + half_spread, 2)
-
-            self._buy_limit(depth, bid_price)
-            self._sell_limit(depth, ask_price)
+            # Inverse pyramid: most depth at tight spread, tapering out.
+            # Mimics real MM behaviour — dense inside, thin at wide levels.
+            weights = list(range(self.n_levels, 0, -1))
+            w_sum = sum(weights)
+            for i in range(self.n_levels):
+                qty = max(1, int(total_depth * weights[i] / w_sum))
+                offset = half_spread * (1.0 + i * 0.5)
+                bid_price = round(mid - offset, 2)
+                ask_price = round(mid + offset, 2)
+                self._buy_limit(qty, bid_price)
+                self._sell_limit(qty, ask_price)
             return
 
         # ---------- classic single-venue mode (inventory balance) ---------
@@ -978,6 +985,12 @@ class AMMArbitrageur:
     4. **AMM consensus** — pure average of pool mid-prices as last
        resort.
 
+    Routing modes
+    -------------
+    * **all** (default) — arbitrage every mispriced pool independently.
+    * **best** — rank pools by profitability (deviation − fee), trade
+      only the most profitable pool each iteration.
+
     Robustness features
     -------------------
     * **Max correction cap**: per-iteration price correction is capped
@@ -993,13 +1006,15 @@ class AMMArbitrageur:
                  amm_pools: Dict[str, CPMMPool | HFMMPool],
                  env: MarketEnvironment = None,
                  max_spread_bps: float = 500.0,
-                 max_correction_pct: float = 10.0):
+                 max_correction_pct: float = 10.0,
+                 routing: str = 'all'):
         self.clob = clob
         self.amm_pools = amm_pools
         self.env = env
         self.type = 'AMMArbitrageur'
         self.max_spread_bps = max_spread_bps
         self.max_correction_pct = max_correction_pct / 100.0
+        self.routing = routing
 
     # ---- helpers ---------------------------------------------------------
 
@@ -1083,27 +1098,63 @@ class AMMArbitrageur:
         if S_t is None:
             return
 
-        for name, pool in self.amm_pools.items():
-            try:
-                # Skip if reserves are dangerously unbalanced
-                if not self._reserve_healthy(pool):
-                    if hasattr(pool, 'update_rate'):
-                        pool.update_rate()
-                    continue
+        if self.routing == 'best':
+            self._arbitrage_best(S_t)
+        else:
+            self._arbitrage_all(S_t)
 
+    def _arbitrage_all(self, S_t):
+        """Original mode: trade every mispriced pool."""
+        for name, pool in self.amm_pools.items():
+            self._arb_one_pool(pool, S_t)
+
+    def _arbitrage_best(self, S_t):
+        """Route to the most profitable pool only."""
+        candidates = []
+        for name, pool in self.amm_pools.items():
+            if not self._reserve_healthy(pool):
+                if hasattr(pool, 'update_rate'):
+                    pool.update_rate()
+                continue
+            try:
                 current = pool.mid_price()
                 if current <= 0:
                     continue
-                dev = (S_t - current) / current
-                if abs(dev) > self.max_correction_pct:
-                    S_capped = current * (1.0 + _math.copysign(
-                        self.max_correction_pct, dev))
-                else:
-                    S_capped = S_t
-
-                pool.arbitrage_to_target(S_capped)
-
-                if hasattr(pool, 'update_rate'):
-                    pool.update_rate()
+                dev_bps = abs(S_t - current) / current * 10_000
+                fee_bps = pool.fee * 10_000
+                profit_bps = dev_bps - fee_bps * 2
+                if profit_bps > 0:
+                    candidates.append((profit_bps, name, pool))
             except Exception:
                 pass
+
+        if not candidates:
+            return
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        _, _, best_pool = candidates[0]
+        self._arb_one_pool(best_pool, S_t)
+
+    def _arb_one_pool(self, pool, S_t):
+        """Arbitrage a single pool toward S_t."""
+        try:
+            if not self._reserve_healthy(pool):
+                if hasattr(pool, 'update_rate'):
+                    pool.update_rate()
+                return
+
+            current = pool.mid_price()
+            if current <= 0:
+                return
+            dev = (S_t - current) / current
+            if abs(dev) > self.max_correction_pct:
+                S_capped = current * (1.0 + _math.copysign(
+                    self.max_correction_pct, dev))
+            else:
+                S_capped = S_t
+
+            pool.arbitrage_to_target(S_capped)
+
+            if hasattr(pool, 'update_rate'):
+                pool.update_rate()
+        except Exception:
+            pass

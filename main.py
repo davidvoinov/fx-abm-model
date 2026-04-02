@@ -5,7 +5,7 @@ Run:
     python3 main.py                          # default scenario
     python3 main.py --preset heavy_amm       # 60% AMM flow
     python3 main.py --preset clob_only       # no AMM pools
-    python3 main.py --amm-share 40 --shock-iter 250 --shock-pct -15
+    python3 main.py --amm-share 30 --shock-iter 350 --shock-pct -20
 
 All configurable parameters are exposed as CLI flags.
 Use  python3 main.py --help  for the full list.
@@ -13,7 +13,11 @@ Use  python3 main.py --help  for the full list.
 
 import argparse
 import math
+import os
 import sys
+
+import numpy as np
+import pandas as pd
 
 from AgentBasedModel.simulator.simulator import Simulator
 from AgentBasedModel.visualization.dashboards import (
@@ -45,7 +49,9 @@ PRESETS = {
     "stress_test": dict(
         stress_start=150,
         stress_end=400,
+        sigma_low=0.01,
         sigma_high=0.08,
+        c_low=0.001,
         c_high=0.04,
     ),
     "shock_only": dict(
@@ -72,8 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--preset", choices=list(PRESETS.keys()), default=None,
                    help="Named parameter bundle (overridden by explicit flags).\n"
                         "Available: " + ", ".join(PRESETS.keys()))
-    g.add_argument("--n-iter", type=int, default=500,
-                   help="Number of simulation iterations (default: 500)")
+    g.add_argument("--n-iter", type=int, default=1000,
+                   help="Number of simulation iterations (default: 1000)")
     g.add_argument("--price", type=float, default=100.0,
                    help="Initial FX mid-price (default: 100)")
     g.add_argument("--seed", type=int, default=None,
@@ -174,18 +180,18 @@ def build_parser() -> argparse.ArgumentParser:
         "  c: c-low     → c-high\n"
         "Set --stress-start -1 to disable."
     )
-    g.add_argument("--stress-start", type=int, default=200,
-                   help="Iteration when stress begins (default: 200, -1 = off)")
-    g.add_argument("--stress-end", type=int, default=350,
-                   help="Iteration when stress ends (default: 350)")
-    g.add_argument("--sigma-low", type=float, default=0.01,
-                   help="Volatility in normal regime (default: 0.01)")
-    g.add_argument("--sigma-high", type=float, default=0.05,
-                   help="Volatility in stress regime (default: 0.05)")
-    g.add_argument("--c-low", type=float, default=0.001,
-                   help="Funding cost in normal regime (default: 0.001)")
-    g.add_argument("--c-high", type=float, default=0.02,
-                   help="Funding cost in stress regime (default: 0.02)")
+    g.add_argument("--stress-start", type=int, default=-1,
+                   help="Iteration when stress begins (default: -1 = off)")
+    g.add_argument("--stress-end", type=int, default=-1,
+                   help="Iteration when stress ends (default: -1 = off)")
+    g.add_argument("--sigma-low", type=float, default=0.015,
+                   help="Volatility in normal regime (default: 0.015)")
+    g.add_argument("--sigma-high", type=float, default=0.025,
+                   help="Volatility in stress regime (default: 0.025)")
+    g.add_argument("--c-low", type=float, default=0.003,
+                   help="Funding cost in normal regime (default: 0.003)")
+    g.add_argument("--c-high", type=float, default=0.008,
+                   help="Funding cost in stress regime (default: 0.008)")
 
     g = p.add_argument_group(
         "Exogenous price shock",
@@ -395,12 +401,92 @@ def print_summary(sim: Simulator):
         if avg_n > 0:
             print(f"    Stress: {avg_st:.1f} bps  ({avg_st/avg_n:.1f}x wider)")
 
+    # ---- Recovery time after shock ------------------------------------
+    shock_iter = sim.shock_iter if hasattr(sim, 'shock_iter') else None
+    if shock_iter is None:
+        shock_iter = getattr(sim, '_shock_iter', None)
+
+    if shock_iter is not None and logger.trade_log:
+        print("\n" + "-" * W)
+        print("  H3: POST-SHOCK RECOVERY TIME")
+        print("-" * W)
+
+        # Build trade DataFrame — use cost_bps directly (vs mid-price)
+        trades = pd.DataFrame(logger.trade_log)
+        # cost_bps is available in all trade records; fv_cost requires
+        # exec_price which only stress_sweep captures.  cost_bps recovery
+        # measures when execution quality returns to pre-shock levels.
+
+        WINDOW = 20
+        THRESHOLD = 20.0
+        WARMUP = 50
+
+        def _recovery(df, shock, window=WINDOW, threshold=THRESHOLD):
+            fin = df[np.isfinite(df['cost_bps'])].copy()
+            pre = fin[(fin['t'] >= WARMUP) & (fin['t'] < shock)]
+            if len(pre) < window:
+                return float('nan'), float('nan')
+            baseline = pre['cost_bps'].median()
+            post = fin[fin['t'] >= shock]
+            if len(post) == 0:
+                return float('nan'), baseline
+            per_t = post.groupby('t')['cost_bps'].median().sort_index()
+            roll = per_t.rolling(window, min_periods=window).median()
+            within = (roll - baseline).abs() <= threshold
+            recovered = within[within]
+            if len(recovered) == 0:
+                return float('inf'), baseline
+            return max(0, recovered.index[0] - shock), baseline
+
+        def _fmt(v):
+            if v != v:
+                return 'N/A'
+            if v == float('inf'):
+                return 'never'
+            return f'{v:.0f}'
+
+        rt_all, bl_all = _recovery(trades, shock_iter)
+
+        clob_trades = trades[trades['venue'] == 'clob']
+        amm_trades = trades[trades['venue'] != 'clob']
+
+        rt_clob, bl_clob = _recovery(clob_trades, shock_iter) if len(clob_trades) else (float('nan'), float('nan'))
+        rt_amm, bl_amm = _recovery(amm_trades, shock_iter) if len(amm_trades) else (float('nan'), float('nan'))
+
+        print(f"\n  Metric: periods after t={shock_iter} until rolling({WINDOW})")
+        print(f"          median fv_cost returns within ±{THRESHOLD:.0f} bps of baseline.")
+
+        print(f"\n  {'Venue':<12s}  {'Baseline':>10s}  {'Recovery':>10s}")
+        print(f"  {'-'*12}  {'-'*10}  {'-'*10}")
+
+        def _bl_fmt(v):
+            return f'{v:.1f}' if np.isfinite(v) else 'N/A'
+
+        print(f"  {'Combined':<12s}  {_bl_fmt(bl_all):>10s}  {_fmt(rt_all):>10s}")
+        print(f"  {'CLOB':<12s}  {_bl_fmt(bl_clob):>10s}  {_fmt(rt_clob):>10s}")
+        print(f"  {'AMM':<12s}  {_bl_fmt(bl_amm):>10s}  {_fmt(rt_amm):>10s}")
+
+        # Per AMM pool recovery
+        amm_pool_names = [v for v in trades['venue'].unique() if v != 'clob']
+        if len(amm_pool_names) > 1:
+            print()
+            for pname in sorted(amm_pool_names):
+                psub = trades[trades['venue'] == pname]
+                rt_p, bl_p = _recovery(psub, shock_iter) if len(psub) else (float('nan'), float('nan'))
+                print(f"  {'  ' + pname.upper():<12s}  {_bl_fmt(bl_p):>10s}  {_fmt(rt_p):>10s}")
+
     print("=" * W + "\n")
 
 
 def generate_all_plots(sim: Simulator):
+    import glob as _glob
     logger = sim.logger
     stress_start = (sim.env.stress_start or 200) if sim.env else 200
+
+    # Remove stale plots from previous runs.
+    out_dir = 'output/main'
+    for old_png in _glob.glob(os.path.join(out_dir, '*.png')):
+        os.remove(old_png)
 
     # Save dashboards + all individual plots to output/main/ (non-interactive).
     generate_all_dashboards(

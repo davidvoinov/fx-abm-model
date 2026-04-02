@@ -294,7 +294,7 @@ class Simulator:
         # ── Apply liquidity scaling ──────────────────────────────────
         eff_clob_volume = max(10, int(clob_volume * clob_liq))
         eff_n_noise = max(1, int(n_noise * clob_liq))
-        eff_d0 = 50.0 * clob_liq
+        eff_d0 = 60.0 * clob_liq
         eff_cpmm_res = cpmm_reserves * amm_liq
         eff_hfmm_res = hfmm_reserves * amm_liq
 
@@ -344,7 +344,8 @@ class Simulator:
         if enable_clob_mm:
             mm = MarketMaker(exchange, cash=1e4, env=env,
                              alpha0=3.0, alpha1=300.0, alpha2=200.0,
-                             d0=eff_d0, d1=500.0, d2=250.0, d_min=5.0)
+                             d0=eff_d0, d1=500.0, d2=250.0, d_min=5.0,
+                             n_levels=5)
 
         # ── Liquidity takers with venue routing ─────────────────────
         fx_traders: List = []

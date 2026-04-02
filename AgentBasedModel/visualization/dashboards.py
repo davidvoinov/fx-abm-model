@@ -186,8 +186,8 @@ def dashboard_h1(logger: 'MetricsLogger',
     ax3.fill_between(range(n), 0, clob_r, alpha=0.4, label='CLOB',
                      color=_C['clob'])
     amm_total = [0.0] * n
-    for name in logger.amm_L_series:
-        v = logger.amm_L_series[name][:n]
+    for name in logger.amm_depth_series:
+        v = logger.amm_depth_series[name][:n]
         while len(v) < n:
             v.append(0)
         amm_total = [a + b for a, b in zip(amm_total, v)]
@@ -198,7 +198,7 @@ def dashboard_h1(logger: 'MetricsLogger',
     _shade_stress(ax3, logger)
     ax3.legend(fontsize=10)
     ax3.set_xlabel('Iteration')
-    ax3.set_ylabel('Depth (units)')
+    ax3.set_ylabel('Depth (base units)')
     ax3.grid(True, alpha=0.25)
 
     # ── KPI summary panel ────────────────────────────────────────────
