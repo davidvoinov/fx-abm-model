@@ -20,8 +20,12 @@ class ExchangeAgent:
     """
     id = 0
 
-    def __init__(self, price: Union[float, int] = 100, std: Union[float, int] = 25, volume: int = 1000, rf: float = 5e-4,
-                 transaction_cost: float = 0):
+    def __init__(self, price: Union[float, int] = 100, std: Union[float, int] = 25, volume: int = 1000,
+                 rf: float = 5e-4, transaction_cost: float = 0,
+                 background_corridor_bps: float = 25.0,
+                 background_target_ratio: float = 1.0,
+                 anchor_strength: float = 1.0,
+                 anchor_threshold_bps: float = 0.0):
         """
         Initialization parameters
         :param price: stock initial price
@@ -37,7 +41,23 @@ class ExchangeAgent:
         self.dividend_book = list()  # list of future dividends
         self.risk_free = rf
         self.transaction_cost = transaction_cost
+        self._seed_price = float(price)
+        self._seed_std = float(std)
+        self._seed_volume = int(volume)
+        self._seed_qty_lo = max(1, volume // 500)
+        self._seed_qty_hi = max(5, volume // 100)
+        self._background_corridor_bps = max(5.0, float(background_corridor_bps))
+        self._background_target_ratio = max(1.0, float(background_target_ratio))
+        self._anchor_strength = max(0.0, min(1.0, float(anchor_strength)))
+        self._anchor_threshold_bps = max(0.0, float(anchor_threshold_bps))
         self._fill_book(price, std, volume, rf * price)
+        background_qty = self._background_qty_near_mid(
+            float(price), self._background_corridor_bps
+        )
+        self._background_target_qty = {
+            side: max(1.0, qty * self._background_target_ratio)
+            for side, qty in background_qty.items()
+        }
 
     def generate_dividend(self):
         """
@@ -47,6 +67,277 @@ class ExchangeAgent:
         d = self.dividend_book[-1] * self._next_dividend()
         self.dividend_book.append(max(d, 0))  # dividend > 0
         self.dividend_book.pop(0)
+
+    def expire_orders(self, fair_price: float = None):
+        """Remove only truly expiring orders.
+
+        TTL-tagged orders are short-lived by construction and should roll
+        off the book naturally. The seeded anonymous book, however,
+        represents persistent background liquidity; removing it simply
+        because fair value drifted was collapsing the default CLOB depth.
+        """
+
+        for side in ('bid', 'ask'):
+            expired = []
+            for order in self.order_book[side]:
+                # TTL-based expiry
+                if order.ttl is not None:
+                    if order.ttl <= 0:
+                        expired.append(order)
+                    else:
+                        order.ttl -= 1
+            for order in expired:
+                if order.trader is not None and hasattr(order.trader, 'orders'):
+                    try:
+                        order.trader.orders.remove(order)
+                    except ValueError:
+                        pass
+                self.order_book[side].remove(order)
+
+    def rebuild_order_book(self):
+        for side in ('bid', 'ask'):
+            orders = list(self.order_book[side])
+            orders.sort(key=lambda order: order.price, reverse=(side == 'bid'))
+
+            rebuilt = OrderList(side)
+            for order in orders:
+                order.left = None
+                order.right = None
+                rebuilt.append(order)
+
+            self.order_book[side] = rebuilt
+
+        if self.order_book['bid'] and self.order_book['ask']:
+            best_bid = self.order_book['bid'].first.price
+            best_ask = self.order_book['ask'].first.price
+
+            if best_bid >= best_ask:
+                mid = 0.5 * (best_bid + best_ask)
+                target_bid = _math.floor((mid - 0.005) * 100.0) / 100.0
+                target_ask = _math.ceil((mid + 0.005) * 100.0) / 100.0
+                bid_shift = best_bid - target_bid
+                ask_shift = target_ask - best_ask
+
+                for order in self.order_book['bid']:
+                    order.price = round(order.price - bid_shift, 2)
+                for order in self.order_book['ask']:
+                    order.price = round(order.price + ask_shift, 2)
+
+    def _background_qty_near_mid(self, reference_price: float, corridor_bps: float) -> dict:
+        if reference_price <= 0:
+            return {'bid': 0.0, 'ask': 0.0}
+
+        bid_lo = reference_price * (1.0 - corridor_bps / 10_000.0)
+        ask_hi = reference_price * (1.0 + corridor_bps / 10_000.0)
+        return {
+            'bid': sum(
+                order.qty for order in self.order_book['bid']
+                if order.trader is None and order.price >= bid_lo
+            ),
+            'ask': sum(
+                order.qty for order in self.order_book['ask']
+                if order.trader is None and order.price <= ask_hi
+            ),
+        }
+
+    def _draw_background_price(self, side: str, reference_price: float,
+                               corridor_bps: float) -> float:
+        tick = 0.01
+        max_offset = max(tick, reference_price * corridor_bps / 10_000.0)
+        scale = max(tick, max_offset / 3.0)
+        offset = min(max_offset, tick + random.expovariate(1.0 / scale))
+
+        if side == 'bid':
+            return round(reference_price - offset, 2)
+        return round(reference_price + offset, 2)
+
+    def _draw_background_price_outside_corridor(self, side: str,
+                                                reference_price: float,
+                                                corridor_bps: float) -> float:
+        tick = 0.01
+        min_offset = max(tick, reference_price * corridor_bps / 10_000.0 + tick)
+        scale = max(tick, min_offset / 2.0)
+        offset = min_offset + random.expovariate(1.0 / scale)
+
+        if side == 'bid':
+            return round(reference_price - offset, 2)
+        return round(reference_price + offset, 2)
+
+    def set_background_depth_target(self, reference_price: float,
+                                    total_target_qty: float,
+                                    corridor_bps: float = None,
+                                    rebalance: bool = True):
+        if reference_price is None or reference_price <= 0:
+            return
+
+        corridor_bps = corridor_bps or self._background_corridor_bps
+        per_side = max(1.0, float(total_target_qty) / 2.0)
+        self._background_target_qty = {'bid': per_side, 'ask': per_side}
+
+        if rebalance:
+            self.rebalance_background_liquidity(
+                reference_price,
+                corridor_bps=corridor_bps,
+                target_ratio=1.0,
+            )
+
+    def rebalance_background_liquidity(self, reference_price: float,
+                                       corridor_bps: float = None,
+                                       target_ratio: float = 1.0):
+        if reference_price is None or reference_price <= 0:
+            return
+
+        corridor_bps = corridor_bps or self._background_corridor_bps
+        targets = {
+            side: max(1.0, self._background_target_qty.get(side, 0.0) * target_ratio)
+            for side in ('bid', 'ask')
+        }
+        changed = False
+
+        bid_lo = reference_price * (1.0 - corridor_bps / 10_000.0)
+        ask_hi = reference_price * (1.0 + corridor_bps / 10_000.0)
+
+        for side in ('bid', 'ask'):
+            near_qty = 0.0
+            near_orders = []
+            far_orders = []
+
+            for order in self.order_book[side]:
+                if order.trader is not None:
+                    continue
+
+                in_corridor = order.price >= bid_lo if side == 'bid' else order.price <= ask_hi
+                if in_corridor:
+                    near_qty += order.qty
+                    near_orders.append(order)
+                else:
+                    far_orders.append(order)
+
+            near_orders.sort(key=lambda order: abs(order.price - reference_price), reverse=True)
+            far_orders.sort(key=lambda order: abs(order.price - reference_price), reverse=True)
+
+            while near_qty > targets[side] and near_orders:
+                order = near_orders.pop(0)
+                order.price = self._draw_background_price_outside_corridor(
+                    side,
+                    reference_price,
+                    corridor_bps,
+                )
+                near_qty -= order.qty
+                changed = True
+
+            while near_qty < targets[side] and far_orders:
+                order = far_orders.pop(0)
+                order.price = self._draw_background_price(side, reference_price, corridor_bps)
+                near_qty += order.qty
+                changed = True
+
+            while near_qty < targets[side]:
+                qty = random.randint(self._seed_qty_lo, self._seed_qty_hi)
+                price = self._draw_background_price(side, reference_price, corridor_bps)
+                self.order_book[side].append(Order(price, qty, side, None))
+                near_qty += qty
+                changed = True
+
+        if changed:
+            self.rebuild_order_book()
+
+    def recenter_book(self, fair_price: float, reprice_prob: float = 0.6,
+                      reprice_noise_bps: float = 0.5,
+                      anchor_strength: float = None,
+                      min_reprice_gap_bps: float = None,
+                      background_target_ratio: float = 1.0):
+        """Probabilistically shift resting orders toward *fair_price*.
+
+        The book closes only a fraction of the gap to the anchor on each
+        tick, creating a realistic lag between latent fair value and the
+        observed CLOB mid.
+
+        Each trader-owned order reprices with probability *reprice_prob*,
+        creating a natural lag between fair-price moves and book adjustment.
+        Repriced orders receive a small noise term to prevent
+        artificial clustering.
+
+        Parameters
+        ----------
+        fair_price : float
+            Target mid-price (from GBM or post-shock).
+        reprice_prob : float
+            Per-order probability of adjusting this tick (0–1).
+        reprice_noise_bps : float
+            Std of Gaussian noise added to repriced orders (in bps
+            of *fair_price*).
+        anchor_strength : float or None
+            Fraction of the gap between the current book mid and
+            *fair_price* closed this tick.  If None, uses the exchange
+            default.
+        min_reprice_gap_bps : float or None
+            Ignore tiny deviations below this threshold.  If None,
+            uses the exchange default.
+        """
+        sp = self.spread()
+        if sp is None or fair_price is None or fair_price <= 0:
+            return
+        book_mid = (sp['bid'] + sp['ask']) / 2.0
+        anchor_strength = self._anchor_strength if anchor_strength is None else max(0.0, min(1.0, anchor_strength))
+        min_reprice_gap_bps = (
+            self._anchor_threshold_bps
+            if min_reprice_gap_bps is None else max(0.0, min_reprice_gap_bps)
+        )
+        gap_bps = abs(fair_price - book_mid) / max(book_mid, 1e-9) * 10_000.0
+        if anchor_strength <= 0.0:
+            self.rebalance_background_liquidity(book_mid, target_ratio=background_target_ratio)
+            return
+        if gap_bps < min_reprice_gap_bps:
+            self.rebalance_background_liquidity(book_mid, target_ratio=background_target_ratio)
+            return
+        target_mid = book_mid + (fair_price - book_mid) * anchor_strength
+        dp = target_mid - book_mid
+        noise_std = max(target_mid, 1e-9) * reprice_noise_bps / 10_000.0
+        repriced = False
+        for side in ('bid', 'ask'):
+            for order in self.order_book[side]:
+                if order.trader is None:
+                    order.price = round(order.price + dp, 2)
+                    repriced = True
+                elif random.random() < reprice_prob:
+                    noise = random.gauss(0, noise_std) if noise_std > 0 else 0.0
+                    order.price = round(order.price + dp + noise, 2)
+                    repriced = True
+
+        if repriced:
+            self.rebuild_order_book()
+            self.rebalance_background_liquidity(target_mid, target_ratio=background_target_ratio)
+
+    def cancel_wave(self, cancel_frac: float = 0.5, near_touch: bool = True):
+        """Cancel a fraction of resting orders (liquidity crisis).
+
+        Parameters
+        ----------
+        cancel_frac : float
+            Fraction of orders to cancel (0–1).
+        near_touch : bool
+            If True, priority is given to orders near the top of book
+            (most aggressive), which is realistic — market-makers and
+            aggressive limit orders withdraw first in a crisis.
+        """
+        for side in ('bid', 'ask'):
+            orders = list(self.order_book[side])
+            if not orders:
+                continue
+            n_cancel = max(1, int(len(orders) * cancel_frac))
+            if near_touch:
+                # Cancel from the top (most aggressive) first
+                to_cancel = orders[:n_cancel]
+            else:
+                to_cancel = random.sample(orders, min(n_cancel, len(orders)))
+            for order in to_cancel:
+                if order.trader is not None and hasattr(order.trader, 'orders'):
+                    try:
+                        order.trader.orders.remove(order)
+                    except ValueError:
+                        pass
+                self.order_book[side].remove(order)
 
     def _fill_book(self, price, std, volume, div: float = 0.05):
         """
@@ -124,7 +415,16 @@ class ExchangeAgent:
 
         :return: void
         """
-        bid, ask = self.spread().values()
+        sp = self.spread()
+        if sp is None:
+            # Book empty — insert directly (no matching possible)
+            if order.order_type == 'bid':
+                self.order_book['bid'].insert(order)
+            elif order.order_type == 'ask':
+                self.order_book['ask'].insert(order)
+            return
+
+        bid, ask = sp.values()
         t_cost = self.transaction_cost
         if not bid or not ask:
             return
@@ -175,6 +475,7 @@ class Trader:
                  amm_pools: Dict[str, CPMMPool | HFMMPool] = None,
                  env: MarketEnvironment = None,
                  amm_share_pct: float = 25.0,
+                 venue_choice_rule: str = 'fixed_share',
                  deterministic_venue: bool = False,
                  beta_amm: float = 0.05,
                  cpmm_bias_bps: float = 5.0,
@@ -189,6 +490,7 @@ class Trader:
         :param amm_pools: dict of AMM pools (enables multi-venue mode)
         :param env: MarketEnvironment for σ_t, c_t
         :param amm_share_pct: target probability (0–100) of routing to AMM vs CLOB
+        :param venue_choice_rule: routing regime, either fixed_share or liquidity_aware
         :param deterministic_venue: if True, use argmin instead of logit
         :param beta_amm: logit sensitivity for intra-AMM choice (CPMM vs HFMM)
         :param cpmm_bias_bps: non-monetary utility discount applied to CPMM cost (bps)
@@ -210,6 +512,10 @@ class Trader:
         self.amm_pools = amm_pools or {}
         self.env = env
         self.amm_share_pct = max(0.0, min(100.0, amm_share_pct))
+        self.venue_choice_rule = (
+            venue_choice_rule if venue_choice_rule in {'fixed_share', 'liquidity_aware'}
+            else 'fixed_share'
+        )
         self.deterministic_venue = deterministic_venue
         self.beta_amm = beta_amm
         self.cpmm_bias_bps = cpmm_bias_bps
@@ -278,12 +584,81 @@ class Trader:
                 costs[name] = float('inf')
         return costs
 
-    def choose_venue(self, Q: float, side: str = 'buy') -> str:
-        """Two-step venue selection.
+    def _perceived_costs(self, costs: Dict[str, float]) -> Dict[str, float]:
+        """Apply venue-specific bias and estimation noise to routing costs."""
+        perceived: Dict[str, float] = {}
+        for name, cost in costs.items():
+            adjusted = cost
+            if name == 'cpmm' and cost != float('inf'):
+                adjusted -= self.cpmm_bias_bps
+            if name != 'clob' and self.cost_noise_std > 0 and cost != float('inf'):
+                adjusted += random.gauss(0, self.cost_noise_std)
+            perceived[name] = adjusted
+        return perceived
 
-        Step 1 — CLOB vs AMM with fixed probability ``amm_share_pct``.
-        Step 2 — within AMM, CPMM vs HFMM (softmax with β_amm),
-            using bias-adjusted and noise-perturbed costs.
+    def _liquidity_aware_pick(self, costs: Dict[str, float], Q: float) -> str:
+        """Route across all venues using cost, executable depth, and AMM price alignment."""
+        amm_names = [name for name in costs if name != 'clob']
+        if not amm_names:
+            return 'clob'
+
+        perceived = self._perceived_costs(costs)
+        try:
+            ref_mid = self.clob.mid_price()
+        except Exception:
+            ref_mid = float('nan')
+
+        amm_prior = max(0.0, min(1.0, self.amm_share_pct / 100.0))
+        clob_prior = max(0.05, 1.0 - amm_prior)
+        amm_prior_each = max(0.05, amm_prior / max(len(amm_names), 1))
+
+        scores: Dict[str, float] = {}
+        for name, cost in perceived.items():
+            if cost == float('inf') or not _math.isfinite(cost):
+                scores[name] = 0.0
+                continue
+
+            cost_score = 1.0 / (1.0 + max(cost, 0.0) / 25.0)
+            alignment_score = 1.0
+            prior_score = 0.5 + (clob_prior if name == 'clob' else amm_prior_each)
+
+            if name == 'clob':
+                try:
+                    depth = self.clob.total_depth(25)['total']
+                except Exception:
+                    depth = 0.0
+            else:
+                pool = self.amm_pools[name]
+                try:
+                    depth = pool.effective_depth(ref_mid) if _math.isfinite(ref_mid) else pool.effective_depth()
+                except Exception:
+                    depth = 0.0
+                try:
+                    pool_mid = pool.mid_price()
+                    if _math.isfinite(ref_mid) and ref_mid > 0 and _math.isfinite(pool_mid):
+                        basis_bps = abs(pool_mid - ref_mid) / ref_mid * 10_000.0
+                        alignment_score = 1.0 / (1.0 + basis_bps / 20.0)
+                except Exception:
+                    alignment_score = 1.0
+
+            depth_score = min(max(depth, 0.0) / max(10.0 * Q, 1.0), 2.0)
+            liquidity_score = 0.4 + 0.6 * min(depth_score, 1.0)
+            scores[name] = prior_score * cost_score * liquidity_score * alignment_score
+
+        return self._weighted_pick(scores)
+
+    def choose_venue(self, Q: float, side: str = 'buy') -> str:
+        """Venue selection under a fixed-share or liquidity-aware routing rule.
+
+        fixed_share:
+            Step 1 — CLOB vs AMM with fixed probability ``amm_share_pct``.
+            Step 2 — within AMM, CPMM vs HFMM (softmax with β_amm),
+                using bias-adjusted and noise-perturbed costs.
+
+        liquidity_aware:
+            Route probabilistically across all venues using perceived cost,
+            executable depth, price alignment, and a soft prior derived from
+            ``amm_share_pct``.
 
         Falls back to CLOB when there are no AMM pools.
         """
@@ -300,23 +675,16 @@ class Trader:
         if not amm_names:
             return 'clob'
 
+        if self.venue_choice_rule == 'liquidity_aware':
+            return self._liquidity_aware_pick(costs, Q)
+
         # ── Step 1: CLOB vs AMM (direct probability) ─────────────────
         if random.random() * 100.0 >= self.amm_share_pct:
             return 'clob'
 
         # ── Step 2: within AMM — CPMM vs HFMM ────────────────────────
         amm_raw_costs = {n: costs[n] for n in amm_names}
-        # Apply bias and noise
-        adj_costs: Dict[str, float] = {}
-        for n, c in amm_raw_costs.items():
-            adj = c
-            # Bias: reduce perceived CPMM cost
-            if n == 'cpmm':
-                adj -= self.cpmm_bias_bps
-            # Noise: estimation error
-            if self.cost_noise_std > 0:
-                adj += random.gauss(0, self.cost_noise_std)
-            adj_costs[n] = adj
+        adj_costs = {n: self._perceived_costs({n: c})[n] for n, c in amm_raw_costs.items()}
 
         return self._softmax_pick(adj_costs, self.beta_amm)
 
@@ -343,6 +711,21 @@ class Trader:
         cumulative = 0.0
         for (name, _), w in zip(items, weights):
             cumulative += w
+            if r <= cumulative:
+                return name
+        return items[-1][0]
+
+    @staticmethod
+    def _weighted_pick(scores: Dict[str, float]) -> str:
+        """Pick a key from positive score weights."""
+        items = list(scores.items())
+        total = sum(max(0.0, score) for _, score in items)
+        if total <= 0.0:
+            return items[0][0]
+        r = random.random() * total
+        cumulative = 0.0
+        for name, score in items:
+            cumulative += max(0.0, score)
             if r <= cumulative:
                 return name
         return items[-1][0]
@@ -421,6 +804,7 @@ class Random(Trader):
                  amm_pools: Dict[str, CPMMPool | HFMMPool] = None,
                  env: MarketEnvironment = None,
                  amm_share_pct: float = 25.0,
+                 venue_choice_rule: str = 'fixed_share',
                  deterministic_venue: bool = False,
                  beta_amm: float = 0.05,
                  cpmm_bias_bps: float = 5.0,
@@ -432,7 +816,8 @@ class Random(Trader):
                  label: str = 'Random'):
         super().__init__(market, cash, assets,
                          clob=clob, amm_pools=amm_pools, env=env,
-                         amm_share_pct=amm_share_pct, deterministic_venue=deterministic_venue,
+                         amm_share_pct=amm_share_pct, venue_choice_rule=venue_choice_rule,
+                         deterministic_venue=deterministic_venue,
                          beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
                          cost_noise_std=cost_noise_std)
         self.type = label if self.multi_venue else 'Random'
@@ -446,21 +831,36 @@ class Random(Trader):
         return random.expovariate(lamb)
 
     @staticmethod
-    def draw_price(order_type, spread: dict, std: Union[float, int] = 2.5) -> float:
+    def draw_price(order_type, spread: dict, std: Union[float, int] = 2.5,
+                   sigma: float = None, sigma_low: float = None) -> float:
         """
-        Draw price for limit order of Noise Agent. The price is calculated as:
-        1) 35% - within the spread - uniform distribution
-        2) 65% - out of the spread - delta from best price is exponential distribution r.v.
+        Draw price for limit order of Noise Agent.
+
+        The inside-spread probability scales inversely with σ/σ_low,
+        modelling the empirical tendency of passive liquidity to
+        withdraw from the top of book during volatile markets.
+
+        1) p_inside (35 % in normal, lower in stress) — uniform inside spread
+        2) (1 − p_inside) — out of spread with exponential delta
         """
-        random_state = random.random()  # Determines IN spread OR OUT of spread
+        # Regime-aware inside-spread probability
+        p_inside = 0.35
+        eff_std = std
+        if sigma is not None and sigma_low is not None and sigma_low > 0:
+            stress_ratio = sigma / sigma_low  # 1.0 normal, 4.0+ stress
+            p_inside = max(0.05, 0.35 / stress_ratio)
+            # Widen draw_delta in stress: orders placed further from touch
+            eff_std = std * max(1.0, stress_ratio * 0.7)
+
+        random_state = random.random()
 
         # Within the spread
-        if random_state < .35:
+        if random_state < p_inside:
             return random.uniform(spread['bid'], spread['ask'])
 
         # Out of spread
         else:
-            delta = Random.draw_delta(std)
+            delta = Random.draw_delta(eff_std)
             if order_type == 'bid':
                 return spread['bid'] - delta
             if order_type == 'ask':
@@ -482,7 +882,11 @@ class Random(Trader):
         if self.multi_venue:
             if random.random() > self.trade_prob:
                 return None
-            side = 'buy' if random.random() > 0.5 else 'sell'
+            # Toxic flow bias: during shock aftermath, trades skew
+            # in the shock direction (herding / stop-loss cascades)
+            bias = self.env.toxic_flow_bias if self.env else 0.0
+            p_buy = 0.5 + bias  # bias > 0 → more buys, bias < 0 → more sells
+            side = 'buy' if random.random() < p_buy else 'sell'
             Q = random.randint(self.q_min, self.q_max)
             venue = self.choose_venue(Q, side)
             cls_info = self._classify(Q)
@@ -496,15 +900,42 @@ class Random(Trader):
         if spread is None:
             return
 
-        random_state = random.random()
+        mid = (spread['bid'] + spread['ask']) / 2.0
 
-        if random_state > .5:
-            order_type = 'bid'
-        else:
-            order_type = 'ask'
+        # Use fair_price as reference for staleness when available
+        ref_mid = mid
+        if self.env is not None:
+            fp = getattr(self.env, 'fair_price', None)
+            if fp is not None and fp > 0:
+                fair_weight = 0.25 * getattr(self.env, 'systemic_liquidity', 1.0)
+                ref_mid = mid + fair_weight * (fp - mid)
+
+        # ── Re-center stale orders ──────────────────────────────────
+        # If any resting order is >200 bps from reference mid, cancel it
+        # and immediately replace with a fresh limit near the spread.
+        stale = None
+        for order in self.orders:
+            dist_bps = abs(order.price - ref_mid) / ref_mid * 10_000
+            if dist_bps > 200:
+                stale = order
+                break
+        if stale is not None:
+            side = stale.order_type
+            self._cancel_order(stale)
+            _sig = self.env.sigma if self.env else None
+            _sig_lo = self.env.sigma_low if self.env else None
+            price = self.draw_price(side, spread, sigma=_sig, sigma_low=_sig_lo)
+            quantity = self.draw_quantity()
+            order = Order(round(price, 2), round(quantity), side, self)
+            self.orders.append(order)
+            self.market.limit_order(order)
+            return  # one re-center per tick is enough
+
+        # ── Normal action selection (Fennell distribution) ──────────
+        order_type = 'bid' if random.random() > 0.5 else 'ask'
 
         random_state = random.random()
-        # Market order
+        # Market order (15%)
         if random_state > .85:
             quantity = self.draw_quantity()
             if order_type == 'bid':
@@ -512,20 +943,215 @@ class Random(Trader):
             elif order_type == 'ask':
                 self._sell_market(quantity)
 
-        # Limit order
-        elif random_state > .5:
-            price = self.draw_price(order_type, spread)
+        # Limit order (35%)
+        elif random_state > .50:
+            _sig = self.env.sigma if self.env else None
+            _sig_lo = self.env.sigma_low if self.env else None
+            price = self.draw_price(order_type, spread, sigma=_sig, sigma_low=_sig_lo)
             quantity = self.draw_quantity()
             if order_type == 'bid':
                 self._buy_limit(quantity, price)
             elif order_type == 'ask':
                 self._sell_limit(quantity, price)
 
-        # Cancellation order
+        # Cancellation order (35%)
         elif random_state < .35:
             if self.orders:
                 order_n = random.randint(0, len(self.orders) - 1)
                 self._cancel_order(self.orders[order_n])
+
+
+class FastRecyclerLP(Random):
+    """Fast electronic LP that rapidly replenishes near-mid depth.
+
+    The class represents short-lived, low-inventory liquidity provision.
+    Quotes are refreshed every tick, cluster close to the mid, and become
+    less aggressive when toxicity or funding stress rises.
+    """
+
+    def __init__(self, market: ExchangeAgent, cash: Union[float, int], assets: int = 0,
+                 env: MarketEnvironment = None,
+                 levels: int = 2,
+                 ttl: int = 2,
+                 base_qty: int = 2,
+                 max_qty: int = 5,
+                 **kwargs):
+        super().__init__(market, cash, assets, env=env, label='FastRecyclerLP', **kwargs)
+        self.type = 'FastRecyclerLP'
+        self.levels = max(1, int(levels))
+        self.ttl = max(1, int(ttl))
+        self.base_qty = max(1, int(base_qty))
+        self.max_qty = max(self.base_qty, int(max_qty))
+        self.last_quoted = False
+
+    def _cancel_all(self):
+        for order in self.orders.copy():
+            try:
+                self._cancel_order(order)
+            except Exception:
+                pass
+        self.orders.clear()
+
+    def _reference_mid(self, spread: dict) -> float:
+        book_mid = 0.5 * (spread['bid'] + spread['ask'])
+        if self.env is None:
+            return book_mid
+        fair_price = getattr(self.env, 'fair_price', None)
+        if fair_price is None or fair_price <= 0:
+            return book_mid
+        fair_weight = 0.20 + 0.25 * getattr(self.env, 'systemic_liquidity', 1.0)
+        fair_weight = max(0.15, min(0.45, fair_weight))
+        return book_mid + fair_weight * (fair_price - book_mid)
+
+    def call(self):
+        self._cancel_all()
+        self.last_quoted = False
+
+        spread = self.market.spread()
+        if spread is None:
+            return
+
+        mid = self._reference_mid(spread)
+        if mid <= 0:
+            return
+
+        sigma = getattr(self.env, 'sigma', 0.01) if self.env is not None else 0.01
+        funding = getattr(self.env, 'funding_cost', 0.0) if self.env is not None else 0.0
+        liquidity = getattr(self.env, 'systemic_liquidity', 1.0) if self.env is not None else 1.0
+        toxic_bias = abs(getattr(self.env, 'toxic_flow_bias', 0.0)) if self.env is not None else 0.0
+
+        withdraw_prob = max(0.0, 0.10 + 0.35 * toxic_bias + 0.25 * (1.0 - liquidity))
+        if random.random() < min(0.85, withdraw_prob):
+            return
+
+        total_spread_bps = 2.0 + 140.0 * sigma + 120.0 * funding
+        total_spread_bps *= 1.0 + 0.60 * toxic_bias + 0.35 * (1.0 - liquidity)
+        half_spread = max(0.01, mid * total_spread_bps / 20_000.0)
+        tick = 0.01
+
+        for level in range(self.levels):
+            level_mult = 1.0 + 0.45 * level
+            offset = half_spread * level_mult
+            qty_scale = max(0.5, liquidity) * (1.0 - 0.25 * level)
+            qty = max(1, min(self.max_qty, int(round(self.base_qty * qty_scale + random.random()))))
+
+            bid_price = round(mid - offset, 2)
+            ask_price = round(mid + offset, 2)
+
+            if bid_price >= spread['ask']:
+                bid_price = round(spread['ask'] - tick, 2)
+            if ask_price <= spread['bid']:
+                ask_price = round(spread['bid'] + tick, 2)
+            if bid_price >= ask_price:
+                continue
+
+            bid_order = Order(bid_price, qty, 'bid', self, ttl=self.ttl)
+            ask_order = Order(ask_price, qty, 'ask', self, ttl=self.ttl)
+            self.orders.append(bid_order)
+            self.orders.append(ask_order)
+            self.market.limit_order(bid_order)
+            self.market.limit_order(ask_order)
+
+        self.last_quoted = bool(self.orders)
+
+
+class LatentLP(Random):
+    """Liquidity provider that enters only when spread/depth dislocate.
+
+    This class models latent liquidity that is not constantly displayed in
+    the book but appears when market making becomes attractive enough.
+    """
+
+    def __init__(self, market: ExchangeAgent, cash: Union[float, int], assets: int = 0,
+                 env: MarketEnvironment = None,
+                 entry_spread_bps: float = 8.0,
+                 top_depth_threshold: float = 8.0,
+                 ttl: int = 4,
+                 base_qty: int = 3,
+                 max_qty: int = 8,
+                 **kwargs):
+        super().__init__(market, cash, assets, env=env, label='LatentLP', **kwargs)
+        self.type = 'LatentLP'
+        self.entry_spread_bps = max(1.0, float(entry_spread_bps))
+        self.top_depth_threshold = max(1.0, float(top_depth_threshold))
+        self.ttl = max(1, int(ttl))
+        self.base_qty = max(1, int(base_qty))
+        self.max_qty = max(self.base_qty, int(max_qty))
+        self.last_quoted = False
+
+    def _cancel_all(self):
+        for order in self.orders.copy():
+            try:
+                self._cancel_order(order)
+            except Exception:
+                pass
+        self.orders.clear()
+
+    def call(self):
+        self._cancel_all()
+        self.last_quoted = False
+
+        spread = self.market.spread()
+        top = self.market.spread_volume()
+        if spread is None or top is None:
+            return
+
+        mid = 0.5 * (spread['bid'] + spread['ask'])
+        if mid <= 0:
+            return
+
+        spread_bps = (spread['ask'] - spread['bid']) / mid * 10_000.0
+        near_touch_depth = min(top['bid'], top['ask'])
+        liquidity = getattr(self.env, 'systemic_liquidity', 1.0) if self.env is not None else 1.0
+        toxic_bias = abs(getattr(self.env, 'toxic_flow_bias', 0.0)) if self.env is not None else 0.0
+        shock_ticks = getattr(self.env, 'shock_ticks_remaining', 0) if self.env is not None else 0
+
+        active = (
+            spread_bps >= self.entry_spread_bps
+            or near_touch_depth <= self.top_depth_threshold
+            or shock_ticks > 0
+        )
+        if not active:
+            return
+
+        entry_prob = 0.55 + 0.20 * min(1.0, max(0.0, (spread_bps - self.entry_spread_bps) / self.entry_spread_bps))
+        entry_prob += 0.15 * min(1.0, max(0.0, (self.top_depth_threshold - near_touch_depth) / self.top_depth_threshold))
+        entry_prob -= 0.30 * toxic_bias
+        entry_prob *= 0.75 + 0.25 * liquidity
+        if random.random() > max(0.05, min(0.95, entry_prob)):
+            return
+
+        fair_price = getattr(self.env, 'fair_price', None) if self.env is not None else None
+        if fair_price is not None and fair_price > 0:
+            mid = 0.75 * mid + 0.25 * fair_price
+
+        half_spread_bps = max(2.0, min(12.0, 0.35 * spread_bps))
+        half_spread = max(0.01, mid * half_spread_bps / 10_000.0)
+        tick = 0.01
+        depth_gap = max(0.0, self.top_depth_threshold - near_touch_depth)
+        qty = max(self.base_qty, int(round(self.base_qty + 0.75 * depth_gap)))
+        qty = min(self.max_qty, qty)
+
+        for level in range(2):
+            offset = half_spread * (1.0 + 0.75 * level)
+            bid_price = round(mid - offset, 2)
+            ask_price = round(mid + offset, 2)
+
+            if bid_price >= spread['ask']:
+                bid_price = round(spread['ask'] - tick, 2)
+            if ask_price <= spread['bid']:
+                ask_price = round(spread['bid'] + tick, 2)
+            if bid_price >= ask_price:
+                continue
+
+            bid_order = Order(bid_price, qty, 'bid', self, ttl=self.ttl)
+            ask_order = Order(ask_price, qty, 'ask', self, ttl=self.ttl)
+            self.orders.append(bid_order)
+            self.orders.append(ask_order)
+            self.market.limit_order(bid_order)
+            self.market.limit_order(ask_order)
+
+        self.last_quoted = bool(self.orders)
 
 
 class Fundamentalist(Trader):
@@ -544,6 +1170,7 @@ class Fundamentalist(Trader):
                  amm_pools: Dict[str, CPMMPool | HFMMPool] = None,
                  env: MarketEnvironment = None,
                  amm_share_pct: float = 25.0,
+                 venue_choice_rule: str = 'fixed_share',
                  deterministic_venue: bool = False,
                  beta_amm: float = 0.05,
                  cpmm_bias_bps: float = 5.0,
@@ -563,7 +1190,8 @@ class Fundamentalist(Trader):
         """
         super().__init__(market, cash, assets,
                          clob=clob, amm_pools=amm_pools, env=env,
-                         amm_share_pct=amm_share_pct, deterministic_venue=deterministic_venue,
+                         amm_share_pct=amm_share_pct, venue_choice_rule=venue_choice_rule,
+                         deterministic_venue=deterministic_venue,
                          beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
                          cost_noise_std=cost_noise_std)
         self.type = 'Fundamentalist'
@@ -596,7 +1224,8 @@ class Fundamentalist(Trader):
                 mid = self.clob.mid_price()
             except Exception:
                 return None
-            mispricing = (self.fundamental_rate - mid) / mid
+            fair = self.env.fair_price if (self.env is not None and hasattr(self.env, 'fair_price')) else self.fundamental_rate
+            mispricing = (fair - mid) / mid
             if abs(mispricing) < self.fx_gamma:
                 return None
             side = 'buy' if mispricing > 0 else 'sell'
@@ -680,6 +1309,8 @@ class Chartist(Trader):
         random_state = random.random()
         t_cost = self.market.transaction_cost
         spread = self.market.spread()
+        if spread is None:
+            return
 
         if self.sentiment == 'Optimistic':
             # Market order
@@ -687,7 +1318,9 @@ class Chartist(Trader):
                 self._buy_market(Random.draw_quantity())
             # Limit order
             elif random_state > .5:
-                self._buy_limit(Random.draw_quantity(), Random.draw_price('bid', spread) * (1 - t_cost))
+                _sig = self.env.sigma if self.env else None
+                _sig_lo = self.env.sigma_low if self.env else None
+                self._buy_limit(Random.draw_quantity(), Random.draw_price('bid', spread, sigma=_sig, sigma_low=_sig_lo) * (1 - t_cost))
             # Cancel order
             elif random_state < .35:
                 if self.orders:
@@ -698,7 +1331,9 @@ class Chartist(Trader):
                 self._sell_market(Random.draw_quantity())
             # Limit order
             elif random_state > .5:
-                self._sell_limit(Random.draw_quantity(), Random.draw_price('ask', spread) * (1 + t_cost))
+                _sig = self.env.sigma if self.env else None
+                _sig_lo = self.env.sigma_low if self.env else None
+                self._sell_limit(Random.draw_quantity(), Random.draw_price('ask', spread, sigma=_sig, sigma_low=_sig_lo) * (1 + t_cost))
             # Cancel order
             elif random_state < .35:
                 if self.orders:
@@ -741,14 +1376,14 @@ class Universalist(Fundamentalist, Chartist):
     Universalist mixes Fundamentalist, Chartist trading strategies, and allows to change from
     one strategy to another.
     """
-    def __init__(self, market: ExchangeAgent, cash: Union[float, int], assets: int = 0, access: int = 1):
+    def __init__(self, market: ExchangeAgent, cash: Union[float, int], assets: int = 0, access: int = 1, **kwargs):
         """
         :param market: exchange agent link
         :param cash: number of cash
         :param assets: number of assets
         :param access: number of future dividends informed
         """
-        super().__init__(market, cash, assets, access=access)
+        super().__init__(market, cash, assets, access=access, **kwargs)
         self.type = 'Chartist' if random.random() > .5 else 'Fundamentalist'  # randomly decide type
         self.sentiment = 'Optimistic' if random.random() > .5 else 'Pessimistic'  # sentiment about trend (Chartist)
         self.access = access  # next n dividend payments known (Fundamentalist)
@@ -837,9 +1472,16 @@ class MarketMaker(Trader):
                  cpmm_bias_bps: float = 5.0,
                  cost_noise_std: float = 1.5,
                  # Brunnermeier-Pedersen params (used when env is set)
-                 alpha0: float = 2.0, alpha1: float = 100.0, alpha2: float = 50.0,
-                 d0: float = 50.0, d1: float = 200.0, d2: float = 100.0,
-                 d_min: float = 5.0, n_levels: int = 1):
+                 alpha0: float = 1.5, alpha1: float = 300.0, alpha2: float = 500.0,
+                 alpha3: float = 50.0,
+                 d0: float = 50.0, d1: float = 750.0, d2: float = 500.0,
+                 d3: float = 30.0,
+                 d_min: float = 3.0, n_levels: int = 5,
+                 inv_skew_bps: float = 0.3,
+                 venue_interaction_mode: str = 'competition',
+                 amm_spread_impact_bps: float = 3.0,
+                 amm_depth_impact: float = 60.0,
+                 amm_reference_q: float = 5.0):
         super().__init__(market, cash, assets,
                          clob=clob, amm_pools=amm_pools, env=env,
                          amm_share_pct=amm_share_pct, deterministic_venue=deterministic_venue,
@@ -854,24 +1496,191 @@ class MarketMaker(Trader):
         self.alpha0 = alpha0
         self.alpha1 = alpha1
         self.alpha2 = alpha2
+        self.alpha3 = alpha3    # OFI-based spread widening
         self.d0 = d0
         self.d1 = d1
         self.d2 = d2
+        self.d3 = d3            # OFI-based depth reduction
         self.d_min = d_min
         self.n_levels = max(1, n_levels)
+        self.inv_skew_bps = inv_skew_bps  # inventory skew coefficient
+        self.venue_interaction_mode = venue_interaction_mode
+        self.amm_spread_impact_bps = max(0.0, amm_spread_impact_bps)
+        self.amm_depth_impact = max(0.0, amm_depth_impact)
+        self.amm_reference_q = max(1.0, float(amm_reference_q))
 
-    def _target_spread_bps(self) -> float:
-        """Quoted spread in bps as f(σ, c)."""
-        return self.alpha0 + self.alpha1 * self.env.sigma + self.alpha2 * self.env.funding_cost
+        # Inventory & order-flow tracking
+        self.inventory: float = 0.0       # net position (+ = long)
+        self._ofi_window: List[float] = []  # recent order-flow imbalance
+        self._ofi_maxlen: int = 20
 
-    def _target_depth(self) -> float:
-        """Depth as f(σ, c), floored at d_min."""
+    def _recent_ofi(self) -> float:
+        """Average recent order-flow imbalance (positive = buy pressure)."""
+        if not self._ofi_window:
+            return 0.0
+        return sum(self._ofi_window) / len(self._ofi_window)
+
+    def _update_ofi(self):
+        """Blend book imbalance with realised taker flow imbalance."""
+        sv = self.market.spread_volume()
+        if sv is not None:
+            book_ofi = (sv['bid'] - sv['ask']) / max(1, sv['bid'] + sv['ask'])
+        else:
+            book_ofi = 0.0
+        flow_ofi = getattr(self.env, 'order_flow_imbalance', 0.0) if self.env is not None else 0.0
+        ofi = 0.4 * book_ofi + 0.6 * flow_ofi
+        self._ofi_window.append(ofi)
+        if len(self._ofi_window) > self._ofi_maxlen:
+            self._ofi_window.pop(0)
+
+    def _liquidity_factor(self) -> float:
+        if self.env is None:
+            return 1.0
+        return max(0.2, min(1.0, getattr(self.env, 'systemic_liquidity', 1.0)))
+
+    def _reference_mid(self, spread: Optional[dict], fair_mid: Optional[float]) -> Optional[float]:
+        book_mid = None
+        if spread is not None:
+            book_mid = (spread['bid'] + spread['ask']) / 2.0
+
+        if book_mid is None:
+            return fair_mid
+        if fair_mid is None or fair_mid <= 0:
+            return book_mid
+
+        sigma_base = getattr(self.env, 'sigma_low', None)
+        stress_scale = 1.0
+        if sigma_base is not None and sigma_base > 0:
+            stress_scale = max(1.0, self.env.sigma / sigma_base)
+
+        liquidity_factor = self._liquidity_factor()
+        gap_bps = abs(fair_mid - book_mid) / max(book_mid, 1e-9) * 10_000.0
+        fair_weight = 0.35 * liquidity_factor / stress_scale
+        fair_weight /= 1.0 + gap_bps / 75.0
+        fair_weight = max(0.05, min(0.35, fair_weight))
+        return book_mid + fair_weight * (fair_mid - book_mid)
+
+    def _amm_support_score(self, mid: float) -> float:
+        """Competitive quality of AMM liquidity as an outside option for the CLOB MM.
+
+        The score is high only when AMM liquidity is simultaneously deep,
+        cheap for a representative trade, and internally consistent in price.
+        This avoids giving the CLOB an automatic bonus just because an AMM
+        exists in the market.
+        """
+        if not self.amm_pools or mid <= 0:
+            return 0.0
+
+        scores = []
+        pool_mids = []
+        stress_scale = 1.0
+        sigma_base = getattr(self.env, 'sigma_low', None)
+        if sigma_base is not None and sigma_base > 0:
+            stress_scale = max(1.0, self.env.sigma / sigma_base)
+
+        for pool in self.amm_pools.values():
+            try:
+                depth = max(0.0, pool.effective_depth(mid))
+                buy_cost = pool.quote_buy(self.amm_reference_q, S_t=mid)['cost_bps']
+                sell_cost = pool.quote_sell(self.amm_reference_q, S_t=mid)['cost_bps']
+                pool_mid = pool.mid_price()
+                avg_cost = 0.5 * (buy_cost + sell_cost)
+                if not (_math.isfinite(avg_cost) and _math.isfinite(pool_mid) and pool_mid > 0):
+                    continue
+
+                alignment_bps = abs(pool_mid - mid) / mid * 10_000.0
+                depth_score = min(depth / max(20.0 * self.amm_reference_q, 1.0), 2.0)
+                cost_score = 1.0 / (1.0 + avg_cost / 25.0)
+                alignment_score = 1.0 / (1.0 + alignment_bps / 20.0)
+                scores.append(depth_score * cost_score * alignment_score)
+                pool_mids.append(pool_mid)
+            except Exception:
+                pass
+
+        if not scores:
+            return 0.0
+
+        support = sum(scores) / len(scores)
+        if len(pool_mids) > 1:
+            dispersion_bps = (max(pool_mids) - min(pool_mids)) / mid * 10_000.0
+            support *= 1.0 / (1.0 + dispersion_bps / 15.0)
+
+        return max(0.0, min(1.0, support / stress_scale))
+
+    def _venue_interaction_state(self, mid: float) -> dict:
+        """Translate AMM presence into risk modifiers, not direct quote subsidies."""
+        liquidity_factor = self._liquidity_factor()
+        state = {
+            'ofi_scale': 1.0,
+            'inventory_scale': 1.0,
+            'liquidity_factor': liquidity_factor,
+        }
+        if self.venue_interaction_mode == 'none':
+            return state
+
+        support = self._amm_support_score(mid)
+        if support <= 0.0:
+            return state
+
+        spread_relief = min(0.35, self.amm_spread_impact_bps / 20.0) * support
+        depth_relief = min(0.35, self.amm_depth_impact / 150.0) * support
+
+        if self.venue_interaction_mode == 'toxicity':
+            state['ofi_scale'] = 1.0 + 0.60 * spread_relief
+            state['inventory_scale'] = 1.0 + 0.75 * depth_relief
+            state['liquidity_factor'] = max(0.2, liquidity_factor * (1.0 - 0.40 * depth_relief))
+            return state
+
+        state['ofi_scale'] = max(0.65, 1.0 - 0.60 * spread_relief)
+        state['inventory_scale'] = max(0.70, 1.0 - 0.75 * depth_relief)
+        support_bonus = 0.10 * spread_relief + 0.20 * depth_relief
+        state['liquidity_factor'] = min(
+            1.15,
+            liquidity_factor + depth_relief * (1.0 - liquidity_factor) + support_bonus,
+        )
+        return state
+
+    def _target_spread_bps(self, mid: float) -> float:
+        """Quoted spread in bps as f(σ, c, |OFI|)."""
+        venue_state = self._venue_interaction_state(mid)
+        effective_ofi = abs(self._recent_ofi()) * venue_state['ofi_scale']
+        base = self.alpha0 + self.alpha1 * self.env.sigma + self.alpha2 * self.env.funding_cost
+        base += self.alpha3 * effective_ofi
+        base += 35.0 * (1.0 - venue_state['liquidity_factor'])
+        return max(0.5, base)
+
+    def _target_depth(self, mid: float) -> float:
+        """Depth as f(σ, c, |OFI|, |inventory|), floored at d_min."""
+        venue_state = self._venue_interaction_state(mid)
+        effective_ofi = abs(self._recent_ofi()) * venue_state['ofi_scale']
+        inventory_penalty = 0.1 * abs(self.inventory) * venue_state['inventory_scale']
         d = self.d0 - self.d1 * self.env.sigma - self.d2 * self.env.funding_cost
+        d -= self.d3 * effective_ofi
+        d -= inventory_penalty
+        d *= venue_state['liquidity_factor']
         return max(d, self.d_min)
+
+    def _inventory_skew(self, mid: float) -> float:
+        """Skew mid-price away from inventory risk (bps → price offset)."""
+        return -self.inv_skew_bps * self.inventory * mid / 10_000.0
 
     def call(self):
         # ---------- multi-venue mode (σ/c-dependent MM) -------------------
         if self.env is not None:
+            # Update OFI tracking
+            self._update_ofi()
+
+            # Track inventory from fills on previous orders:
+            # orders that were partially filled have reduced qty
+            for order in self.orders:
+                if hasattr(order, '_mm_init_qty'):
+                    filled = order._mm_init_qty - order.qty
+                    if filled > 0:
+                        if order.order_type == 'bid':
+                            self.inventory += filled
+                        else:
+                            self.inventory -= filled
+            # that were partially or fully filled (qty changed since placement)
             for order in self.orders.copy():
                 try:
                     self._cancel_order(order)
@@ -880,24 +1689,43 @@ class MarketMaker(Trader):
             self.orders.clear()
 
             sp = self.market.spread()
-            if sp is None:
+            fair_mid = getattr(self.env, 'fair_price', None)
+
+            if sp is None and (fair_mid is None or fair_mid <= 0):
                 return
 
-            mid = (sp['bid'] + sp['ask']) / 2.0
-            half_spread = mid * self._target_spread_bps() / 10_000.0 / 2.0
-            total_depth = max(1, int(self._target_depth()))
+            mid = self._reference_mid(sp, fair_mid)
+            if mid is None or mid <= 0:
+                return
 
-            # Inverse pyramid: most depth at tight spread, tapering out.
-            # Mimics real MM behaviour — dense inside, thin at wide levels.
+            # Apply inventory skew: shift effective mid away from risk
+            skew = self._inventory_skew(mid)
+            eff_mid = mid + skew
+
+            half_spread = mid * self._target_spread_bps(mid) / 10_000.0 / 2.0
+            total_depth = max(1, int(self._target_depth(mid)))
+
+            # Inventory-based one-sided thinning: reduce depth on the
+            # overexposed side to encourage inventory mean-reversion
+            inv_ratio = min(1.0, abs(self.inventory) / max(1, self.softlimit))
+            bid_depth_frac = 1.0 - 0.5 * inv_ratio if self.inventory > 0 else 1.0
+            ask_depth_frac = 1.0 - 0.5 * inv_ratio if self.inventory < 0 else 1.0
+
+            # Inverse pyramid: most depth at tight spread, tapering out
             weights = list(range(self.n_levels, 0, -1))
             w_sum = sum(weights)
             for i in range(self.n_levels):
-                qty = max(1, int(total_depth * weights[i] / w_sum))
+                base_qty = max(1, int(total_depth * weights[i] / w_sum))
                 offset = half_spread * (1.0 + i * 0.5)
-                bid_price = round(mid - offset, 2)
-                ask_price = round(mid + offset, 2)
-                self._buy_limit(qty, bid_price)
-                self._sell_limit(qty, ask_price)
+                bid_qty = max(1, int(base_qty * bid_depth_frac))
+                ask_qty = max(1, int(base_qty * ask_depth_frac))
+                bid_price = round(eff_mid - offset, 2)
+                ask_price = round(eff_mid + offset, 2)
+                self._buy_limit(bid_qty, bid_price)
+                self._sell_limit(ask_qty, ask_price)
+            # Tag orders with initial qty for inventory tracking next tick
+            for order in self.orders:
+                order._mm_init_qty = order.qty
             return
 
         # ---------- classic single-venue mode (inventory balance) ---------
@@ -944,7 +1772,9 @@ class AMMProvider:
                  phi1: float = 0.5,
                  phi2: float = 2.0,
                  phi3: float = 1.0,
-                 max_adj: float = 0.05):
+                 max_adj: float = 0.05,
+                 core_liquidity_ratio: float = 0.65,
+                 stabilizing_bias: float = 0.02):
         self.type = 'AMMProvider'
         self.pool = pool
         self.env = env
@@ -952,6 +1782,9 @@ class AMMProvider:
         self.phi2 = phi2
         self.phi3 = phi3
         self.max_adj = max_adj
+        self.core_liquidity_ratio = max(0.0, min(1.0, core_liquidity_ratio))
+        self.stabilizing_bias = max(0.0, stabilizing_bias)
+        self._initial_liquidity = max(self.pool.liquidity_measure(), 1e-9)
 
     def update_liquidity(self):
         """Adjust pool liquidity according to LP rule.  Called once per period."""
@@ -961,8 +1794,24 @@ class AMMProvider:
         fee_income = self.pool.period_fee_revenue
         sigma = self.env.sigma
         c = self.env.funding_cost
+        liquidity_factor = getattr(self.env, 'systemic_liquidity', 1.0)
+        flow_pressure = abs(getattr(self.env, 'order_flow_imbalance', 0.0))
+        sigma_base = max(getattr(self.env, 'sigma_low', sigma), 1e-9)
+        stress_excess = max(0.0, sigma / sigma_base - 1.0)
+        stressed_flow_pressure = flow_pressure * (stress_excess + (1.0 - liquidity_factor))
         delta_L = self.phi1 * fee_income - self.phi2 * sigma - self.phi3 * c
         frac = delta_L / L
+        frac -= 0.03 * (1.0 - liquidity_factor)
+        frac -= 0.02 * stressed_flow_pressure
+        frac += self.stabilizing_bias * max(0.0, 0.85 - liquidity_factor)
+
+        core_floor = self._initial_liquidity * self.core_liquidity_ratio
+        if L < core_floor:
+            refill = min(self.max_adj, max(0.0, (core_floor - L) / max(L, 1e-9)))
+            frac = max(frac, refill)
+        elif frac < 0 and L * (1.0 + frac) < core_floor:
+            frac = core_floor / max(L, 1e-9) - 1.0
+
         frac = max(-self.max_adj, min(self.max_adj, frac))
         if frac > 0:
             self.pool.add_liquidity(frac)
@@ -1007,7 +1856,8 @@ class AMMArbitrageur:
                  env: MarketEnvironment = None,
                  max_spread_bps: float = 500.0,
                  max_correction_pct: float = 10.0,
-                 routing: str = 'all'):
+                 routing: str = 'all',
+                 trade_fraction_cap: float = 0.20):
         self.clob = clob
         self.amm_pools = amm_pools
         self.env = env
@@ -1015,6 +1865,7 @@ class AMMArbitrageur:
         self.max_spread_bps = max_spread_bps
         self.max_correction_pct = max_correction_pct / 100.0
         self.routing = routing
+        self.trade_fraction_cap = max(0.0, min(1.0, trade_fraction_cap))
 
     # ---- helpers ---------------------------------------------------------
 
@@ -1028,23 +1879,41 @@ class AMMArbitrageur:
                 pass
         return sum(mids) / len(mids) if mids else None
 
+    def _blend_with_fair(self, observed: Optional[float]) -> Optional[float]:
+        """Treat env.fair_price as a latent anchor rather than a command."""
+        fair = None
+        if self.env is not None:
+            fair = self.env.fair_price
+
+        if fair is None:
+            return observed
+        if observed is None:
+            return fair
+
+        sigma_base = getattr(self.env, 'sigma_low', None) if self.env is not None else None
+        stress_scale = 1.0
+        if sigma_base is not None and sigma_base > 0 and self.env is not None:
+            stress_scale = max(1.0, self.env.sigma / sigma_base)
+
+        liquidity_factor = getattr(self.env, 'systemic_liquidity', 1.0)
+        gap_bps = abs(fair - observed) / max(observed, 1e-9) * 10_000.0
+        fair_weight = 0.35 * liquidity_factor / stress_scale
+        fair_weight /= 1.0 + gap_bps / 75.0
+        fair_weight = max(0.05, min(0.35, fair_weight))
+        return observed + fair_weight * (fair - observed)
+
     def _reference_price(self) -> Optional[float]:
         """
         Determine the best available reference price.
 
         Priority:
-        1. env.fair_price (exogenous GBM — always trustworthy)
-        2. CLOB mid (if book is healthy)
-        3. Blend of CLOB + AMM consensus
-        4. Pure AMM consensus
+        1. CLOB / AMM observed price discovery
+        2. Blend with env.fair_price as a latent anchor
+        3. Pure fair_price only if all venue prices are unavailable
         """
-        # (1) Exogenous fair price — highest priority
-        if self.env is not None:
-            fp = self.env.fair_price
-            if fp is not None:
-                return fp
+        fair = self.env.fair_price if self.env is not None else None
 
-        # (2–4) CLOB / blend / AMM fallback
+        # CLOB / blend / AMM fallback
         S_clob = None
         try:
             S_clob = self.clob.mid_price()
@@ -1054,16 +1923,16 @@ class AMMArbitrageur:
         S_amm = self._amm_consensus()
 
         if S_clob is None and S_amm is None:
-            return None
+            return fair
         if S_clob is None:
-            return S_amm
+            return self._blend_with_fair(S_amm)
         if S_amm is None:
-            return S_clob
+            return self._blend_with_fair(S_clob)
 
         # Sanity: if CLOB is implausible relative to AMM (>50 % off)
         clob_dev = abs(S_clob - S_amm) / S_amm if S_amm > 0 else 0
         if clob_dev > 0.5:
-            return S_amm
+            return self._blend_with_fair(S_amm)
 
         try:
             spread_bps = self.clob.quoted_spread_bps()
@@ -1071,12 +1940,15 @@ class AMMArbitrageur:
             spread_bps = float('inf')
 
         if not _math.isfinite(spread_bps) or spread_bps > 2000:
-            return S_amm
+            return self._blend_with_fair(S_amm)
         if spread_bps > self.max_spread_bps:
             w = max(0.0, 1.0 - (spread_bps - self.max_spread_bps)
                     / (2000 - self.max_spread_bps))
-            return w * S_clob + (1.0 - w) * S_amm
-        return S_clob
+            market_ref = w * S_clob + (1.0 - w) * S_amm
+            return self._blend_with_fair(market_ref)
+
+        market_ref = 0.65 * S_clob + 0.35 * S_amm
+        return self._blend_with_fair(market_ref)
 
     @staticmethod
     def _reserve_healthy(pool, threshold: float = 0.1) -> bool:
@@ -1152,7 +2024,8 @@ class AMMArbitrageur:
             else:
                 S_capped = S_t
 
-            pool.arbitrage_to_target(S_capped)
+            max_trade_qty = max(0.0, pool.x * self.trade_fraction_cap)
+            pool.arbitrage_to_target(S_capped, max_trade_qty=max_trade_qty)
 
             if hasattr(pool, 'update_rate'):
                 pool.update_rate()

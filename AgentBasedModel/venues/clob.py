@@ -33,6 +33,10 @@ class CLOBVenue:
     ----------
     exchange : ExchangeAgent
         The underlying CLOB.
+    env : MarketEnvironment, optional
+        Stored for potential use by downstream analytics.
+        Note: ``mid_price()`` always returns the book mid
+        ``(best_bid + best_ask) / 2``, not ``env.fair_price``.
     f_broker : float
         Broker fee in **bps** (default 0).
     f_venue : float
@@ -40,18 +44,23 @@ class CLOBVenue:
     """
 
     def __init__(self, exchange: 'ExchangeAgent',
+                 env: 'MarketEnvironment' = None,
                  f_broker: float = 0.0, f_venue: float = 0.0):
         self.exchange = exchange
+        self.env = env
         self.f_broker = f_broker
         self.f_venue = f_venue
 
     # ---- basic prices ----------------------------------------------------
 
     def mid_price(self) -> float:
+        sp = self.exchange.spread()
+        if sp is not None:
+            return (sp['bid'] + sp['ask']) / 2.0
+        # Fallback to exchange.price() which rounds to 0.1
         try:
             return self.exchange.price()
         except Exception:
-            # Book empty — return last dividend price as fallback
             if hasattr(self.exchange, 'dividend_book') and self.exchange.dividend_book:
                 return self.exchange.dividend_book[-1]
             return 100.0
@@ -65,6 +74,8 @@ class CLOBVenue:
         if sp is None:
             return float('inf')
         mid = self.mid_price()
+        if mid <= 0:
+            return float('inf')
         return 10_000.0 * (sp['ask'] - sp['bid']) / mid
 
     # ---- walk the book (read-only) ---------------------------------------
@@ -82,7 +93,7 @@ class CLOBVenue:
         levels = []
 
         for order in self.exchange.order_book[book_side]:
-            if remaining <= 0:
+            if remaining <= 1e-12:
                 break
             fill = min(remaining, order.qty)
             total_cost += fill * order.price
@@ -271,9 +282,9 @@ class ShadowCLOB:
     """
 
     def __init__(self, env: 'MarketEnvironment', *,
-                 alpha0: float = 3.0,
+                 alpha0: float = 1.5,
                  alpha1: float = 300.0,
-                 alpha2: float = 200.0,
+                 alpha2: float = 500.0,
                  base_depth: float = 500.0,
                  impact_lambda: float = 0.15):
         self.env = env
@@ -366,9 +377,13 @@ class ShadowCLOB:
         return max(0.5, base + self.impact_lambda * Q)
 
     def _depth(self) -> float:
-        """Total depth in base units, regime-dependent."""
+        """Total depth in base units, regime-dependent.
+
+        Depth shrinks with σ; calibrated to Mancini et al. (2009)
+        observation of dramatic FX liquidity evaporation during crisis.
+        """
         sigma = self.env.sigma
-        return self.base_depth / (1.0 + 50.0 * sigma)
+        return self.base_depth / (1.0 + 80.0 * sigma)
 
     def _zero_quote(self):
         mid = self.mid_price()

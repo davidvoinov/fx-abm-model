@@ -47,12 +47,13 @@ DPI = 200
 # ===================================================================
 
 def dashboard_context(logger: 'MetricsLogger',
-                      out_dir: str = 'output',
-                      rolling: int = 5) -> str:
+                                            out_dir: str = 'output',
+                                            rolling: int = 5,
+                                            shock_iter: Optional[int] = None) -> str:
     """
     3-panel context dashboard:
       top-left:  σ_t and c_t  (twin-axis)
-      top-right: FX mid-price
+            top-right: FX mid-price + raw fair price
       bottom:    CLOB quoted spread
     """
     fig = plt.figure(figsize=(16, 9))
@@ -74,6 +75,11 @@ def dashboard_context(logger: 'MetricsLogger',
     ax1b.set_ylabel('$c_t$', color='tab:blue')
     ax1b.tick_params(axis='y', labelcolor='tab:blue')
     lines = l1 + l2
+    if shock_iter is not None:
+        shock_line = ax1.axvline(shock_iter, color='#8b0000', ls='--',
+                                 lw=1.2, alpha=0.85,
+                                 label=f'Shock t={shock_iter}')
+        lines = lines + [shock_line]
     ax1.legend(lines, [l.get_label() for l in lines], fontsize=10,
                loc='upper left')
     ax1.set_xlabel('Iteration')
@@ -82,12 +88,24 @@ def dashboard_context(logger: 'MetricsLogger',
 
     # ── FX Price ─────────────────────────────────────────────────────
     ax2 = fig.add_subplot(gs[0, 1])
-    ax2.set_title(f'FX Mid-Price (CLOB)  [MA {rolling}]')
+    ax2.set_title(f'FX Mid-Price (CLOB)  [MA {rolling}]  +  Raw Fair Price')
     s = _rolling_avg(logger.clob_mid_series, rolling)
-    ax2.plot(s, color='black', linewidth=1)
+    ax2.plot(s, color='black', linewidth=1.35,
+             label=f'CLOB mid [MA {rolling}]')
+    fair = [
+        value if value is not None and math.isfinite(value) else float('nan')
+        for value in logger.fair_price_series
+    ]
+    if any(math.isfinite(value) for value in fair):
+        ax2.plot(fair, color=_C['stress'], linewidth=1.0, ls='--', alpha=0.9,
+                 label='Fair price (raw)')
+    if shock_iter is not None:
+        ax2.axvline(shock_iter, color='#8b0000', ls='--', lw=1.2, alpha=0.85,
+                    label=f'Shock t={shock_iter}')
     _shade_stress(ax2, logger)
     ax2.set_xlabel('Iteration')
     ax2.set_ylabel('Price')
+    ax2.legend(fontsize=9, loc='upper right')
     ax2.grid(True, alpha=0.25)
 
     # ── CLOB Spread ──────────────────────────────────────────────────
@@ -95,6 +113,9 @@ def dashboard_context(logger: 'MetricsLogger',
     ax3.set_title(f'CLOB Quoted Spread  [MA {rolling}]')
     s = _rolling_avg(logger.clob_qspr, rolling)
     ax3.plot(s, color='black', linewidth=1)
+    if shock_iter is not None:
+        ax3.axvline(shock_iter, color='#8b0000', ls='--', lw=1.2,
+                    alpha=0.85)
     _shade_stress(ax3, logger)
     ax3.set_xlabel('Iteration')
     ax3.set_ylabel('Spread (bps)')
@@ -113,7 +134,8 @@ def dashboard_context(logger: 'MetricsLogger',
 def dashboard_h1(logger: 'MetricsLogger',
                  out_dir: str = 'output',
                  Q: float = 5,
-                 rolling: int = 10) -> str:
+                 rolling: int = 10,
+                 shock_iter: Optional[int] = None) -> str:
     """
     4-panel H1 dashboard:
       top-left:   C_v(Q) cost curves
@@ -252,10 +274,11 @@ def dashboard_h2(logger: 'MetricsLogger',
                  Q: float = 5,
                  rolling: int = 10,
                  corr_window: int = 30,
-                 stress_start: int = 200) -> str:
+                 stress_start: Optional[int] = None,
+                 shock_iter: Optional[int] = None) -> str:
     """
     6-panel H2 dashboard:
-      row 0: cost time series  |  CLOB spread vs AMM cost
+      row 0: cost time series (twin-axis)  |  CLOB spread vs AMM cost
       row 1: flow allocation   |  rolling correlation
       row 2: AMM liquidity     |  stress flow migration bars
     """
@@ -274,18 +297,27 @@ def dashboard_h2(logger: 'MetricsLogger',
             out.append(sum(window) / len(window) if window else float('nan'))
         return list(range(w - 1, len(s))), out
 
-    # ── (0,0) Cost time series ───────────────────────────────────────
+    # ── (0,0) Cost time series (twin-axis) ──────────────────────────
     ax = fig.add_subplot(gs[0, 0])
     ax.set_title(f'Execution Cost Time Series  (Q={Q}, MA {rolling})')
     xs, ys = _roll(logger.cost_series('clob', Q))
-    ax.plot(xs, ys, label='CLOB', lw=1.3, color=_C['clob'])
+    ax.plot(xs, ys, label='CLOB', lw=1.5, color=_C['clob'])
+    ax.set_ylabel('CLOB Cost (bps)', color=_C['clob'])
+    ax.tick_params(axis='y', labelcolor=_C['clob'])
+    axr = ax.twinx()
     for name in logger.amm_cost_curves:
-        xs, ys = _roll(logger.cost_series(name, Q))
-        ax.plot(xs, ys, label=name.upper(), lw=1.3, color=_C.get(name))
+        xs2, ys2 = _roll(logger.cost_series(name, Q))
+        axr.plot(xs2, ys2, label=name.upper(), lw=1.3, ls='--',
+                 color=_C.get(name), alpha=0.7)
+    axr.set_ylabel('AMM Cost (bps)')
+    if shock_iter is not None:
+        ax.axvline(shock_iter, color='red', ls='--', lw=1.2, alpha=0.7,
+                   label=f'Shock t={shock_iter}')
     _shade_stress(ax, logger)
-    ax.legend(fontsize=10)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = axr.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=9, loc='upper left')
     ax.set_xlabel('Iteration')
-    ax.set_ylabel('Cost (bps)')
     ax.grid(True, alpha=0.25)
 
     # ── (0,1) CLOB spread vs AMM cost ────────────────────────────────
@@ -378,7 +410,7 @@ def dashboard_h2(logger: 'MetricsLogger',
     ax = fig.add_subplot(gs[2, 1])
     ax.set_title('AMM Share: Normal vs Stress')
     amm_venues = [v for v in logger.flow_volume if v != 'clob']
-    idx = min(stress_start, n)
+    idx = min(stress_start, n) if stress_start is not None else n
     before_sh, stress_sh = {}, {}
     for v in amm_venues:
         fs = logger.flow_share(v)
@@ -413,20 +445,28 @@ def dashboard_h2(logger: 'MetricsLogger',
     kpi_lines = []
     for name in logger.amm_cost_curves:
         rho = logger.cost_correlation('clob', name, Q=Q)
-        ba = logger.commonality_before_after('clob', name, Q=Q,
-                                              stress_start=stress_start)
-        b_s = f'{ba["before"]:.3f}' if math.isfinite(ba['before']) else 'N/A'
-        a_s = f'{ba["after"]:.3f}' if math.isfinite(ba['after']) else 'N/A'
-        kpi_lines.append(f'CLOB↔{name.upper()}: ρ={rho:.3f}  '
-                         f'(before={b_s}, after={a_s})')
+        if stress_start is not None:
+            ba = logger.commonality_before_after('clob', name, Q=Q,
+                                                  stress_start=stress_start)
+            b_s = f'{ba["before"]:.3f}' if math.isfinite(ba['before']) else 'N/A'
+            a_s = f'{ba["after"]:.3f}' if math.isfinite(ba['after']) else 'N/A'
+            kpi_lines.append(f'CLOB↔{name.upper()}: ρ={rho:.3f}  '
+                             f'(before={b_s}, after={a_s})')
+        else:
+            kpi_lines.append(f'CLOB↔{name.upper()}: ρ={rho:.3f}')
     # CLOB spread normal vs stress
     qspr_raw = logger.clob_qspr
-    n_s = [s for s in qspr_raw[:idx] if math.isfinite(s)]
-    s_s = [s for s in qspr_raw[idx:] if math.isfinite(s)]
-    avg_n = sum(n_s) / len(n_s) if n_s else 0
-    avg_s = sum(s_s) / len(s_s) if s_s else 0
-    mult = f'{avg_s / avg_n:.1f}×' if avg_n > 0 else '—'
-    kpi_lines.append(f'CLOB spread: {avg_n:.1f} → {avg_s:.1f} bps ({mult})')
+    if stress_start is not None:
+        n_s = [s for s in qspr_raw[:idx] if math.isfinite(s)]
+        s_s = [s for s in qspr_raw[idx:] if math.isfinite(s)]
+        avg_n = sum(n_s) / len(n_s) if n_s else 0
+        avg_s = sum(s_s) / len(s_s) if s_s else 0
+        mult = f'{avg_s / avg_n:.1f}×' if avg_n > 0 else '—'
+        kpi_lines.append(f'CLOB spread: {avg_n:.1f} → {avg_s:.1f} bps ({mult})')
+    else:
+        all_s = [s for s in qspr_raw if math.isfinite(s)]
+        avg_all = sum(all_s) / len(all_s) if all_s else 0
+        kpi_lines.append(f'CLOB spread: {avg_all:.1f} bps (avg)')
 
     fig.text(0.50, 0.01, '   |   '.join(kpi_lines),
              ha='center', va='bottom', fontsize=10,
@@ -468,12 +508,22 @@ def _rolling_return_vol(mid_series, window=20):
     return [0.0] + vol
 
 
+def _window_avg(values, start: int, end: int) -> float:
+    finite = [value for value in values[start:end] if math.isfinite(value)]
+    return sum(finite) / len(finite) if finite else float('nan')
+
+
+def _fmt_metric(value: float, digits: int = 1) -> str:
+    return f'{value:.{digits}f}' if math.isfinite(value) else 'N/A'
+
+
 def dashboard_comparison(logger_amm: 'MetricsLogger',
                          logger_no_amm: 'MetricsLogger',
                          out_dir: str = 'output',
                          rolling: int = 10,
                          vol_window: int = 20,
-                         stress_start: int = 200) -> str:
+                         stress_start: Optional[int] = None,
+                         shock_iter: Optional[int] = None) -> str:
     """
     4-panel comparison dashboard — With AMM vs Without AMM:
       (0,0): CLOB Depth [MA]
@@ -497,6 +547,13 @@ def dashboard_comparison(logger_amm: 'MetricsLogger',
         f = [x for x in lst if math.isfinite(x)]
         return sum(f) / len(f) if f else float('nan')
 
+    def _annotate_event(ax):
+        if stress_start is not None:
+            ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+        if shock_iter is not None:
+            ax.axvline(shock_iter, color='#8b0000', ls='--', lw=1.2,
+                       alpha=0.85, label=f'Shock t={shock_iter}')
+
     # ── (0,0) CLOB Depth ─────────────────────────────────────────────
     ax = fig.add_subplot(gs[0, 0])
     ax.set_title(f'CLOB Depth  [MA {rolling}]')
@@ -509,7 +566,7 @@ def dashboard_comparison(logger_amm: 'MetricsLogger',
     d_no = _rolling_avg(_total_depth(logger_no_amm)[:n], rolling)
     ax.plot(d_amm, color=c_amm, lw=1.5, label='With AMM')
     ax.plot(d_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
-    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    _annotate_event(ax)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Depth (bid + ask)')
     ax.legend(fontsize=10)
@@ -523,7 +580,7 @@ def dashboard_comparison(logger_amm: 'MetricsLogger',
     vol_no = _rolling_return_vol(logger_no_amm.clob_mid_series[:n], vol_window)
     ax.plot(vol_amm, color=c_amm, lw=1.5, label='With AMM')
     ax.plot(vol_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
-    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    _annotate_event(ax)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('σ(return)')
     ax.legend(fontsize=10)
@@ -537,7 +594,7 @@ def dashboard_comparison(logger_amm: 'MetricsLogger',
     s_no = _rolling_avg(logger_no_amm.clob_qspr[:n], rolling)
     ax.plot(s_amm, color=c_amm, lw=1.5, label='With AMM')
     ax.plot(s_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
-    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    _annotate_event(ax)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Spread (bps)')
     ax.legend(fontsize=10)
@@ -552,33 +609,74 @@ def dashboard_comparison(logger_amm: 'MetricsLogger',
     vol_amm_all = _rolling_return_vol(logger_amm.clob_mid_series, vol_window)
     vol_no_all = _rolling_return_vol(logger_no_amm.clob_mid_series, vol_window)
 
-    avg_spr_amm = _mean(logger_amm.clob_qspr)
-    avg_spr_no = _mean(logger_no_amm.clob_qspr)
-    avg_dep_amm = _mean(depth_amm)
-    avg_dep_no = _mean(depth_no)
-    avg_vol_amm = _mean(vol_amm_all)
-    avg_vol_no = _mean(vol_no_all)
-
     def _delta(a, b):
         if b == 0 or not math.isfinite(a) or not math.isfinite(b):
             return 'N/A'
         return f'{(a - b) / abs(b):+.1%}'
 
-    rows = [
-        ('Avg Spread (bps)', f'{avg_spr_amm:.1f}', f'{avg_spr_no:.1f}',
-         _delta(avg_spr_amm, avg_spr_no)),
-        ('Avg CLOB Depth', f'{avg_dep_amm:.0f}', f'{avg_dep_no:.0f}',
-         _delta(avg_dep_amm, avg_dep_no)),
-        ('Avg Volatility', f'{avg_vol_amm:.4f}', f'{avg_vol_no:.4f}',
-         _delta(avg_vol_amm, avg_vol_no)),
-    ]
+    if shock_iter is not None:
+        shock_idx = max(0, min(shock_iter, n))
+        pre_start = max(0, shock_idx - 50)
+        shock_end = min(n, shock_idx + 20)
+        rows = [
+            ('Spread pre (bps)',
+             _fmt_metric(_window_avg(logger_amm.clob_qspr, pre_start, shock_idx)),
+             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, pre_start, shock_idx)),
+             _delta(_window_avg(logger_amm.clob_qspr, pre_start, shock_idx),
+                    _window_avg(logger_no_amm.clob_qspr, pre_start, shock_idx))),
+            ('Spread shock (bps)',
+             _fmt_metric(_window_avg(logger_amm.clob_qspr, shock_idx, shock_end)),
+             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, shock_idx, shock_end)),
+             _delta(_window_avg(logger_amm.clob_qspr, shock_idx, shock_end),
+                    _window_avg(logger_no_amm.clob_qspr, shock_idx, shock_end))),
+            ('Depth pre',
+             _fmt_metric(_window_avg(depth_amm, pre_start, shock_idx), digits=0),
+             _fmt_metric(_window_avg(depth_no, pre_start, shock_idx), digits=0),
+             _delta(_window_avg(depth_amm, pre_start, shock_idx),
+                    _window_avg(depth_no, pre_start, shock_idx))),
+            ('Depth shock',
+             _fmt_metric(_window_avg(depth_amm, shock_idx, shock_end), digits=0),
+             _fmt_metric(_window_avg(depth_no, shock_idx, shock_end), digits=0),
+             _delta(_window_avg(depth_amm, shock_idx, shock_end),
+                    _window_avg(depth_no, shock_idx, shock_end))),
+            ('Vol pre',
+             _fmt_metric(_window_avg(vol_amm_all, pre_start, shock_idx), digits=4),
+             _fmt_metric(_window_avg(vol_no_all, pre_start, shock_idx), digits=4),
+             _delta(_window_avg(vol_amm_all, pre_start, shock_idx),
+                    _window_avg(vol_no_all, pre_start, shock_idx))),
+            ('Vol shock',
+             _fmt_metric(_window_avg(vol_amm_all, shock_idx, shock_end), digits=4),
+             _fmt_metric(_window_avg(vol_no_all, shock_idx, shock_end), digits=4),
+             _delta(_window_avg(vol_amm_all, shock_idx, shock_end),
+                    _window_avg(vol_no_all, shock_idx, shock_end))),
+        ]
+        ax.text(0.5, 0.92, f'Local Comparison Around Shock t={shock_iter}',
+                ha='center', va='center', fontsize=13, fontweight='bold',
+                transform=ax.transAxes)
+        ax.text(0.5, 0.86, f'Pre=[{pre_start},{shock_idx})   Shock=[{shock_idx},{shock_end})',
+                ha='center', va='center', fontsize=10,
+                fontfamily='monospace', transform=ax.transAxes)
+    else:
+        avg_spr_amm = _mean(logger_amm.clob_qspr)
+        avg_spr_no = _mean(logger_no_amm.clob_qspr)
+        avg_dep_amm = _mean(depth_amm)
+        avg_dep_no = _mean(depth_no)
+        avg_vol_amm = _mean(vol_amm_all)
+        avg_vol_no = _mean(vol_no_all)
+        rows = [
+            ('Avg Spread (bps)', f'{avg_spr_amm:.1f}', f'{avg_spr_no:.1f}',
+             _delta(avg_spr_amm, avg_spr_no)),
+            ('Avg CLOB Depth', f'{avg_dep_amm:.0f}', f'{avg_dep_no:.0f}',
+             _delta(avg_dep_amm, avg_dep_no)),
+            ('Avg Volatility', f'{avg_vol_amm:.4f}', f'{avg_vol_no:.4f}',
+             _delta(avg_vol_amm, avg_vol_no)),
+        ]
 
-    # Header box
-    ax.text(0.5, 0.92, 'Market Quality Comparison',
-            ha='center', va='center', fontsize=13, fontweight='bold',
-            transform=ax.transAxes)
-    ax.text(0.5, 0.86, '=' * 42, ha='center', va='center', fontsize=10,
-            fontfamily='monospace', transform=ax.transAxes)
+        ax.text(0.5, 0.92, 'Market Quality Comparison',
+                ha='center', va='center', fontsize=13, fontweight='bold',
+                transform=ax.transAxes)
+        ax.text(0.5, 0.86, '=' * 42, ha='center', va='center', fontsize=10,
+                fontfamily='monospace', transform=ax.transAxes)
 
     col_labels = ['Metric', 'AMM', 'No AMM', 'Delta']
     tbl = ax.table(
@@ -613,7 +711,8 @@ def save_comparison_individual(logger_amm: 'MetricsLogger',
                                out_dir: str = 'output',
                                rolling: int = 10,
                                vol_window: int = 20,
-                               stress_start: int = 200) -> list:
+                               stress_start: Optional[int] = None,
+                               shock_iter: Optional[int] = None) -> list:
     """Save each panel of dashboard_comparison as a separate PNG."""
     os.makedirs(out_dir, exist_ok=True)
     paths: list = []
@@ -638,6 +737,13 @@ def save_comparison_individual(logger_amm: 'MetricsLogger',
             return 'N/A'
         return f'{(a - b) / abs(b):+.1%}'
 
+    def _annotate_event(ax):
+        if stress_start is not None:
+            ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+        if shock_iter is not None:
+            ax.axvline(shock_iter, color='#8b0000', ls='--', lw=1.2,
+                       alpha=0.85, label=f'Shock t={shock_iter}')
+
     # ── 1. CLOB Depth ────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.set_title(f'CLOB Depth  [MA {rolling}]', fontsize=13)
@@ -645,7 +751,7 @@ def save_comparison_individual(logger_amm: 'MetricsLogger',
     d_no = _rolling_avg(_total_depth(logger_no_amm)[:n], rolling)
     ax.plot(d_amm, color=c_amm, lw=1.5, label='With AMM')
     ax.plot(d_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
-    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    _annotate_event(ax)
     ax.set_xlabel('Iteration'); ax.set_ylabel('Depth (bid + ask)')
     ax.legend(fontsize=11); ax.grid(True, alpha=0.25)
     plt.tight_layout()
@@ -659,7 +765,7 @@ def save_comparison_individual(logger_amm: 'MetricsLogger',
     vol_no = _rolling_return_vol(logger_no_amm.clob_mid_series[:n], vol_window)
     ax.plot(vol_amm, color=c_amm, lw=1.5, label='With AMM')
     ax.plot(vol_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
-    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    _annotate_event(ax)
     ax.set_xlabel('Iteration'); ax.set_ylabel('σ(return)')
     ax.legend(fontsize=11); ax.grid(True, alpha=0.25)
     plt.tight_layout()
@@ -673,7 +779,7 @@ def save_comparison_individual(logger_amm: 'MetricsLogger',
     s_no = _rolling_avg(logger_no_amm.clob_qspr[:n], rolling)
     ax.plot(s_amm, color=c_amm, lw=1.5, label='With AMM')
     ax.plot(s_no, color=c_no, ls='--', lw=1.5, label='Without AMM')
-    ax.axvspan(stress_start, min(350, n), alpha=0.08, color='red')
+    _annotate_event(ax)
     ax.set_xlabel('Iteration'); ax.set_ylabel('Spread (bps)')
     ax.legend(fontsize=11); ax.grid(True, alpha=0.25)
     plt.tight_layout()
@@ -691,21 +797,60 @@ def save_comparison_individual(logger_amm: 'MetricsLogger',
     vol_amm_all = _rolling_return_vol(logger_amm.clob_mid_series, vol_window)
     vol_no_all = _rolling_return_vol(logger_no_amm.clob_mid_series, vol_window)
 
-    avg_spr_amm = _mean(logger_amm.clob_qspr)
-    avg_spr_no = _mean(logger_no_amm.clob_qspr)
-    avg_dep_amm = _mean(depth_amm)
-    avg_dep_no = _mean(depth_no)
-    avg_vol_amm = _mean(vol_amm_all)
-    avg_vol_no = _mean(vol_no_all)
+    if shock_iter is not None:
+        shock_idx = max(0, min(shock_iter, n))
+        pre_start = max(0, shock_idx - 50)
+        shock_end = min(n, shock_idx + 20)
+        rows = [
+            ('Spread pre (bps)',
+             _fmt_metric(_window_avg(logger_amm.clob_qspr, pre_start, shock_idx)),
+             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, pre_start, shock_idx)),
+             _delta(_window_avg(logger_amm.clob_qspr, pre_start, shock_idx),
+                    _window_avg(logger_no_amm.clob_qspr, pre_start, shock_idx))),
+            ('Spread shock (bps)',
+             _fmt_metric(_window_avg(logger_amm.clob_qspr, shock_idx, shock_end)),
+             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, shock_idx, shock_end)),
+             _delta(_window_avg(logger_amm.clob_qspr, shock_idx, shock_end),
+                    _window_avg(logger_no_amm.clob_qspr, shock_idx, shock_end))),
+            ('Depth pre',
+             _fmt_metric(_window_avg(depth_amm, pre_start, shock_idx), digits=0),
+             _fmt_metric(_window_avg(depth_no, pre_start, shock_idx), digits=0),
+             _delta(_window_avg(depth_amm, pre_start, shock_idx),
+                    _window_avg(depth_no, pre_start, shock_idx))),
+            ('Depth shock',
+             _fmt_metric(_window_avg(depth_amm, shock_idx, shock_end), digits=0),
+             _fmt_metric(_window_avg(depth_no, shock_idx, shock_end), digits=0),
+             _delta(_window_avg(depth_amm, shock_idx, shock_end),
+                    _window_avg(depth_no, shock_idx, shock_end))),
+            ('Vol pre',
+             _fmt_metric(_window_avg(vol_amm_all, pre_start, shock_idx), digits=4),
+             _fmt_metric(_window_avg(vol_no_all, pre_start, shock_idx), digits=4),
+             _delta(_window_avg(vol_amm_all, pre_start, shock_idx),
+                    _window_avg(vol_no_all, pre_start, shock_idx))),
+            ('Vol shock',
+             _fmt_metric(_window_avg(vol_amm_all, shock_idx, shock_end), digits=4),
+             _fmt_metric(_window_avg(vol_no_all, shock_idx, shock_end), digits=4),
+             _delta(_window_avg(vol_amm_all, shock_idx, shock_end),
+                    _window_avg(vol_no_all, shock_idx, shock_end))),
+        ]
+        ax.set_title(f'Market Quality Around Shock t={shock_iter}',
+                     fontsize=14, fontweight='bold', pad=12)
+    else:
+        avg_spr_amm = _mean(logger_amm.clob_qspr)
+        avg_spr_no = _mean(logger_no_amm.clob_qspr)
+        avg_dep_amm = _mean(depth_amm)
+        avg_dep_no = _mean(depth_no)
+        avg_vol_amm = _mean(vol_amm_all)
+        avg_vol_no = _mean(vol_no_all)
 
-    rows = [
-        ('Avg Spread (bps)', f'{avg_spr_amm:.1f}', f'{avg_spr_no:.1f}',
-         _delta(avg_spr_amm, avg_spr_no)),
-        ('Avg CLOB Depth', f'{avg_dep_amm:.0f}', f'{avg_dep_no:.0f}',
-         _delta(avg_dep_amm, avg_dep_no)),
-        ('Avg Volatility', f'{avg_vol_amm:.4f}', f'{avg_vol_no:.4f}',
-         _delta(avg_vol_amm, avg_vol_no)),
-    ]
+        rows = [
+            ('Avg Spread (bps)', f'{avg_spr_amm:.1f}', f'{avg_spr_no:.1f}',
+             _delta(avg_spr_amm, avg_spr_no)),
+            ('Avg CLOB Depth', f'{avg_dep_amm:.0f}', f'{avg_dep_no:.0f}',
+             _delta(avg_dep_amm, avg_dep_no)),
+            ('Avg Volatility', f'{avg_vol_amm:.4f}', f'{avg_vol_no:.4f}',
+             _delta(avg_vol_amm, avg_vol_no)),
+        ]
 
     col_labels = ['Metric', 'AMM', 'No AMM', 'Delta']
     tbl = ax.table(
@@ -735,14 +880,14 @@ def save_comparison_individual(logger_amm: 'MetricsLogger',
 
 def plot_market_quality_table(logger: 'MetricsLogger',
                               out_dir: str = 'output',
-                              stress_start: int = 200) -> str:
+                              stress_start: Optional[int] = None) -> str:
     """
     Market-quality comparison table rendered as an image.
     Columns: Metric | Normal | Stress | Ratio.
     """
     os.makedirs(out_dir, exist_ok=True)
     n = len(logger.iterations)
-    idx = min(stress_start, n)
+    idx = min(stress_start, n) if stress_start is not None else n
 
     # --- collect metrics ---
     def _mean(lst):
@@ -789,19 +934,26 @@ def plot_market_quality_table(logger: 'MetricsLogger',
 
     # Correlation
     for v in logger.amm_cost_curves:
-        ba = logger.commonality_before_after('clob', v, Q=5,
-                                             stress_start=stress_start)
-        b_s = f'{ba["before"]:.3f}' if math.isfinite(ba['before']) else 'N/A'
-        a_s = f'{ba["after"]:.3f}' if math.isfinite(ba['after']) else 'N/A'
+        if stress_start is not None:
+            ba = logger.commonality_before_after('clob', v, Q=5,
+                                                 stress_start=stress_start)
+            b_s = f'{ba["before"]:.3f}' if math.isfinite(ba['before']) else 'N/A'
+            a_s = f'{ba["after"]:.3f}' if math.isfinite(ba['after']) else 'N/A'
+        else:
+            rho = logger.cost_correlation('clob', v, Q=5)
+            b_s = f'{rho:.3f}' if math.isfinite(rho) else 'N/A'
+            a_s = '—'
         rows.append((f'ρ CLOB↔{v.upper()} (Q=5)', b_s, a_s, ''))
 
     # --- render table ---
-    col_labels = ['Metric', 'Normal', 'Stress', 'Ratio']
+    has_stress = stress_start is not None and idx < n
+    col_labels = ['Metric', 'Normal', 'Stress', 'Ratio'] if has_stress else ['Metric', 'Average', '', '']
     cell_text = [[r[0], r[1], r[2], r[3]] for r in rows]
 
     fig, ax = plt.subplots(figsize=(10, 0.55 * len(rows) + 1.5))
     ax.axis('off')
-    ax.set_title('Market Quality Comparison: Normal vs Stress',
+    ax.set_title('Market Quality Comparison: Normal vs Stress' if has_stress
+                 else 'Market Quality Summary',
                  fontsize=14, fontweight='bold', pad=12)
 
     tbl = ax.table(cellText=cell_text, colLabels=col_labels,
@@ -979,23 +1131,27 @@ def plot_h1_summary_table(logger: 'MetricsLogger',
 
 def generate_all_dashboards(logger: 'MetricsLogger',
                             out_dir: str = 'output',
-                            stress_start: int = 200,
+                            stress_start: Optional[int] = None,
                             Q: float = 5,
                             rolling: int = 10,
-                            logger_no_amm: 'MetricsLogger' = None) -> list:
+                            logger_no_amm: 'MetricsLogger' = None,
+                            shock_iter: Optional[int] = None) -> list:
     """Generate all dashboards, return list of file paths."""
     os.makedirs(out_dir, exist_ok=True)
 
     paths = [
-        dashboard_context(logger, out_dir=out_dir, rolling=rolling),
-        dashboard_h1(logger, out_dir=out_dir, Q=Q, rolling=rolling),
+        dashboard_context(logger, out_dir=out_dir, rolling=rolling,
+                  shock_iter=shock_iter),
+        dashboard_h1(logger, out_dir=out_dir, Q=Q, rolling=rolling,
+                     shock_iter=shock_iter),
         dashboard_h2(logger, out_dir=out_dir, Q=Q, rolling=rolling,
-                     stress_start=stress_start),
+                     stress_start=stress_start, shock_iter=shock_iter),
     ]
     if logger_no_amm is not None:
         paths.append(dashboard_comparison(
             logger, logger_no_amm,
             out_dir=out_dir, rolling=rolling, stress_start=stress_start,
+            shock_iter=shock_iter,
         ))
     return paths
 
@@ -1006,10 +1162,11 @@ def generate_all_dashboards(logger: 'MetricsLogger',
 
 def save_all_individual_plots(logger: 'MetricsLogger',
                               out_dir: str = 'output',
-                              stress_start: int = 200,
+                              stress_start: Optional[int] = None,
                               Q: float = 5,
                               rolling: int = 10,
-                              logger_no_amm: 'MetricsLogger' = None) -> list:
+                              logger_no_amm: 'MetricsLogger' = None,
+                              shock_iter: Optional[int] = None) -> list:
     """Call every venue_plots function, intercept plt.show → savefig."""
     os.makedirs(out_dir, exist_ok=True)
     saved: list = []
@@ -1018,12 +1175,12 @@ def save_all_individual_plots(logger: 'MetricsLogger',
     plot_calls = [
         # Context
         (_vp.plot_environment,              {},                                      'environment'),
-        (_vp.plot_fx_price,                 {'rolling': rolling},                    'fx_price'),
+        (_vp.plot_fx_price,                 {'rolling': rolling, 'shock_iter': shock_iter}, 'fx_price'),
         (_vp.plot_clob_spread,              {'rolling': rolling},                    'clob_spread'),
         # H1
         (_vp.plot_execution_cost_curves,    {},                                      'h1_cost_curves'),
         (_vp.plot_cost_decomposition,       {'Q': Q},                                'h1_cost_decomposition'),
-        (_vp.plot_total_market_depth,       {'rolling': rolling},                    'h1_total_depth'),
+        (_vp.plot_total_market_depth,       {'rolling': rolling, 'shock_iter': shock_iter}, 'h1_total_depth'),
         # H2
         (_vp.plot_cost_timeseries,          {'Q': Q, 'rolling': rolling},            'h2_cost_timeseries'),
         (_vp.plot_flow_allocation,          {'rolling': rolling},                    'h2_flow_allocation'),
@@ -1080,6 +1237,7 @@ def save_all_individual_plots(logger: 'MetricsLogger',
         cmp_paths = save_comparison_individual(
             logger, logger_no_amm,
             out_dir=out_dir, rolling=rolling, stress_start=stress_start,
+            shock_iter=shock_iter,
         )
         saved.extend(cmp_paths)
 

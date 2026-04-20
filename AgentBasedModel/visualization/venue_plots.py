@@ -102,7 +102,8 @@ def plot_cost_decomposition(logger: 'MetricsLogger', Q: float = 5,
 
 
 def plot_total_market_depth(logger: 'MetricsLogger', rolling: int = 10,
-                            figsize=(12, 5)):
+                            figsize=(12, 5),
+                            shock_iter: int = None):
     """
     Combined depth: CLOB depth (bid+ask qty) + AMM effective depth.
     Shows that AMM adds to total available liquidity even if more expensive.
@@ -339,7 +340,7 @@ def plot_amm_liquidity(logger: 'MetricsLogger', figsize=(12, 5)):
 
 
 def plot_stress_flow_migration(logger: 'MetricsLogger',
-                                stress_start: int = 200,
+                                stress_start: int = None,
                                 figsize=(10, 6)):
     """
     Bar chart: AMM share of volume BEFORE vs DURING stress.
@@ -350,7 +351,7 @@ def plot_stress_flow_migration(logger: 'MetricsLogger',
 
     venues = [v for v in logger.flow_volume if v != 'clob']
     n = len(logger.iterations)
-    idx = min(stress_start, n)
+    idx = min(stress_start, n) if stress_start is not None else n
 
     before_shares = {}
     stress_shares = {}
@@ -416,19 +417,33 @@ def plot_environment(logger: 'MetricsLogger', figsize=(12, 4)):
 
 
 def plot_fx_price(logger: 'MetricsLogger', rolling: int = 1,
-                  figsize=(12, 4)):
+                  figsize=(12, 4),
+                  shock_iter: int = None):
     fig, ax = plt.subplots(figsize=figsize)
     title = 'FX Mid-Price (CLOB)'
     if rolling > 1:
         title += f'  [MA {rolling}]'
+    title += '  +  Raw Fair Price'
     ax.set_title(title)
     s = logger.clob_mid_series
     if rolling > 1:
         s = _rolling_avg(s, rolling)
-    ax.plot(s, color='black', linewidth=1)
+    ax.plot(s, color='black', linewidth=1.25,
+            label=f'CLOB mid [MA {rolling}]' if rolling > 1 else 'CLOB mid')
+    fair = [
+        value if value is not None and math.isfinite(value) else float('nan')
+        for value in logger.fair_price_series
+    ]
+    if any(math.isfinite(value) for value in fair):
+        ax.plot(fair, color='#c44e52', linewidth=1.0, ls='--', alpha=0.9,
+                label='Fair price (raw)')
+    if shock_iter is not None:
+        ax.axvline(shock_iter, color='#8b0000', ls='--', lw=1.2, alpha=0.85,
+                   label=f'Shock t={shock_iter}')
     _shade_stress(ax, logger)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Price')
+    ax.legend(fontsize=9, loc='upper right')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()

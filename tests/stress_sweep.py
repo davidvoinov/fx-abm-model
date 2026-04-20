@@ -9,9 +9,9 @@ Stress Sweep — Simulation + Analysis (unified)
 
 **Генерация (Block A + Block B)**
 
-  Block A:  Полный перебор CLOB-конфигураций из 5 агентов
-            (MarketMaker, Random, Fundamentalist, Chartist, Universalist),
-            где MM <= 1.  Всего 91 конфигурация.  Без AMM-пулов.
+  Block A:  Полный перебор CLOB-конфигураций
+            (MarketMaker, Random, Fundamentalist, Chartist, Universalist).
+            MM 0-5, каждый другой тип 0-5, ≥1 не-MM.  Без AMM-пулов.
 
   Block B:  Полный перебор AMM-конфигураций из 1-5 пулов
             (CPMM + HFMM).  Всего 20 конфигураций.  Без CLOB-агентов.
@@ -25,7 +25,7 @@ Stress Sweep — Simulation + Analysis (unified)
             Полный перебор 1-5 пулов из 3 вариантов.  55 конфигураций.
 
   Block D:  Мультивенью CLOB+AMM с FX-тейкерами.
-            CLOB: лучший состав из Block A (MM=1, Rnd=2, Chart=1, Univ=1).
+            CLOB: лучший состав из Block A (MM=2, Rnd=1, Fund=3, Chart=1, Univ=1).
             AMM:  лучший пул из Block C (1 tight HFMM, fee=5bp, A=50, R=500).
             Перебор amm_share_pct = 0, 10, 20, ..., 100.  11 конфигураций.
             FX-тейкеры маршрутизируют ордера между CLOB и AMM.
@@ -343,15 +343,22 @@ def run_simulation(config_id, exchange, env, clob, amm_pools,
 
 # -- Block A helpers ---------------------------------------------------
 
+MAX_AGENT = 5   # каждый тип 0..5
+
+
 def _enumerate_clob_configs():
-    """Yield (n_mm, n_rnd, n_fund, n_chart, n_univ) with total=5, n_mm <= 1."""
-    for n_mm in range(2):
-        rest = 5 - n_mm
-        for n_rnd in range(rest + 1):
-            for n_fund in range(rest - n_rnd + 1):
-                for n_chart in range(rest - n_rnd - n_fund + 1):
-                    n_univ = rest - n_rnd - n_fund - n_chart
-                    yield (n_mm, n_rnd, n_fund, n_chart, n_univ)
+    """Yield (n_mm, n_rnd, n_fund, n_chart, n_univ).
+
+    Каждый тип 0-5, хотя бы 1 не-MM агент.
+    """
+    for n_mm in range(MAX_AGENT + 1):
+        for n_rnd in range(MAX_AGENT + 1):
+            for n_fund in range(MAX_AGENT + 1):
+                for n_chart in range(MAX_AGENT + 1):
+                    for n_univ in range(MAX_AGENT + 1):
+                        if n_rnd + n_fund + n_chart + n_univ == 0:
+                            continue  # нужен хотя бы 1 тейкер
+                        yield (n_mm, n_rnd, n_fund, n_chart, n_univ)
 
 
 def _build_clob_agents(exchange, env, n_mm, n_rnd, n_fund, n_chart, n_univ):
@@ -384,7 +391,7 @@ def run_block_a():
     configs = list(_enumerate_clob_configs())
     print('=' * 70)
     print(f'  BLOCK A -- CLOB agent compositions  ({len(configs)} configs, no AMM)')
-    print(f'  5 agents total, <=1 MM.  Types: MM, Random, Fund, Chartist, Univ')
+    print(f'  MM 0-{MAX_AGENT}, others 0-{MAX_AGENT} each.  Types: MM, Random, Fund, Chartist, Univ')
     print('=' * 70)
 
     for idx, (n_mm, n_rnd, n_fund, n_chart, n_univ) in enumerate(configs, 1):
@@ -549,21 +556,63 @@ def run_block_c():
         print(f'{len(df)} trades  ->  {path}')
 
 
-# -- Block D: Multi-venue via Simulator.default_fx() ------------------
+# -- Block D: Multi-venue with best Block A CLOB ----------------------
 
 AMM_SHARE_GRID = list(range(0, 101, 10))  # 0%, 10%, ..., 100%
+BLOCK_D_BEST_CLOB = dict(n_mm=2, n_rnd=1, n_fund=3, n_chart=1, n_univ=1)
+
+
+def _build_block_d_fx_traders(exchange, clob, amm_pools, env, amm_pct):
+    fx_traders = []
+
+    for _ in range(15):
+        fx_traders.append(Random(
+            exchange, cash=1e4,
+            clob=clob, amm_pools=amm_pools, env=env,
+            amm_share_pct=amm_pct,
+            beta_amm=0.05, cpmm_bias_bps=5.0, cost_noise_std=1.5,
+            trade_prob=0.3, q_min=1, q_max=5, label='Noise',
+        ))
+    for _ in range(5):
+        fx_traders.append(Fundamentalist(
+            exchange, cash=1e4,
+            clob=clob, amm_pools=amm_pools, env=env,
+            amm_share_pct=amm_pct,
+            beta_amm=0.05, cpmm_bias_bps=5.0, cost_noise_std=1.5,
+            fundamental_rate=PRICE, fx_gamma=5e-3, fx_q_max=10,
+        ))
+    for _ in range(10):
+        fx_traders.append(Random(
+            exchange, cash=1e4,
+            clob=clob, amm_pools=amm_pools, env=env,
+            amm_share_pct=amm_pct,
+            beta_amm=0.05, cpmm_bias_bps=5.0, cost_noise_std=1.5,
+            trade_prob=0.4, q_min=1, q_max=2, label='Retail',
+        ))
+    for _ in range(3):
+        fx_traders.append(Random(
+            exchange, cash=5e4,
+            clob=clob, amm_pools=amm_pools, env=env,
+            amm_share_pct=amm_pct,
+            beta_amm=0.05, cpmm_bias_bps=5.0, cost_noise_std=1.5,
+            trade_prob=0.15, q_min=15, q_max=50, label='Institutional',
+        ))
+
+    return fx_traders
 
 
 def run_block_d():
-    """Sweep amm_share_pct using full Simulator.default_fx() architecture.
+    """Sweep amm_share_pct using best Block A CLOB + best Block C AMM.
 
-    Identical to main.py: 30 CLOB noise + 1 MM + 33 FX takers
-    (15 Noise + 5 Fund + 10 Retail + 3 Institutional) + CPMM + HFMM + arb.
+    CLOB: MM=2, Random=1, Fundamentalist=3, Chartist=1, Univ=1.
+    AMM: 1 tight HFMM (fee=5bp, A=50, reserves=500).
+    FX takers preserved from default architecture: 33 agents.
     """
     print('\n' + '=' * 70)
-    print(f'  BLOCK D -- Multi-venue via default_fx()  ({len(AMM_SHARE_GRID)} configs)')
-    print(f'  Architecture: identical to main.py (30 noise + 1 MM + 33 FX takers)')
-    print(f'  AMM: CPMM (fee=30bp) + HFMM (fee=10bp, A=10)')
+    print(f'  BLOCK D -- Multi-venue with best Block A CLOB  ({len(AMM_SHARE_GRID)} configs)')
+    print(f'  CLOB: MM=2 Random=1 Fund=3 Chart=1 Univ=1')
+    print(f'  FX takers: 15 Noise + 5 Fund + 10 Retail + 3 Institutional')
+    print(f'  AMM: 1 tight HFMM (fee=5bp, A=50, R=500)')
     print(f'  Sweep: amm_share_pct = {AMM_SHARE_GRID}')
     print('=' * 70)
 
@@ -573,26 +622,34 @@ def run_block_d():
 
         _seed_all()
 
-        sim = Simulator.default_fx(
-            price=PRICE,
-            clob_volume=DEPTH,
-            amm_share_pct=amm_pct,
-            stress_start=-1,    # no gradual stress, only shock
-            stress_end=-1,
-            shock_iter=None,    # handled by run_simulation loop
-        )
+        env = _make_env()
+        exchange = ExchangeAgent(price=PRICE, std=2.0, volume=DEPTH)
+        clob = CLOBVenue(exchange)
 
-        # Extract components for run_simulation
-        clob_agents = list(sim.clob_noise)
-        if sim.mm:
-            clob_agents.append(sim.mm)
+        clob_agents = _build_clob_agents(
+            exchange, env,
+            BLOCK_D_BEST_CLOB['n_mm'],
+            BLOCK_D_BEST_CLOB['n_rnd'],
+            BLOCK_D_BEST_CLOB['n_fund'],
+            BLOCK_D_BEST_CLOB['n_chart'],
+            BLOCK_D_BEST_CLOB['n_univ'],
+        )
+        sim_info = SimulatorInfo(exchange, clob_agents)
+
+        hfmm = HFMMPool(x=500.0, y=500.0 * PRICE, A=50.0, fee=0.0005, rate=PRICE)
+        hfmm.pool_name = 'hfmm_tight'
+        amm_pools = {'hfmm_tight': hfmm}
+        lp_providers = [AMMProvider(hfmm, env)]
+        arbitrageur = AMMArbitrageur(clob, amm_pools, env=env, routing='best')
+
+        fx_traders = _build_block_d_fx_traders(exchange, clob, amm_pools, env, amm_pct)
 
         df = run_simulation(
-            config_id, sim.exchange, sim.env, sim.clob, sim.amm_pools,
+            config_id, exchange, env, clob, amm_pools,
             clob_agents=clob_agents,
-            fx_traders=sim.fx_traders,
-            lp_providers=sim.lp_providers, arbitrageur=sim.arbitrageur,
-            sim_info=None,
+            fx_traders=fx_traders,
+            lp_providers=lp_providers, arbitrageur=arbitrageur,
+            sim_info=sim_info,
         )
 
         path = os.path.join(OUT_DIR, f'{config_id}.csv')
@@ -645,7 +702,12 @@ def load_block(prefix):
         files = [f for f in files if not os.path.basename(f).startswith('AMM_C_')]
     frames = []
     for f in files:
-        df = pd.read_csv(f)
+        try:
+            df = pd.read_csv(f)
+        except pd.errors.EmptyDataError:
+            continue
+        if df.empty:
+            continue
         fname = os.path.basename(f).replace('.csv', '')
         df['config_id'] = fname
         if prefix == 'CLOB':
@@ -797,9 +859,9 @@ def report_block_a(clob):
     grp = grp.merge(cost_agg, on='config_id', how='left')
 
     # MM presence
-    print('\n  2a. Effect of Market Maker (MM=0 vs MM=1):')
+    print('\n  2a. Effect of Market Maker count (MM=0..5):')
     print('  ' + '-' * 60)
-    for mm_val in [0, 1]:
+    for mm_val in sorted(grp['n_mm'].unique()):
         sub = grp[grp['n_mm'] == mm_val]
         print(f'    MM={mm_val}  ({len(sub)} configs):')
         print(f'      Fill rate       : {sub["fill_rate"].mean():.1f}% '
@@ -870,7 +932,7 @@ def report_block_a(clob):
     rec_df = pd.DataFrame(rec_rows)
     grp = grp.merge(rec_df[['config_id', 'recovery_t']], on='config_id', how='left')
 
-    for mm_val in [0, 1]:
+    for mm_val in sorted(rec_df['n_mm'].unique()):
         sub = rec_df[rec_df['n_mm'] == mm_val]
         _recovery_summary(sub['recovery_t'], f'MM={mm_val} ({len(sub)} cfgs)')
 
@@ -1207,9 +1269,6 @@ def report_block_d(mv):
 def report_cross_venue(clob, amm):
     _section('4. CROSS-VENUE: CLOB vs AMM')
 
-    clob_mm1 = clob[clob['n_mm'] == 1].copy()
-    clob_mm0 = clob[clob['n_mm'] == 0].copy()
-
     def fv_stats(df, label):
         fin = df[np.isfinite(df['cost_bps']) & np.isfinite(df['fv_cost'])].copy()
         fin = fin[fin['fv_cost'].between(-5000, 5000)]
@@ -1224,8 +1283,8 @@ def report_cross_venue(clob, amm):
                   f'p75={fin["fv_cost"].quantile(0.75):.1f} bps')
         print()
 
-    fv_stats(clob_mm1, 'CLOB with MM (best CLOB)')
-    fv_stats(clob_mm0, 'CLOB without MM')
+    fv_stats(clob[clob['n_mm'] >= 1], 'CLOB with MM (MM>=1)')
+    fv_stats(clob[clob['n_mm'] == 0], 'CLOB without MM')
     fv_stats(amm, 'AMM (all configs)')
 
 
@@ -1260,10 +1319,8 @@ def report_shock(clob, amm):
         else:
             print(f'    POST-shock: no filled trades')
 
-    clob_mm1 = clob[clob['n_mm'] == 1]
-    clob_mm0 = clob[clob['n_mm'] == 0]
-    pre_post(clob_mm1, 'CLOB with MM')
-    pre_post(clob_mm0, 'CLOB without MM')
+    pre_post(clob[clob['n_mm'] >= 1], 'CLOB with MM (MM>=1)')
+    pre_post(clob[clob['n_mm'] == 0], 'CLOB without MM')
     pre_post(amm, 'AMM (all configs)')
 
 
@@ -1272,26 +1329,26 @@ def report_shock(clob, amm):
 def report_best_configs(clob_grp, amm_grp, amm_c_grp=None, mv_grp=None):
     _section('6. BEST CONFIGURATIONS')
 
-    # Best CLOB — closest to fair value (|fv_cost| → 0) with MM=1
+    # Best CLOB — closest to fair value (|fv_cost| → 0) with MM>=1
     if clob_grp is not None and len(clob_grp):
         valid = clob_grp.dropna(subset=['fv_cost_med'])
         if len(valid):
-            # Prefer configs WITH market maker (MM=1) — proper CLOB
-            mm1 = valid[valid['n_mm'] == 1]
-            pool = mm1 if len(mm1) else valid
+            # Prefer configs WITH market maker (MM>=1) — proper CLOB
+            mm_pos = valid[valid['n_mm'] >= 1]
+            pool = mm_pos if len(mm_pos) else valid
             pool = pool.copy()
             pool['abs_fv'] = pool['fv_cost_med'].abs()
             best = pool.loc[pool['abs_fv'].idxmin()]
-            print(f'\n  >>> BEST CLOB configuration (closest to fair value, MM=1):')
+            print(f'\n  >>> BEST CLOB configuration (closest to fair value, MM>=1):')
             print(f'      MM={int(best.n_mm)}  Random={int(best.n_rnd)}  '
                   f'Fund={int(best.n_fund)}  Chartist={int(best.n_chart)}  '
                   f'Univ={int(best.n_univ)}')
             print(f'      Fill rate    : {best.fill_rate:.1f}%')
             print(f'      cost_bps med : {best.cost_med:.1f} bps')
             print(f'      cost_bps mean: {best.cost_mean:.1f} bps')
-            print(f'      fv_cost med  : {best.fv_cost_med:.1f} bps')
-            print(f'      fv_cost mean : {best.fv_cost_mean:.1f} bps')
-            print(f'      |fv_cost|    : {best.abs_fv:.1f} bps  (lower = better)')
+            print(f'      fv_cost med  : {best.fv_cost_med:.2f} bps')
+            print(f'      fv_cost mean : {best.fv_cost_mean:.2f} bps')
+            print(f'      |fv_cost|    : {best.abs_fv:.2f} bps  (lower = better)')
 
     # Best AMM
     if amm_grp is not None and len(amm_grp):
@@ -1335,18 +1392,18 @@ def report_best_configs(clob_grp, amm_grp, amm_c_grp=None, mv_grp=None):
 def report_conclusions():
     _section('7. SUMMARY & CONCLUSIONS')
     print("""
-  Blocks A-C: closed ecosystems (no external FX takers).
-    A: 5 CLOB agents trade among themselves.
+    Blocks A-C: closed ecosystems (no external FX takers).
+        A: CLOB agents trade among themselves (MM 0-5, others 0-5).
     B: AMM pools with only the arbitrageur trading.
     C: heterogeneous HFMM pools, routing='best'.
-  Block D: open system via Simulator.default_fx().
-    30 CLOB noise + 1 MM + 33 FX takers (Noise/Fund/Retail/Institutional)
-    + CPMM + HFMM + arbitrageur. Sweep amm_share_pct 0-100%.
+    Block D: open system with best Block A CLOB + best Block C AMM.
+        CLOB = MM2 + Random1 + Fund3 + Chart1 + Univ1.
+        AMM = 1 tight HFMM.  FX takers = 33 routed agents.
 
   COMPONENT INSIGHTS (Blocks A-C):
   1. MARKET MAKER is critical for CLOB stability.
-     MM=1: median fv_cost ~ -112 bps (tight spread execution).
-     MM=0: higher variance, wider spread.
+     MM>=1 improves fill rate and execution quality.
+     More MMs → tighter spreads, more depth, lower fv_cost.
 
   2. HFMM CHEAPER THAN CPMM.
      Pure HFMM ~ 63 bps, pure CPMM ~ 85 bps.

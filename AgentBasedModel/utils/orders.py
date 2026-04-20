@@ -7,13 +7,14 @@ class Order:
     """
     order_id = 0
 
-    def __init__(self, price, qty, order_type, trader_link=None):
+    def __init__(self, price, qty, order_type, trader_link=None, ttl=None):
         # Properties
         self.price = price
         self.qty = qty
         self.order_type = order_type
         self.trader = trader_link
         self.order_id = Order.order_id
+        self.ttl = ttl  # ticks until expiry (None = GTC)
 
         # Connections
         self.left = None
@@ -192,6 +193,7 @@ class OrderList:
         # If empty
         if self.first is None:
             self.append(order)
+            return
 
         # Insert order in the beginning
         if order <= self.first:

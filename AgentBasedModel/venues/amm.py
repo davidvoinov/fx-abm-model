@@ -63,13 +63,22 @@ class CPMMPool:
     """
 
     def __init__(self, x: float, y: float, fee: float = 0.003,
-                 gas_cost_bps: float = 0.0):
+                 gas_cost_bps: float = 0.0,
+                 dynamic_fee: bool = False,
+                 fee_floor: Optional[float] = None,
+                 fee_cap: Optional[float] = None):
         assert x > 0 and y > 0, "Reserves must be positive"
         self.x = float(x)
         self.y = float(y)
         self.k = self.x * self.y
         self.fee = fee
+        self._base_fee = fee
         self.gas_cost_bps = gas_cost_bps
+
+        # Dynamic fee configuration
+        self.dynamic_fee = dynamic_fee
+        self._fee_floor = fee_floor if fee_floor is not None else fee * 0.2
+        self._fee_cap = fee_cap if fee_cap is not None else fee * 5.0
 
         # Accumulated fee revenue (in quote terms) for LP income tracking
         self.fee_revenue = 0.0
@@ -79,11 +88,14 @@ class CPMMPool:
         self.x_history: List[float] = [self.x]
         self.y_history: List[float] = [self.y]
         self.fee_revenue_history: List[float] = [0.0]
+        self.fee_history: List[float] = [self.fee]
 
     # ---- prices ----------------------------------------------------------
 
     def mid_price(self) -> float:
         """Internal pool mid-price: quote per base."""
+        if self.x <= 0:
+            return float('inf')
         return self.y / self.x
 
     # ---- quoting (read-only) ---------------------------------------------
@@ -103,7 +115,7 @@ class CPMMPool:
         """
         if Q <= 0:
             return self._zero_quote(S_t)
-        if Q >= self.x:
+        if Q >= self.x * 0.95:
             return self._inf_quote()
 
         S_ref = S_t if S_t is not None else self.mid_price()
@@ -181,7 +193,9 @@ class CPMMPool:
         """Execute selling Q base. Updates reserves & fee revenue."""
         quote = self.quote_sell(Q, self.mid_price())
 
-        fee_amount = Q * self.fee * self.mid_price()
+        # Sell-side fees are charged on the input base amount. In quote
+        # terms this is Q * fee * exec_price, which equals delta_y * fee.
+        fee_amount = quote['delta_y'] * self.fee
         self.fee_revenue += fee_amount
         self.period_fee_revenue += fee_amount
 
@@ -224,7 +238,8 @@ class CPMMPool:
 
     # ---- arbitrage -------------------------------------------------------
 
-    def arbitrage_to_target(self, S_t: float) -> float:
+    def arbitrage_to_target(self, S_t: float,
+                            max_trade_qty: Optional[float] = None) -> float:
         """
         Trade to align pool mid-price with external price S_t.
         Returns quantity of base traded (positive = bought base from pool).
@@ -238,17 +253,22 @@ class CPMMPool:
         # Target reserves: y/x = S_t, x*y = k
         x_target = _math.sqrt(self.k / S_t)
         delta_x = x_target - self.x
+        trade_cap = float('inf') if max_trade_qty is None else max(0.0, max_trade_qty)
 
         if delta_x < 0:
             # Pool has too much x → buy base from pool
-            Q = min(abs(delta_x), self.x * 0.5)
+            Q = min(abs(delta_x), self.x * 0.5, trade_cap)
+            if Q <= 0:
+                return 0.0
             self.execute_buy(Q)
             return Q
         else:
             # Pool needs more x → sell base to pool
             # Cap: never drain more than 50 % of quote reserves
             max_sell = self.y * 0.5 / max(S_t, 1e-9)
-            Q = min(abs(delta_x), max_sell)
+            Q = min(abs(delta_x), max_sell, trade_cap)
+            if Q <= 0:
+                return 0.0
             self.execute_sell(Q)
             return -Q
 
@@ -283,11 +303,22 @@ class CPMMPool:
         """Reset per-period fee accumulator."""
         self.period_fee_revenue = 0.0
 
+    def update_fee(self, sigma_t: float, sigma_base: float, sigma_prev: Optional[float] = None):
+        """Scale fee proportionally to σ_t / σ_base, clamped to [floor, cap].
+        Uses lagged σ (sigma_prev) when available to avoid look-ahead bias."""
+        if not self.dynamic_fee or sigma_base <= 0:
+            return
+        sigma_eff = sigma_prev if sigma_prev is not None else sigma_t
+        ratio = sigma_eff / sigma_base
+        self.fee = max(self._fee_floor,
+                       min(self._fee_cap, self._base_fee * ratio))
+
     def record_state(self):
         """Snapshot current reserves & cumulative fees."""
         self.x_history.append(self.x)
         self.y_history.append(self.y)
         self.fee_revenue_history.append(self.fee_revenue)
+        self.fee_history.append(self.fee)
 
     # ---- helpers ---------------------------------------------------------
 
@@ -392,7 +423,10 @@ class HFMMPool:
 
     def __init__(self, x: float, y: float, A: float = 100.0,
                  fee: float = 0.001, gas_cost_bps: float = 0.0,
-                 rate: Optional[float] = None):
+                 rate: Optional[float] = None,
+                 dynamic_fee: bool = False,
+                 fee_floor: Optional[float] = None,
+                 fee_cap: Optional[float] = None):
         """
         Parameters
         ----------
@@ -401,14 +435,23 @@ class HFMMPool:
         A : float       amplification coefficient
         fee : float     pool fee (fraction)
         rate : float    equilibrium price (quote/base).  If None → y/x.
+        dynamic_fee : bool   scale fee with σ_t / σ_base
+        fee_floor : float    minimum fee (default: base_fee × 0.2)
+        fee_cap : float      maximum fee (default: base_fee × 5.0)
         """
         assert x > 0 and y > 0 and A > 0
         self.x = float(x)          # raw base reserves
         self.y = float(y)          # raw quote reserves
         self.A = A
         self.fee = fee
+        self._base_fee = fee
         self.gas_cost_bps = gas_cost_bps
         self.rate = rate if rate is not None else self.y / self.x
+
+        # Dynamic fee configuration
+        self.dynamic_fee = dynamic_fee
+        self._fee_floor = fee_floor if fee_floor is not None else fee * 0.2
+        self._fee_cap = fee_cap if fee_cap is not None else fee * 5.0
 
         # Normalised reserves for the invariant
         self._xn = self.x * self.rate
@@ -422,6 +465,7 @@ class HFMMPool:
         self.y_history: List[float] = [self.y]
         self.D_history: List[float] = [self.D]
         self.fee_revenue_history: List[float] = [0.0]
+        self.fee_history: List[float] = [self.fee]
 
     def _sync_norm(self):
         """Re-compute normalised reserves from raw."""
@@ -432,6 +476,8 @@ class HFMMPool:
 
     def mid_price(self) -> float:
         """Quote per base, derived from the marginal rate on the curve."""
+        if self._xn <= 0 or self._yn <= 0:
+            return float('inf')
         mp_norm = _hfmm_mid_price(self._xn, self._yn, self.A, self.D)
         return mp_norm * self.rate
 
@@ -445,7 +491,7 @@ class HFMMPool:
         """
         if Q <= 0:
             return self._zero_quote(S_t)
-        if Q >= self.x:
+        if Q >= self.x * 0.95:
             return self._inf_quote()
 
         S_ref = S_t if S_t is not None else self.mid_price()
@@ -522,7 +568,9 @@ class HFMMPool:
     def execute_sell(self, Q: float) -> dict:
         quote = self.quote_sell(Q, self.mid_price())
 
-        fee_amount = Q * self.fee * self.mid_price()
+        # Sell-side fees are charged on the input base amount. In quote
+        # terms this is Q * fee * exec_price, which equals delta_y * fee.
+        fee_amount = quote['delta_y'] * self.fee
         self.fee_revenue += fee_amount
         self.period_fee_revenue += fee_amount
 
@@ -563,7 +611,8 @@ class HFMMPool:
 
     # ---- arbitrage -------------------------------------------------------
 
-    def arbitrage_to_target(self, S_t: float) -> float:
+    def arbitrage_to_target(self, S_t: float,
+                            max_trade_qty: Optional[float] = None) -> float:
         """
         Binary-search for x_target such that mid_price ≈ S_t,
         then execute the implied trade.  Returns signed quantity traded.
@@ -594,15 +643,20 @@ class HFMMPool:
 
         x_target = (lo + hi) / 2.0
         delta = x_target - self.x
+        trade_cap = float('inf') if max_trade_qty is None else max(0.0, max_trade_qty)
 
         if delta < 0:
-            Q = min(abs(delta), self.x * 0.5)
+            Q = min(abs(delta), self.x * 0.5, trade_cap)
+            if Q <= 0:
+                return 0.0
             self.execute_buy(Q)
             return Q
         else:
             # Cap: never drain more than 50 % of quote reserves
             max_sell = self.y * 0.5 / max(S_t, 1e-9)
-            Q = min(abs(delta), max_sell)
+            Q = min(abs(delta), max_sell, trade_cap)
+            if Q <= 0:
+                return 0.0
             self.execute_sell(Q)
             return -Q
 
@@ -662,11 +716,22 @@ class HFMMPool:
     def reset_period_fees(self):
         self.period_fee_revenue = 0.0
 
+    def update_fee(self, sigma_t: float, sigma_base: float, sigma_prev: Optional[float] = None):
+        """Scale fee proportionally to σ_t / σ_base, clamped to [floor, cap].
+        Uses lagged σ (sigma_prev) when available to avoid look-ahead bias."""
+        if not self.dynamic_fee or sigma_base <= 0:
+            return
+        sigma_eff = sigma_prev if sigma_prev is not None else sigma_t
+        ratio = sigma_eff / sigma_base
+        self.fee = max(self._fee_floor,
+                       min(self._fee_cap, self._base_fee * ratio))
+
     def record_state(self):
         self.x_history.append(self.x)
         self.y_history.append(self.y)
         self.D_history.append(self.D)
         self.fee_revenue_history.append(self.fee_revenue)
+        self.fee_history.append(self.fee)
 
     # ---- helpers ---------------------------------------------------------
 

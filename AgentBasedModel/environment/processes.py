@@ -5,9 +5,10 @@ and fair price S_t.
 Supports piecewise-constant regimes (normal → stress → normal)
 or a simple mean-reverting stochastic process for σ, c.
 
-S_t follows a Geometric Brownian Motion (GBM) driven by σ_t so that
-there is always an authoritative fair price available — even when the
-CLOB order book is thin or absent (AMM-only scenarios).
+S_t follows a mean-reverting latent-anchor process so that there is
+always an authoritative fair price available — even when the CLOB order
+book is thin or absent (AMM-only scenarios) — without producing the
+hyper-drifting post-shock paths of a pure GBM.
 """
 
 import random
@@ -28,13 +29,17 @@ class MarketEnvironment:
 
     Fair price S_t
     --------------
-    Always present.  Follows GBM:
+    Always present.  Follows a mean-reverting process in log-price:
 
-        S_{t+1} = S_t · exp((μ − ½σ²)Δt + σ √Δt · ε)
+        log S_{t+1} = log S_t
+            + μ
+            + κ (log S* - log S_t)
+            + λ σ_t ε
 
-    where σ = σ_t (the current regime volatility), μ = ``drift``,
-    Δt = 1.  The resulting path is the *official* reference price
-    used by arbitrageurs when the CLOB is unreliable or absent.
+    where S* is a latent anchor price.  Price shocks move both S_t and
+    S* downward (or upward), but only partially, so the process can
+    recover in a controlled way instead of exploding under repeated
+    high-σ draws.
 
     These parameters feed into:
       - CLOB market-maker spread:  qspr_t = α₀ + α₁ σ_t + α₂ c_t
@@ -52,7 +57,11 @@ class MarketEnvironment:
                  mode: str = 'piecewise',
                  # ── exogenous fair price ──────────────────────
                  price: Optional[float] = None,
-                 drift: float = 0.0):
+                 drift: float = 0.0,
+                 price_reversion: float = 0.12,
+                 price_vol_scale: float = 0.35,
+                 shock_anchor_weight: float = 0.75,
+                 shock_price_freeze_ticks: int = 1):
         """
         Parameters
         ----------
@@ -69,7 +78,17 @@ class MarketEnvironment:
             Initial fair price S_0.  If None the fair price is not tracked
             (backward-compatible with legacy callers).
         drift : float
-            Annualised drift μ for the GBM (default 0 = martingale).
+            Drift μ of the latent fair-price process.
+        price_reversion : float
+            Mean-reversion speed κ toward the latent anchor price.
+        price_vol_scale : float
+            Scale λ mapping σ_t into fair-price innovations.
+        shock_anchor_weight : float
+            Fraction of a shock that permanently shifts the latent anchor.
+        shock_price_freeze_ticks : int
+            Number of periods to freeze S_t immediately after a shock so
+            the logged shock level is not contaminated by the same-tick
+            stochastic price step.
         """
         self.sigma_low = sigma_low
         self.sigma_high = sigma_high
@@ -84,15 +103,51 @@ class MarketEnvironment:
         self._c = c_low
         self._t = 0
 
-        # ── Fair price (GBM) ─────────────────────────────────────────
+        # ── Shock-induced stress overlay ─────────────────────────────
+        # When a price shock hits, σ and c spike and then decay
+        # exponentially back to the regime baseline.
+        self._shock_sigma_overlay: float = 0.0
+        self._shock_c_overlay: float = 0.0
+        self._shock_decay: float = 0.93   # per-step multiplier ≈ half-life ~10 iters
+
+        # ── Shock liquidity-crisis state ────────────────────────────────
+        # Managed by apply_shock(), decremented by step().
+        self.shock_ticks_remaining: int = 0       # >0 means shock aftermath
+        self.mm_pause_ticks: int = 0              # MM doesn't quote
+        self.cancel_wave_frac: float = 0.0        # fraction of book to cancel
+        self.reprice_prob_override: Optional[float] = None  # reduced repricing
+        self.anchor_strength_override: Optional[float] = None
+        self.background_target_ratio_override: Optional[float] = None
+        self.toxic_flow_bias: float = 0.0         # directional bias for takers
+        self._order_flow_imbalance: float = 0.0   # signed taker flow pressure
+        self._liquidity_shock: float = 0.0        # systemic liquidity damage
+        self._liquidity_shock_decay: float = 0.90
+
+        # Configurable per-tick decay speeds for liquidity-crisis state
+        self._reprice_prob_recovery: float = 0.05       # +per tick toward 0.6
+        self._anchor_strength_recovery: float = 0.03    # +per tick toward 0.25
+        self._bg_target_ratio_recovery: float = 0.08    # +per tick toward 1.0
+        self._toxic_flow_decay: float = 0.85            # multiplicative per tick
+        self._systemic_liquidity: float = 1.0
+        self._recovery_support: float = 1.0
+
+        # ── Fair price (latent-anchor mean reversion) ───────────────
         self._price: Optional[float] = float(price) if price is not None else None
+        self._price_anchor: Optional[float] = float(price) if price is not None else None
         self._drift = drift
+        self._price_reversion = max(0.0, price_reversion)
+        self._price_vol_scale = max(0.0, price_vol_scale)
+        self._shock_anchor_weight = max(0.0, min(1.0, shock_anchor_weight))
+        self._shock_price_freeze_default = max(0, int(shock_price_freeze_ticks))
+        self._price_freeze_ticks = 0
 
         # History
         self.sigma_history: List[float] = []
         self.c_history: List[float] = []
         self.regime_history: List[str] = []
         self.price_history: List[float] = []  # S_t series
+        self.flow_imbalance_history: List[float] = []
+        self.systemic_liquidity_history: List[float] = []
 
     # ---- public API ------------------------------------------------------
 
@@ -109,6 +164,16 @@ class MarketEnvironment:
         """Exogenous fair price S_t (None if not configured)."""
         return self._price
 
+    @property
+    def order_flow_imbalance(self) -> float:
+        """EWMA of signed taker flow, positive for buy pressure."""
+        return self._order_flow_imbalance
+
+    @property
+    def systemic_liquidity(self) -> float:
+        """Common liquidity factor shared across venues in [0.2, 1.0]."""
+        return self._systemic_liquidity
+
     def is_stress(self) -> bool:
         if self.stress_start is None:
             return False
@@ -120,32 +185,242 @@ class MarketEnvironment:
         """Advance to next period and update σ_t, c_t, S_t."""
         self._t += 1
 
+        recovery_support = max(0.75, min(1.75, self._recovery_support))
+        reprice_recovery = self._reprice_prob_recovery * recovery_support
+        anchor_recovery = self._anchor_strength_recovery * recovery_support
+        bg_ratio_recovery = self._bg_target_ratio_recovery * recovery_support
+        toxic_flow_decay = self._toxic_flow_decay ** recovery_support
+        liquidity_shock_decay = self._liquidity_shock_decay ** recovery_support
+
         if self.mode == 'piecewise':
             self._step_piecewise()
         else:
             self._step_stochastic()
 
-        # GBM step for fair price
+        # Add shock-induced stress overlay (decays each step)
+        if self._shock_sigma_overlay > 1e-8:
+            self._sigma += self._shock_sigma_overlay
+            self._shock_sigma_overlay *= self._shock_decay
+        if self._shock_c_overlay > 1e-8:
+            self._c += self._shock_c_overlay
+            self._shock_c_overlay *= self._shock_decay
+
+        # Decay shock liquidity-crisis state
+        if self.shock_ticks_remaining > 0:
+            self.shock_ticks_remaining -= 1
+            if self.mm_pause_ticks > 0:
+                self.mm_pause_ticks -= 1
+            # Gradually restore reprice probability
+            if self.reprice_prob_override is not None:
+                self.reprice_prob_override = min(
+                    0.6, self.reprice_prob_override + reprice_recovery)
+                if self.reprice_prob_override >= 0.6:
+                    self.reprice_prob_override = None
+            if self.anchor_strength_override is not None:
+                self.anchor_strength_override = min(
+                    0.25, self.anchor_strength_override + anchor_recovery)
+                if self.anchor_strength_override >= 0.25:
+                    self.anchor_strength_override = None
+            if self.background_target_ratio_override is not None:
+                self.background_target_ratio_override = min(
+                    1.0, self.background_target_ratio_override + bg_ratio_recovery)
+                if self.background_target_ratio_override >= 0.95:
+                    self.background_target_ratio_override = None
+            # Decay toxic flow bias
+            if abs(self.toxic_flow_bias) > 0.01:
+                self.toxic_flow_bias *= toxic_flow_decay
+            else:
+                self.toxic_flow_bias = 0.0
+        else:
+            self.reprice_prob_override = None
+            self.anchor_strength_override = None
+            self.background_target_ratio_override = None
+            self.toxic_flow_bias = 0.0
+
+        if abs(self._order_flow_imbalance) > 0.01:
+            self._order_flow_imbalance *= 0.90
+        else:
+            self._order_flow_imbalance = 0.0
+
+        if self._liquidity_shock > 1e-8:
+            self._liquidity_shock *= liquidity_shock_decay
+
+        # Fair-price step
         if self._price is not None:
-            self._step_price()
+            if self._price_freeze_ticks > 0:
+                self._price_freeze_ticks -= 1
+            else:
+                self._step_price()
+
+        self._update_systemic_liquidity()
 
         self.sigma_history.append(self._sigma)
         self.c_history.append(self._c)
         self.regime_history.append('stress' if self.is_stress() else 'normal')
         if self._price is not None:
             self.price_history.append(self._price)
+        self.flow_imbalance_history.append(self._order_flow_imbalance)
+        self.systemic_liquidity_history.append(self._systemic_liquidity)
 
     def apply_shock(self, pct: float):
         """Apply an instantaneous shock to the fair price.
+
+        Also triggers an endogenous stress response: σ and c spike
+        proportionally to the shock magnitude and then decay
+        exponentially (half-life ≈ 10 steps).
 
         Parameters
         ----------
         pct : float
             Percentage change (e.g. -20 for a 20 % crash).
         """
+        multiplier = 1.0 + pct / 100.0
         if self._price is not None:
-            self._price *= (1.0 + pct / 100.0)
+            self._price *= multiplier
             self._price = max(self._price, 1e-6)
+            self._price_freeze_ticks = self._shock_price_freeze_default
+        if self._price_anchor is not None:
+            anchor_multiplier = 1.0 + self._shock_anchor_weight * (multiplier - 1.0)
+            self._price_anchor *= max(anchor_multiplier, 1e-6)
+            self._price_anchor = max(self._price_anchor, 1e-6)
+
+        # ── Endogenous stress response ───────────────────────────────
+        intensity = min(abs(pct) / 20.0, 2.0)
+        self._shock_sigma_overlay = (self.sigma_high - self.sigma_low) * intensity
+        self._shock_c_overlay = (self.c_high - self.c_low) * intensity
+
+        # ── Liquidity crisis state ──────────────────────────────────
+        self.shock_ticks_remaining = max(12, int(24 * intensity))
+        self.mm_pause_ticks = max(2, int(6 * intensity))
+        self.cancel_wave_frac = min(0.8, 0.15 + 0.35 * intensity)
+        self.reprice_prob_override = max(0.05, 0.25 - 0.08 * intensity)
+        self.anchor_strength_override = max(0.10, 0.22 - 0.05 * intensity)
+        self.background_target_ratio_override = max(0.45, 0.70 - 0.12 * intensity)
+        # Toxic flow: takers skew toward shock direction
+        self.toxic_flow_bias = -0.3 * (1.0 if pct < 0 else -1.0) * intensity
+        self._liquidity_shock = max(self._liquidity_shock, 0.25 + 0.20 * intensity)
+        self._update_systemic_liquidity()
+
+    def apply_fundamental_shock(self, pct: float,
+                                anchor_weight: float = 1.0,
+                                freeze_ticks: Optional[int] = None):
+        """Move the latent fair value without mechanically repricing venues."""
+        if pct == 0:
+            return
+
+        multiplier = max(1e-6, 1.0 + pct / 100.0)
+        if self._price is not None:
+            self._price *= multiplier
+            self._price = max(self._price, 1e-6)
+            self._price_freeze_ticks = (
+                self._shock_price_freeze_default
+                if freeze_ticks is None else max(0, int(freeze_ticks))
+            )
+        if self._price_anchor is not None:
+            eff_weight = max(0.0, min(1.0, anchor_weight))
+            anchor_multiplier = 1.0 + eff_weight * (multiplier - 1.0)
+            self._price_anchor *= max(anchor_multiplier, 1e-6)
+            self._price_anchor = max(self._price_anchor, 1e-6)
+
+    def apply_funding_volatility_shock(self, intensity: float,
+                                       decay: float = 0.94):
+        """Spike sigma and funding cost with gradual decay."""
+        intensity = max(0.0, float(intensity))
+        if intensity <= 0:
+            return
+
+        self._shock_decay = max(0.80, min(0.99, float(decay)))
+        sigma_jump = (self.sigma_high - self.sigma_low) * intensity
+        c_jump = (self.c_high - self.c_low) * intensity
+        self._shock_sigma_overlay = max(self._shock_sigma_overlay, sigma_jump)
+        self._shock_c_overlay = max(self._shock_c_overlay, c_jump)
+        self.shock_ticks_remaining = max(self.shock_ticks_remaining, 12 + int(18 * intensity))
+        self._update_systemic_liquidity()
+
+    def apply_liquidity_shock(self, cancel_frac: float,
+                              direction: float = 0.0,
+                              intensity: Optional[float] = None,
+                              reprice_prob: float = 0.05,
+                              anchor_strength: float = 0.03,
+                              background_target_ratio: float = 0.35,
+                              reprice_prob_recovery: Optional[float] = None,
+                              anchor_strength_recovery: Optional[float] = None,
+                              bg_target_ratio_recovery: Optional[float] = None,
+                              toxic_flow_decay: Optional[float] = None,
+                              liquidity_shock_decay: Optional[float] = None):
+        """Trigger cancellations, MM withdrawal, stale quotes and toxic flow."""
+        cancel_frac = max(0.0, min(1.0, float(cancel_frac)))
+        intensity = cancel_frac if intensity is None else max(0.0, float(intensity))
+        if cancel_frac <= 0 and intensity <= 0:
+            return
+
+        self.shock_ticks_remaining = max(self.shock_ticks_remaining, 10 + int(20 * intensity))
+        self.mm_pause_ticks = max(self.mm_pause_ticks, 2 + int(8 * intensity))
+        self.cancel_wave_frac = max(self.cancel_wave_frac, cancel_frac)
+        self.reprice_prob_override = (
+            max(0.01, min(reprice_prob, self.reprice_prob_override))
+            if self.reprice_prob_override is not None else max(0.01, reprice_prob)
+        )
+        self.anchor_strength_override = (
+            max(0.0, min(anchor_strength, self.anchor_strength_override))
+            if self.anchor_strength_override is not None else max(0.0, anchor_strength)
+        )
+        self.background_target_ratio_override = min(
+            self.background_target_ratio_override if self.background_target_ratio_override is not None else 1.0,
+            max(0.10, background_target_ratio),
+        )
+        signed_direction = 0.0
+        if direction > 0:
+            signed_direction = 1.0
+        elif direction < 0:
+            signed_direction = -1.0
+        self.toxic_flow_bias = 0.30 * signed_direction * max(0.3, intensity)
+        self._liquidity_shock = max(self._liquidity_shock, 0.20 + 0.35 * intensity)
+        # Apply custom decay rates if provided
+        if reprice_prob_recovery is not None:
+            self._reprice_prob_recovery = max(0.001, float(reprice_prob_recovery))
+        if anchor_strength_recovery is not None:
+            self._anchor_strength_recovery = max(0.001, float(anchor_strength_recovery))
+        if bg_target_ratio_recovery is not None:
+            self._bg_target_ratio_recovery = max(0.001, float(bg_target_ratio_recovery))
+        if toxic_flow_decay is not None:
+            self._toxic_flow_decay = max(0.50, min(0.99, float(toxic_flow_decay)))
+        if liquidity_shock_decay is not None:
+            self._liquidity_shock_decay = max(0.50, min(0.99, float(liquidity_shock_decay)))
+        self._update_systemic_liquidity()
+
+    def observe_order_flow(self, period_trades: List[dict]):
+        """Update common liquidity state from realised taker order flow.
+
+        The model previously reacted mostly to fair-price moves.  This
+        method injects a common liquidity channel driven by signed flow,
+        so dealer constraints and AMM liquidity can comove for the right
+        reason.
+        """
+        buy_vol = sum(
+            tr.get('quantity', 0.0)
+            for tr in period_trades
+            if tr.get('side') == 'buy'
+        )
+        sell_vol = sum(
+            tr.get('quantity', 0.0)
+            for tr in period_trades
+            if tr.get('side') == 'sell'
+        )
+        gross = buy_vol + sell_vol
+        imbalance = (buy_vol - sell_vol) / gross if gross > 0 else 0.0
+        self._order_flow_imbalance = 0.65 * self._order_flow_imbalance + 0.35 * imbalance
+
+        sigma_base = max(self.sigma_low, 1e-9)
+        stress_scale = max(1.0, self._sigma / sigma_base)
+        stress_excess = max(0.0, stress_scale - 1.0)
+        flow_damage = 0.08 * abs(self._order_flow_imbalance) * (stress_excess + self._liquidity_shock)
+        self._liquidity_shock = min(0.85, self._liquidity_shock + flow_damage)
+        self._update_systemic_liquidity()
+
+    def set_recovery_support(self, support: float):
+        """Set resiliency support from active book-side liquidity providers."""
+        self._recovery_support = max(0.75, min(1.75, float(support)))
 
     # ---- private ---------------------------------------------------------
 
@@ -176,11 +451,34 @@ class MarketEnvironment:
 
     def _step_price(self):
         """
-        GBM step: S_{t+1} = S_t · exp((μ − ½σ²) + σ ε), Δt = 1.
+        Mean-reverting log-price step toward the latent anchor.
         """
+        if self._price is None:
+            return
+        anchor = self._price_anchor if self._price_anchor is not None else self._price
         sigma = self._sigma
         mu = self._drift
         eps = random.gauss(0, 1)
-        log_ret = (mu - 0.5 * sigma * sigma) + sigma * eps
-        self._price *= math.exp(log_ret)
+        log_price = math.log(max(self._price, 1e-6))
+        log_anchor = math.log(max(anchor, 1e-6))
+        log_price += mu
+        log_price += self._price_reversion * (log_anchor - log_price)
+        log_price += self._price_vol_scale * sigma * eps
+        self._price = math.exp(log_price)
         self._price = max(self._price, 1e-6)
+
+    def _update_systemic_liquidity(self):
+        """Shared liquidity factor that links CLOB and AMM conditions."""
+        sigma_base = max(self.sigma_low, 1e-9)
+        c_base = max(self.c_low, 1e-9)
+        sigma_stress = max(0.0, self._sigma / sigma_base - 1.0)
+        c_stress = max(0.0, self._c / c_base - 1.0)
+        flow_pressure = abs(self._order_flow_imbalance) * (0.5 * sigma_stress + self._liquidity_shock)
+
+        friction = (
+            0.12 * sigma_stress
+            + 0.05 * c_stress
+            + 0.35 * flow_pressure
+            + self._liquidity_shock
+        )
+        self._systemic_liquidity = max(0.2, min(1.0, 1.0 / (1.0 + friction)))

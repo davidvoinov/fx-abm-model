@@ -60,17 +60,32 @@ Generates PNG dashboards and CSV tables into output/unit_tests/:
   - routing_diagnostics.png — softmax theory vs empirical, regime transitions,
                               two-step routing, venue cost comparison
 """
-import sys, os, math, random
+import sys, os, math, random, argparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from AgentBasedModel.utils.orders import Order, OrderList
-from AgentBasedModel.agents.agents import ExchangeAgent, Trader
+from AgentBasedModel.agents.agents import ExchangeAgent, Trader, Fundamentalist, MarketMaker, AMMArbitrageur, AMMProvider
 from AgentBasedModel.venues.clob import CLOBVenue
 from AgentBasedModel.venues.amm import (
     CPMMPool, HFMMPool,
     _hfmm_get_D, _hfmm_get_y, _hfmm_mid_price,
 )
+from AgentBasedModel.environment.processes import MarketEnvironment
+from AgentBasedModel.metrics.resilience import (
+    composite_resilience_metrics,
+    kaplan_meier_curve,
+    price_resilience_metrics,
+    series_resilience_metrics,
+)
+from AgentBasedModel.metrics.statistics import (
+    bootstrap_diff_ci,
+    bootstrap_mean_ci,
+    bootstrap_paired_diff_ci,
+    paired_t_test,
+    welch_t_test,
+)
+import main as main_module
 from collections import Counter
 
 W = 72
@@ -261,6 +276,31 @@ def test_clob():
     c_empty = CLOBVenue(ex_empty)
     check("Empty book: mid = 100 (fallback)", c_empty.mid_price(), 100.0)
     check("Empty book: qspr = inf", c_empty.quoted_spread_bps(), float('inf'))
+
+    inserted = OrderList('bid')
+    inserted.insert(Order(99.0, 10, 'bid', None))
+    check_bool(
+        "Empty insert keeps single isolated node",
+        inserted.first is inserted.last and inserted.first is not None
+        and inserted.first.left is None and inserted.first.right is None,
+        (
+            f"first={inserted.first}, last={inserted.last}, "
+            f"left={getattr(inserted.first, 'left', None)}, "
+            f"right={getattr(inserted.first, 'right', None)}"
+        ),
+    )
+
+    subsection("Partial Anchor")
+    ex_anchor = _make_exchange(BIDS, ASKS)
+    ex_anchor._anchor_strength = 0.25
+    ex_anchor._anchor_threshold_bps = 0.0
+    ex_anchor.rebalance_background_liquidity = lambda *args, **kwargs: None
+    ex_anchor.recenter_book(110.0, reprice_prob=1.0,
+                            reprice_noise_bps=0.0,
+                            anchor_strength=0.25,
+                            min_reprice_gap_bps=0.0)
+    check("Anchor moves only 25% toward fair price",
+          ex_anchor.price(), 102.5, abs_tol=1e-9)
 
 
 # =====================================================================
@@ -570,14 +610,16 @@ def test_routing():
     def _make_exchange_r():
         return _make_exchange([(99, 50), (98, 50)], [(101, 50), (102, 50)])
 
-    def _make_trader(amm_share_pct=50, beta_amm=0.05, bias=0.0, noise=0.0, det=False):
-        ex = _make_exchange_r()
+    def _make_trader(amm_share_pct=50, beta_amm=0.05, bias=0.0, noise=0.0,
+                     det=False, rule='fixed_share', ex=None):
+        ex = ex or _make_exchange_r()
         clob = CLOBVenue(ex)
         cpmm = CPMMPool(x=1000, y=100_000, fee=0.003)
         hfmm = HFMMPool(x=1000, y=100_000, A=100, fee=0.001, rate=100.0)
         return Trader(market=ex, cash=1e6, assets=100, clob=clob,
                       amm_pools={'cpmm': cpmm, 'hfmm': hfmm},
-                      amm_share_pct=amm_share_pct, deterministic_venue=det,
+                      amm_share_pct=amm_share_pct, venue_choice_rule=rule,
+                      deterministic_venue=det,
                       beta_amm=beta_amm, cpmm_bias_bps=bias, cost_noise_std=noise)
 
     # ── 1. Softmax ───────────────────────────────────────────────────
@@ -673,6 +715,18 @@ def test_routing():
                picks_n['cpmm'] > 0 and picks_n['hfmm'] > 0,
                f"CPMM={picks_n['cpmm']}, HFMM={picks_n['hfmm']}")
 
+    random.seed(42)
+    thin_ex = _make_exchange([(99, 5)], [(101, 5)])
+    fixed_thin = _make_trader(amm_share_pct=5, rule='fixed_share', ex=thin_ex)
+    liq_thin = _make_trader(amm_share_pct=5, rule='liquidity_aware', ex=_make_exchange([(99, 5)], [(101, 5)]))
+    q_large = 20.0
+    fixed_amm_share = sum(1 for _ in range(N) if fixed_thin.choose_venue(q_large) != 'clob') / N
+    random.seed(42)
+    liq_amm_share = sum(1 for _ in range(N) if liq_thin.choose_venue(q_large) != 'clob') / N
+    check_bool("Liquidity-aware routing overrides the fixed-share split when CLOB is infeasible",
+               fixed_amm_share < 0.15 and liq_amm_share > 0.95,
+               f"fixed_amm_share={fixed_amm_share:.3f}, liquidity_aware_amm_share={liq_amm_share:.3f}")
+
     # ── estimate_costs() ─────────────────────────────────────────────
     # Must return a dict with keys clob/cpmm/hfmm, all float.
     subsection("estimate_costs()")
@@ -680,6 +734,720 @@ def test_routing():
     print(f"    costs = {costs_e}")
     check_bool("Keys: clob, cpmm, hfmm",
                set(costs_e.keys()) == {'clob', 'cpmm', 'hfmm'})
+
+def test_mm_amm_interaction():
+    """AMM interaction channel can tighten or worsen CLOB MM quotes."""
+    section("MARKET MAKER / AMM INTERACTION — Unit Tests")
+
+    class MockEnv:
+        def __init__(self, sigma=0.01, c=0.002, sigma_low=0.01):
+            self.sigma = sigma
+            self.funding_cost = c
+            self.sigma_low = sigma_low
+
+    ex = _make_exchange(BIDS, ASKS)
+    env = MockEnv()
+    pools = {
+        'cpmm': CPMMPool(x=1000.0, y=100_000.0, fee=0.003),
+        'hfmm': HFMMPool(x=1000.0, y=100_000.0, A=10.0, fee=0.001, rate=100.0),
+    }
+    mid = 100.0
+
+    mm_none = MarketMaker(ex, cash=1e4, env=env, amm_pools=pools,
+                          venue_interaction_mode='none')
+    mm_comp = MarketMaker(ex, cash=1e4, env=env, amm_pools=pools,
+                          venue_interaction_mode='competition',
+                          amm_spread_impact_bps=3.0, amm_depth_impact=20.0)
+    mm_tox = MarketMaker(ex, cash=1e4, env=env, amm_pools=pools,
+                         venue_interaction_mode='toxicity',
+                         amm_spread_impact_bps=3.0, amm_depth_impact=20.0)
+
+    spread_none = mm_none._target_spread_bps(mid)
+    spread_comp = mm_comp._target_spread_bps(mid)
+    spread_tox = mm_tox._target_spread_bps(mid)
+    depth_none = mm_none._target_depth(mid)
+    depth_comp = mm_comp._target_depth(mid)
+    depth_tox = mm_tox._target_depth(mid)
+
+    check_bool("Competition mode tightens CLOB MM spread",
+               spread_comp < spread_none,
+               f"competition={spread_comp:.3f}, none={spread_none:.3f}")
+    check_bool("Competition mode boosts CLOB MM depth",
+               depth_comp > depth_none,
+               f"competition={depth_comp:.3f}, none={depth_none:.3f}")
+    check_bool("Toxicity mode widens CLOB MM spread",
+               spread_tox > spread_none,
+               f"toxicity={spread_tox:.3f}, none={spread_none:.3f}")
+    check_bool("Toxicity mode reduces CLOB MM depth",
+               depth_tox < depth_none,
+               f"toxicity={depth_tox:.3f}, none={depth_none:.3f}")
+
+    support_calm = mm_comp._amm_support_score(mid)
+    env.sigma = 0.05
+    support_stress = mm_comp._amm_support_score(mid)
+    check_bool("AMM support fades in stress",
+               support_stress < support_calm,
+               f"calm={support_calm:.3f}, stress={support_stress:.3f}")
+
+
+# =====================================================================
+#  5. FEE ACCOUNTING & FUNDAMENTALIST ANCHOR
+# =====================================================================
+
+def test_fee_accounting():
+    """Sell-side fee revenue uses actual exec_price, not mid_price."""
+    section("FEE ACCOUNTING — Unit Tests")
+
+    # ── CPMM sell-side fee accuracy ──────────────────────────────────
+    subsection("CPMM sell-side fee revenue")
+    p = CPMMPool(x=1000.0, y=100_000.0, fee=0.01)
+    for Q in [1, 10, 50, 200]:
+        p2 = CPMMPool(x=1000.0, y=100_000.0, fee=0.01)
+        quote = p2.execute_sell(Q)
+        expected_fee = Q * 0.01 * quote['exec_price']
+        check(f"CPMM sell Q={Q}: fee_revenue ≈ Q·fee·exec_price",
+              p2.fee_revenue, expected_fee, rel=1e-9)
+
+    # ── HFMM sell-side fee accuracy ──────────────────────────────────
+    subsection("HFMM sell-side fee revenue")
+    for Q in [1, 10, 50]:
+        h = HFMMPool(x=1000.0, y=100_000.0, A=10.0, fee=0.01, rate=100.0)
+        quote = h.execute_sell(Q)
+        expected_fee = Q * 0.01 * quote['exec_price']
+        check(f"HFMM sell Q={Q}: fee_revenue ≈ Q·fee·exec_price",
+              h.fee_revenue, expected_fee, rel=1e-9)
+
+    # ── Cumulative fee test (buy + sell) ─────────────────────────────
+    subsection("Cumulative fee (buy→sell→buy sequence)")
+    p3 = CPMMPool(x=1000.0, y=100_000.0, fee=0.003)
+    cum = 0.0
+    for _ in range(10):
+        q_buy = p3.execute_buy(5)
+        cum += q_buy['delta_y'] * 0.003
+        q_sell = p3.execute_sell(5)
+        cum += 5 * 0.003 * q_sell['exec_price']
+    check(f"Cumulative fee matches fee_revenue after 20 trades",
+          p3.fee_revenue, cum, rel=1e-6)
+
+
+def test_fundamentalist_anchor():
+    """FX Fundamentalist uses env.fair_price, not static fundamental_rate."""
+    section("FUNDAMENTALIST DYNAMIC ANCHOR — Unit Tests")
+
+    # Minimal env mock
+    class MockEnv:
+        def __init__(self, fp):
+            self.fair_price = fp
+            self.sigma = 0.02
+            self.funding_cost = 0.005
+        def is_stress(self):
+            return False
+
+    # Minimal CLOB mock that returns a fixed mid
+    class MockCLOB:
+        def __init__(self, mid):
+            self._mid = mid
+        def mid_price(self):
+            return self._mid
+        def quote_buy(self, Q):
+            return dict(exec_price=self._mid, cost_bps=5.0,
+                        half_spread_bps=5.0, espr_bps=10.0,
+                        impact_bps=0.0, fee_bps=0.0)
+        def quote_sell(self, Q):
+            return self.quote_buy(Q)
+
+    # Build a Fundamentalist with fundamental_rate=100 but env has fair_price=80
+    ex = ExchangeAgent(price=100.0, std=2.0, volume=100)
+    env = MockEnv(fp=80.0)
+    clob = MockCLOB(mid=80.0)
+
+    f = Fundamentalist(ex, cash=1e4, access=1,
+                       clob=clob, amm_pools={}, env=env,
+                       amm_share_pct=0,
+                       fundamental_rate=100.0, fx_gamma=5e-3, fx_q_max=10)
+
+    # With env.fair_price=80 and CLOB mid=80 → mispricing ≈ 0 → no trade
+    subsection("env.fair_price = CLOB mid → no trade")
+    result = f.call()
+    check_bool("No trade when fair_price ≈ mid",
+               result is None,
+               f"result = {result}")
+
+    # Now move env.fair_price to 90 → mispricing = (90-80)/80 = 12.5% → buy
+    subsection("env.fair_price > CLOB mid → buy signal")
+    env.fair_price = 90.0
+    result2 = f.call()
+    check_bool("Triggers buy when env.fair_price > mid",
+               result2 is not None and result2.get('side') == 'buy',
+               f"result = {result2}")
+
+    # With static anchor (100) and mid=80 you'd always get a buy — but
+    # with env.fair_price=75 and mid=80 you should get a sell
+    subsection("env.fair_price < CLOB mid → sell signal")
+    env.fair_price = 75.0
+    result3 = f.call()
+    check_bool("Triggers sell when env.fair_price < mid",
+               result3 is not None and result3.get('side') == 'sell',
+               f"result = {result3}")
+
+def test_environment_price_process():
+    """Shock tick should log the shocked level before stochastic recovery begins."""
+    section("ENVIRONMENT PRICE PROCESS — Unit Tests")
+
+    random.seed(42)
+    env = MarketEnvironment(price=100.0,
+                            sigma_low=0.01, sigma_high=0.05,
+                            c_low=0.001, c_high=0.01)
+
+    env.apply_shock(-20.0)
+    check("Shock applies immediate -20% level shift",
+          env.fair_price, 80.0, abs_tol=1e-9)
+
+    env.step()
+    check("First post-shock step preserves shocked level",
+          env.fair_price, 80.0, abs_tol=1e-9)
+
+    path = []
+    for _ in range(40):
+        env.step()
+        path.append(env.fair_price)
+
+    check_bool("Post-shock path stays in a sane range over 40 steps",
+               min(path) > 60.0 and max(path) < 110.0,
+               f"min={min(path):.3f}, max={max(path):.3f}")
+
+
+def test_latent_anchor_reference():
+    """AMM arb reference should treat env.fair_price as a latent anchor."""
+    section("LATENT FAIR-PRICE ANCHOR — Unit Tests")
+
+    class MockEnv:
+        def __init__(self):
+            self.fair_price = 110.0
+            self.sigma = 0.05
+            self.sigma_low = 0.01
+            self.funding_cost = 0.01
+            self.systemic_liquidity = 0.6
+
+    class MockCLOB:
+        def mid_price(self):
+            return 100.0
+        def quoted_spread_bps(self):
+            return 20.0
+
+    env = MockEnv()
+    clob = MockCLOB()
+    pools = {
+        'cpmm': CPMMPool(x=1000.0, y=99_000.0, fee=0.003),
+        'hfmm': HFMMPool(x=1000.0, y=100_000.0, A=10.0, fee=0.001, rate=100.0),
+    }
+    arb = AMMArbitrageur(clob, pools, env=env)
+    ref = arb._reference_price()
+
+    check_bool("Reference stays between observed market and fair anchor",
+               100.0 < ref < 110.0,
+               f"ref={ref:.4f}")
+    check_bool("Reference leans toward observed market, not fair anchor",
+               abs(ref - 100.0) < abs(ref - 110.0),
+               f"ref={ref:.4f}")
+
+
+def test_systemic_liquidity_factor():
+    """Shared liquidity factor should fall on shock / flow stress and later recover."""
+    section("SYSTEMIC LIQUIDITY FACTOR — Unit Tests")
+
+    env = MarketEnvironment(price=100.0,
+                            sigma_low=0.01, sigma_high=0.05,
+                            c_low=0.001, c_high=0.01)
+    base_liq = env.systemic_liquidity
+
+    env.apply_shock(-20.0)
+    shock_liq = env.systemic_liquidity
+    check_bool("Shock lowers common liquidity factor",
+               shock_liq < base_liq,
+               f"base={base_liq:.3f}, shock={shock_liq:.3f}")
+
+    env.observe_order_flow([
+        {'side': 'sell', 'quantity': 20},
+        {'side': 'sell', 'quantity': 10},
+    ])
+    flow_liq = env.systemic_liquidity
+    check_bool("Sell wave creates negative order-flow imbalance",
+               env.order_flow_imbalance < 0,
+               f"imbalance={env.order_flow_imbalance:.3f}")
+    check_bool("Order-flow pressure does not improve liquidity factor",
+               flow_liq <= shock_liq,
+               f"shock={shock_liq:.3f}, flow={flow_liq:.3f}")
+
+    for _ in range(40):
+        env.step()
+
+    check_bool("Common liquidity factor partially recovers over time",
+               env.systemic_liquidity > flow_liq,
+               f"flow={flow_liq:.3f}, recovered={env.systemic_liquidity:.3f}")
+
+
+def test_shock_stress_cli_semantics():
+    """Pure shocks should no longer auto-enable a separate regime-stress layer."""
+    section("SHOCK / REGIME-STRESS CLI SEMANTICS — Unit Tests")
+
+    args = argparse.Namespace(
+        shock_iter=250,
+        shock_pct=-20.0,
+        stress_start=-1,
+        stress_end=-1,
+        n_iter=1000,
+        sigma_low=0.01,
+        sigma_high=0.05,
+        c_low=0.002,
+        c_high=0.02,
+        shock_regime_stress=False,
+        no_shock_stress=False,
+    )
+    main_module._auto_stress_around_shock(args)
+    check_bool("Pure shock leaves regime stress disabled",
+               args.stress_start == -1 and args.stress_end == -1,
+               f"stress_start={args.stress_start}, stress_end={args.stress_end}")
+
+    sim = argparse.Namespace(shock_iter=args.shock_iter, env=argparse.Namespace(stress_start=-1))
+    split_iter, split_title, phase_before, phase_after = main_module._linkage_split_point(sim)
+    check_bool("Pure shock H2 split falls back to shock tick",
+               split_iter == args.shock_iter and split_title == 'Shock',
+               f"split_iter={split_iter}, split_title={split_title}")
+    check_bool("Pure shock labels are pre/post shock",
+               phase_before == 'Pre-shock' and phase_after == 'Post-shock',
+               f"phase_before={phase_before}, phase_after={phase_after}")
+
+    args2 = argparse.Namespace(**vars(args))
+    args2.shock_regime_stress = True
+    main_module._auto_stress_around_shock(args2)
+    check_bool("Explicit shock_regime_stress starts stress at shock tick",
+               args2.stress_start == args2.shock_iter and args2.stress_end > args2.shock_iter,
+               f"stress_start={args2.stress_start}, stress_end={args2.stress_end}")
+
+    sim2 = argparse.Namespace(shock_iter=args2.shock_iter,
+                              env=argparse.Namespace(stress_start=args2.stress_start))
+    split_iter2, split_title2, _, phase_after2 = main_module._linkage_split_point(sim2)
+    check_bool("Explicit regime stress remains preferred split point",
+               split_iter2 == args2.stress_start and split_title2 == 'Stress',
+               f"split_iter={split_iter2}, split_title={split_title2}")
+    check_bool("Explicit regime stress keeps stress label",
+               phase_after2 == 'Stress',
+               f"phase_after={phase_after2}")
+
+
+def test_flash_crash_preset():
+    """Flash-crash preset should be wired as a pure microstructure realism shock."""
+    section("FLASH CRASH PRESET — Unit Tests")
+
+    parser = main_module.build_parser()
+    args = parser.parse_args(['--preset', 'flash_crash'])
+    main_module._apply_preset_defaults(parser, args)
+
+    check_bool("Flash crash is a realism preset",
+               main_module._preset_family(args.preset) == 'realism',
+               f"preset_family={main_module._preset_family(args.preset)}")
+    check_bool("Flash crash does not impose a fundamental repricing",
+               args.fundamental_shock_pct == 0.0,
+               f"fundamental_shock_pct={args.fundamental_shock_pct}")
+    check_bool("Flash crash uses an explicit sell-side sweep",
+               args.order_flow_shock_side == 'sell' and args.order_flow_shock_qty > 0,
+               f"side={args.order_flow_shock_side}, qty={args.order_flow_shock_qty}")
+    check_bool("Flash crash includes an aggressive liquidity withdrawal",
+               args.liquidity_shock_frac >= 0.85,
+               f"liquidity_shock_frac={args.liquidity_shock_frac}")
+    check_bool("Flash crash keeps recovery faster than a dealer liquidity crisis",
+               args.reprice_prob_recovery > main_module.REALISM_PRESETS['dealer_liquidity_crisis']['reprice_prob_recovery'],
+               f"flash={args.reprice_prob_recovery}, dealer={main_module.REALISM_PRESETS['dealer_liquidity_crisis']['reprice_prob_recovery']}")
+
+
+def test_mm_withdrawal_preset():
+    """MM withdrawal should stay persistent but recover faster via secondary liquidity support."""
+    section("MM WITHDRAWAL PRESET — Unit Tests")
+
+    parser = main_module.build_parser()
+    args = parser.parse_args(['--preset', 'mm_withdrawal'])
+    main_module._apply_preset_defaults(parser, args)
+
+    check_bool("MM withdrawal remains a realism preset",
+               main_module._preset_family(args.preset) == 'realism',
+               f"preset_family={main_module._preset_family(args.preset)}")
+    check_bool("MM withdrawal keeps no permanent fair-value shift",
+               args.fundamental_shock_pct == 0.0,
+               f"fundamental_shock_pct={args.fundamental_shock_pct}")
+    check_bool("MM withdrawal stays harsher than funding-liquidity shock on quote loss",
+               args.liquidity_shock_frac > main_module.REALISM_PRESETS['funding_liquidity_shock']['liquidity_shock_frac'],
+               f"mm={args.liquidity_shock_frac}, funding={main_module.REALISM_PRESETS['funding_liquidity_shock']['liquidity_shock_frac']}")
+    check_bool("MM withdrawal fades liquidity stress faster than dealer-liquidity crisis",
+               args.liquidity_shock_decay < main_module.REALISM_PRESETS['dealer_liquidity_crisis']['liquidity_shock_decay'],
+               f"mm={args.liquidity_shock_decay}, dealer={main_module.REALISM_PRESETS['dealer_liquidity_crisis']['liquidity_shock_decay']}")
+    check_bool("MM withdrawal raises latent liquidity support above the parser default",
+               args.n_latent_lp > parser.get_default('n_latent_lp') and args.n_fast_lp > parser.get_default('n_fast_lp'),
+               f"n_fast_lp={args.n_fast_lp}, n_latent_lp={args.n_latent_lp}")
+    check_bool("MM withdrawal accelerates near-mid background replenishment",
+               args.bg_target_ratio_recovery > main_module.REALISM_PRESETS['funding_liquidity_shock']['bg_target_ratio_recovery'],
+               f"mm={args.bg_target_ratio_recovery}, funding={main_module.REALISM_PRESETS['funding_liquidity_shock']['bg_target_ratio_recovery']}")
+
+
+def test_funding_liquidity_shock_preset():
+    """Funding-liquidity shock should remain a temporary stress event, not a legacy repricing panel."""
+    section("FUNDING LIQUIDITY SHOCK PRESET — Unit Tests")
+
+    parser = main_module.build_parser()
+    args = parser.parse_args(['--preset', 'funding_liquidity_shock'])
+    main_module._apply_preset_defaults(parser, args)
+
+    check_bool("Funding liquidity shock is a realism preset",
+               main_module._preset_family(args.preset) == 'realism',
+               f"preset_family={main_module._preset_family(args.preset)}")
+    check_bool("Funding liquidity shock does not impose a permanent fair-value shift",
+               args.fundamental_shock_pct == 0.0,
+               f"fundamental_shock_pct={args.fundamental_shock_pct}")
+    check_bool("Funding liquidity shock includes a strong funding/vol spike",
+               args.funding_vol_shock_intensity >= 0.9,
+               f"funding_vol_shock_intensity={args.funding_vol_shock_intensity}")
+    check_bool("Funding liquidity shock is milder than flash crash on quote withdrawal",
+               args.liquidity_shock_frac < main_module.REALISM_PRESETS['flash_crash']['liquidity_shock_frac'],
+               f"funding={args.liquidity_shock_frac}, flash={main_module.REALISM_PRESETS['flash_crash']['liquidity_shock_frac']}")
+
+
+def test_initial_depth_matching():
+    """Initial live CLOB depth should be matched to aggregate AMM depth."""
+    section("INITIAL DEPTH MATCHING — Unit Tests")
+
+    from AgentBasedModel.simulator.simulator import Simulator
+
+    random.seed(42)
+    sim = Simulator.default_fx(match_initial_depth=True)
+    clob_depth = sim.clob.total_depth(25)['total']
+    mid = sim.clob.mid_price()
+    amm_depth = sum(pool.effective_depth(mid) for pool in sim.amm_pools.values())
+    ratio = clob_depth / amm_depth if amm_depth > 0 else float('inf')
+    check_bool("Initial CLOB near-mid depth matches aggregate AMM depth",
+               0.90 <= ratio <= 1.10,
+               f"clob={clob_depth:.1f}, amm={amm_depth:.1f}, ratio={ratio:.3f}")
+
+    random.seed(42)
+    sim_no_match = Simulator.default_fx(match_initial_depth=False)
+    clob_no_match = sim_no_match.clob.total_depth(25)['total']
+    mid_no_match = sim_no_match.clob.mid_price()
+    amm_no_match = sum(pool.effective_depth(mid_no_match) for pool in sim_no_match.amm_pools.values())
+    ratio_no_match = clob_no_match / amm_no_match if amm_no_match > 0 else float('inf')
+    check_bool("Opt-out keeps the unmatched initial calibration",
+               abs(ratio_no_match - ratio) > 0.05,
+               f"matched={ratio:.3f}, unmatched={ratio_no_match:.3f}")
+
+
+def test_amm_core_liquidity_floor():
+    """AMM LP rule should preserve a core liquidity floor under stress."""
+    section("AMM CORE LIQUIDITY FLOOR — Unit Tests")
+
+    env = MarketEnvironment(price=100.0,
+                            sigma_low=0.01, sigma_high=0.05,
+                            c_low=0.001, c_high=0.01)
+    pool = HFMMPool(x=1000.0, y=100000.0, A=10.0, fee=0.001, rate=100.0)
+    provider = AMMProvider(pool, env,
+                           core_liquidity_ratio=0.75,
+                           stabilizing_bias=0.03)
+
+    initial_L = pool.liquidity_measure()
+    pool.remove_liquidity(0.40)
+    stressed_L = pool.liquidity_measure()
+    env.apply_shock(-20.0)
+    provider.update_liquidity()
+    updated_L = pool.liquidity_measure()
+
+    check_bool("Core floor triggers refill when liquidity falls too far",
+               updated_L > stressed_L,
+               f"stressed={stressed_L:.1f}, updated={updated_L:.1f}")
+    check_bool("Core floor preserves a large stable AMM base",
+               updated_L >= 0.60 * initial_L,
+               f"initial={initial_L:.1f}, updated={updated_L:.1f}")
+
+
+def test_realism_shock_mode():
+    """Realism mode should separate fair-value jumps from immediate AMM repricing."""
+    section("REALISM SHOCK MODE — Unit Tests")
+
+    from AgentBasedModel.simulator.simulator import Simulator
+
+    random.seed(42)
+    sim = Simulator.default_fx(
+        n_noise=8, n_mm=1,
+        n_fx_takers=0, n_fx_fund=0,
+        n_retail=0, n_institutional=0,
+        n_clob_fund=1, n_clob_chart=0,
+        n_clob_univ=0, clob_volume=200,
+        shock_mode='realism',
+        fundamental_shock_pct=-15.0,
+        order_flow_shock_qty=0.0,
+        liquidity_shock_frac=0.40,
+        funding_vol_shock_intensity=1.0,
+    )
+    cpmm_mid_before = sim.amm_pools['cpmm'].mid_price()
+    fair_before = sim.env.fair_price
+
+    sim._apply_realism_shock()
+
+    check_bool("Fair price jumps in realism mode",
+               sim.env.fair_price < fair_before,
+               f"before={fair_before:.2f}, after={sim.env.fair_price:.2f}")
+    check_bool("AMM price is not instantly rebalanced in realism mode",
+               abs(sim.amm_pools['cpmm'].mid_price() - cpmm_mid_before) < 1e-9,
+               f"before={cpmm_mid_before:.4f}, after={sim.amm_pools['cpmm'].mid_price():.4f}")
+    check_bool("Liquidity shock pauses market makers",
+               sim.env.mm_pause_ticks > 0,
+               f"mm_pause_ticks={sim.env.mm_pause_ticks}")
+
+    random.seed(42)
+    sim2 = Simulator.default_fx(
+        n_noise=8, n_mm=1,
+        n_fx_takers=0, n_fx_fund=0,
+        n_retail=0, n_institutional=0,
+        n_clob_fund=1, n_clob_chart=0,
+        n_clob_univ=0, clob_volume=200,
+        shock_mode='realism',
+        fundamental_shock_pct=0.0,
+        order_flow_shock_qty=80.0,
+        order_flow_shock_side='sell',
+        liquidity_shock_frac=0.20,
+        funding_vol_shock_intensity=0.0,
+    )
+    pre_mid = sim2.clob.mid_price()
+    sim2._apply_realism_shock()
+    post_mid = sim2.clob.mid_price()
+    check_bool("Order-flow shock sweeps the live CLOB",
+               post_mid < pre_mid,
+               f"pre_mid={pre_mid:.2f}, post_mid={post_mid:.2f}")
+
+
+def test_shock_event_window_helpers():
+    """Event-window helpers should expose local post-shock diagnostics."""
+    section("SHOCK EVENT WINDOWS — Unit Tests")
+
+    windows = main_module._shock_window_slices(500, 350)
+    check_bool("Shock windows contain four local segments",
+               len(windows) == 4,
+               f"windows={windows}")
+    check_bool("First post-shock window starts at t0",
+               windows[1] == ('t0..t0+5', 350, 355),
+               f"window={windows[1]}")
+
+    series = [10.0] * 50 + [25.0, 22.0, 18.0, 14.0, 12.0, 11.0, 10.5, 10.2, 10.1, 10.0]
+    baseline = 10.0
+    rt, target = main_module._rolling_normalization_time(
+        series,
+        shock_iter=50,
+        baseline=baseline,
+        direction='upper',
+        rel_tol=0.1,
+        abs_tol=0.5,
+        window=3,
+        horizon=20,
+    )
+    check_bool("Rolling normalization finds a finite recovery time",
+               math.isfinite(rt) and rt >= 0,
+               f"rt={rt}, target={target}")
+
+    trough, t_trough = main_module._series_trough(
+        [0.0] * 50 + [-10.0, -30.0, -25.0, -5.0],
+        shock_iter=50,
+        direction='lower',
+        horizon=10,
+    )
+    check_bool("Series trough captures max local impact",
+               trough == -30.0 and t_trough == 1.0,
+               f"trough={trough}, t_trough={t_trough}")
+
+
+def test_resilience_metrics_censoring():
+    """Relative-recovery metrics should distinguish recovered and censored trajectories."""
+    section("RESILIENCE METRICS — Unit Tests")
+
+    recovered_series = (
+        [100.0] * 50
+        + [80.0, 82.0, 90.0, 95.0, 96.0, 96.5, 96.2, 96.1]
+    )
+    recovered = price_resilience_metrics(
+        recovered_series,
+        shock_iter=50,
+        avg_window=4,
+        stable_window=3,
+        retracement_fraction=0.8,
+        horizon=8,
+    )
+    check_bool("80% retracement detects recovery on sustained normalization",
+               recovered['recovered'] and not recovered['is_censored'],
+               f"recovered={recovered['recovered']}, censored={recovered['is_censored']}")
+    check("Recovered trajectory reaches target in 5 steps",
+          recovered['recovery_steps'], 5.0)
+    check_bool("Normalized impact is finite for recovered path",
+               math.isfinite(recovered['normalized_avg_impact']),
+               f"normalized_avg_impact={recovered['normalized_avg_impact']}")
+
+    censored_series = [100.0] * 50 + [80.0] * 20
+    censored = price_resilience_metrics(
+        censored_series,
+        shock_iter=50,
+        avg_window=5,
+        stable_window=3,
+        retracement_fraction=0.8,
+        horizon=10,
+    )
+    check_bool("Flat distressed path stays right-censored",
+               (not censored['recovered']) and censored['is_censored'],
+               f"recovered={censored['recovered']}, censored={censored['is_censored']}")
+    check("Censored path reports observed horizon instead of fake recovery",
+          censored['time_observed_steps'], 10.0)
+
+    km = kaplan_meier_curve([4.0, 10.0, 6.0], [True, False, True])
+    check_bool("Kaplan-Meier returns a finite median when survival crosses 50%",
+               math.isfinite(km['median_time']) and km['median_time'] == 6.0,
+               f"median_time={km['median_time']}, survival={km['survival']}")
+
+    repricing_series = [100.0] * 50 + [90.0, 91.0, 93.0, 95.0, 96.0, 97.0, 97.0, 97.0]
+    fair_value_series = [100.0] * 50 + [97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0, 97.0]
+    repricing = price_resilience_metrics(
+        repricing_series,
+        shock_iter=50,
+        avg_window=4,
+        stable_window=3,
+        retracement_fraction=0.8,
+        horizon=8,
+        target_series=fair_value_series,
+        target_mode='fair_value_gap',
+    )
+    check_bool("Fair-value-gap mode recovers to the new equilibrium instead of the old price",
+               repricing['recovered'] and repricing['analysis_target_mode'] == 'fair_value_gap',
+               f"recovered={repricing['recovered']}, target_mode={repricing['analysis_target_mode']}")
+    check("Fair-value-gap recovery reaches target in 4 steps",
+          repricing['recovery_steps'], 4.0)
+
+
+def test_priority_resilience_metrics():
+    """Generic spread/depth/cost metrics and their composite should recover consistently."""
+    section("PRIORITY RESILIENCE METRICS — Unit Tests")
+
+    price_series = [100.0] * 50 + [80.0, 82.0, 90.0, 95.0, 96.0, 96.5, 96.2, 96.1]
+    spread_series = [2.0] * 50 + [8.0, 6.0, 4.0, 2.6, 2.4, 2.3, 2.2, 2.1]
+    depth_series = [100.0] * 50 + [60.0, 70.0, 82.0, 91.0, 95.0, 96.0, 97.0, 98.0]
+    cost_series = [5.0] * 50 + [15.0, 12.0, 8.0, 6.0, 5.6, 5.4, 5.3, 5.2]
+
+    price_metrics = price_resilience_metrics(
+        price_series,
+        shock_iter=50,
+        avg_window=4,
+        stable_window=3,
+        retracement_fraction=0.8,
+        horizon=8,
+    )
+    spread_metrics = series_resilience_metrics(
+        spread_series,
+        shock_iter=50,
+        avg_window=4,
+        stable_window=3,
+        retracement_fraction=0.8,
+        horizon=8,
+    )
+    depth_metrics = series_resilience_metrics(
+        depth_series,
+        shock_iter=50,
+        avg_window=4,
+        stable_window=3,
+        retracement_fraction=0.8,
+        horizon=8,
+    )
+    cost_metrics = series_resilience_metrics(
+        cost_series,
+        shock_iter=50,
+        avg_window=4,
+        stable_window=3,
+        retracement_fraction=0.8,
+        horizon=8,
+    )
+    composite = composite_resilience_metrics(
+        [price_metrics, spread_metrics, depth_metrics, cost_metrics],
+        analysis_target_mode='joint_price_spread_depth_cost',
+    )
+
+    check_bool("Spread resilience recovers after a sustained spread compression",
+               spread_metrics['recovered'],
+               f"recovery_steps={spread_metrics['recovery_steps']}")
+    check("Spread resilience reaches target in 3 steps",
+          spread_metrics['recovery_steps'], 3.0)
+    check_bool("Depth resilience recovers after depth rebuild",
+               depth_metrics['recovered'],
+               f"recovery_steps={depth_metrics['recovery_steps']}")
+    check("Execution-cost resilience reaches target in 3 steps",
+          cost_metrics['recovery_steps'], 3.0)
+    check_bool("Composite resilience requires all component recoveries",
+               composite['recovered'] and composite['analysis_target_mode'] == 'joint_price_spread_depth_cost',
+               f"recovered={composite['recovered']}, mode={composite['analysis_target_mode']}")
+    check("Composite recovery waits for the slowest component",
+          composite['recovery_steps'], 5.0)
+
+
+def test_resilience_statistical_metrics():
+    """Bootstrap CI and Welch/paired t-tests should expose stable effect estimates."""
+    section("RESILIENCE STATISTICS — Unit Tests")
+
+    sample = [1.0, 2.0, 3.0, 4.0]
+    boot_mean = bootstrap_mean_ci(sample, n_boot=1000, ci_level=0.95, seed=7)
+    check("Bootstrap mean matches arithmetic mean",
+       boot_mean['mean'], 2.5)
+    check_bool("Bootstrap CI contains the sample mean",
+         boot_mean['ci_lo'] <= boot_mean['mean'] <= boot_mean['ci_hi'],
+         f"ci=({boot_mean['ci_lo']:.3f}, {boot_mean['ci_hi']:.3f}), mean={boot_mean['mean']:.3f}")
+
+    sample_a = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+    sample_b = [2.0, 3.0, 2.0, 3.0, 2.0, 3.0]
+    ttest = welch_t_test(sample_a, sample_b)
+    boot_diff = bootstrap_diff_ci(sample_a, sample_b, n_boot=1000, ci_level=0.95, seed=11)
+
+    check_bool("Welch t-test detects lower mean in sample_a",
+         math.isfinite(ttest['p_value']) and ttest['p_value'] < 0.01 and ttest['mean_diff'] < 0,
+         f"p={ttest['p_value']}, diff={ttest['mean_diff']}")
+    check_bool("Bootstrap diff CI stays below zero when sample_a < sample_b",
+         boot_diff['ci_hi'] < 0.0,
+         f"ci=({boot_diff['ci_lo']:.3f}, {boot_diff['ci_hi']:.3f})")
+
+    paired_a = [10.0, 12.0, 11.0, 13.0, 14.0]
+    paired_b = [9.0, 10.0, 10.0, 11.0, 12.0]
+    paired_test = paired_t_test(paired_a, paired_b)
+    paired_boot = bootstrap_paired_diff_ci(paired_a, paired_b, n_boot=1000, ci_level=0.95, seed=13)
+
+    check_bool("Paired t-test detects positive within-seed delta",
+         math.isfinite(paired_test['p_value']) and paired_test['p_value'] < 0.05 and paired_test['mean_diff'] > 0.0,
+         f"p={paired_test['p_value']}, diff={paired_test['mean_diff']}")
+    check_bool("Paired bootstrap CI stays above zero for positive deltas",
+         paired_boot['ci_lo'] > 0.0,
+         f"ci=({paired_boot['ci_lo']:.3f}, {paired_boot['ci_hi']:.3f})")
+
+
+def test_arbitrage_trade_cap():
+    """Arbitrageur should respect per-step reserve trade caps."""
+    section("ARBITRAGE TRADE CAP — Unit Tests")
+
+    class MockCLOB:
+        def mid_price(self):
+            return 100.0
+        def quoted_spread_bps(self):
+            return 10.0
+
+    pool = CPMMPool(x=1000.0, y=100000.0, fee=0.003)
+    arb = AMMArbitrageur(
+        MockCLOB(),
+        {'cpmm': pool},
+        max_correction_pct=50.0,
+        trade_fraction_cap=0.02,
+    )
+    before_x = pool.x
+    arb._arb_one_pool(pool, 120.0)
+    traded_x = pool.x - before_x
+
+    check_bool("Arbitrage trade is capped by configured reserve fraction",
+               traded_x <= before_x * 0.02 + 1e-6,
+               f"before_x={before_x:.2f}, after_x={pool.x:.2f}, traded_x={traded_x:.2f}")
 
 
 # =====================================================================
@@ -1264,7 +2032,24 @@ if __name__ == '__main__':
     test_cpmm()
     test_hfmm()
     test_routing()
-
+    test_mm_amm_interaction()
+    test_fee_accounting()
+    test_fundamentalist_anchor()
+    test_environment_price_process()
+    test_latent_anchor_reference()
+    test_systemic_liquidity_factor()
+    test_shock_stress_cli_semantics()
+    test_flash_crash_preset()
+    test_mm_withdrawal_preset()
+    test_funding_liquidity_shock_preset()
+    test_initial_depth_matching()
+    test_amm_core_liquidity_floor()
+    test_realism_shock_mode()
+    test_shock_event_window_helpers()
+    test_resilience_metrics_censoring()
+    test_priority_resilience_metrics()
+    test_resilience_statistical_metrics()
+    test_arbitrage_trade_cap()
     print(f"\n{'=' * W}")
     print(f"  SUMMARY: {total_pass} passed, {total_fail} failed")
     print(f"{'=' * W}")

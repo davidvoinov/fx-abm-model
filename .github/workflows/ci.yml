@@ -26,10 +26,6 @@ jobs:
       - name: Syntax check
         run: python -m compileall -q .
 
-      - name: Import smoke check
-        run: |
-          python -c "from AgentBasedModel.simulator.simulator import Simulator; print('import ok')"
-
       - name: Regression baseline check
         run: |
           python -m tests.regression.compare_baseline

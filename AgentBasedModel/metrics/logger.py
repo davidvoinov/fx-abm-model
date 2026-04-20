@@ -49,6 +49,8 @@ class MetricsLogger:
         self.sigma_series: List[float] = []
         self.c_series: List[float] = []
         self.regime_series: List[str] = []
+        self.systemic_liquidity_series: List[float] = []
+        self.flow_imbalance_series: List[float] = []
 
         # Prices
         self.clob_mid_series: List[float] = []
@@ -131,6 +133,8 @@ class MetricsLogger:
         self.sigma_series.append(env.sigma)
         self.c_series.append(env.funding_cost)
         self.regime_series.append('stress' if env.is_stress() else 'normal')
+        self.systemic_liquidity_series.append(getattr(env, 'systemic_liquidity', 1.0))
+        self.flow_imbalance_series.append(getattr(env, 'order_flow_imbalance', 0.0))
 
         # CLOB basics
         try:
@@ -139,7 +143,7 @@ class MetricsLogger:
             clob_mid = self.clob_mid_series[-1] if self.clob_mid_series else 100.0
         self.clob_mid_series.append(clob_mid)
         self.clob_qspr.append(clob.quoted_spread_bps())
-        self.clob_depth.append(clob.total_depth())
+        self.clob_depth.append(clob.total_depth(bps_from_mid=25))
 
         # Exogenous fair price (GBM) — authoritative when available
         fp = getattr(env, 'fair_price', None)
@@ -227,6 +231,36 @@ class MetricsLogger:
             return self.clob_cost_curves.get(Q, [])
         return self.amm_cost_curves.get(venue, {}).get(Q, [])
 
+    def venue_basis_series(self, venue: str) -> List[float]:
+        """AMM-vs-CLOB mid-price basis in bps."""
+        if venue == 'clob' or venue not in self.amm_mid_series:
+            return [0.0 for _ in self.clob_mid_series]
+
+        basis = []
+        for clob_mid, amm_mid in zip(self.clob_mid_series, self.amm_mid_series[venue]):
+            if not (math.isfinite(clob_mid) and math.isfinite(amm_mid) and clob_mid > 0):
+                basis.append(float('nan'))
+                continue
+            basis.append(10_000.0 * (amm_mid - clob_mid) / clob_mid)
+        return basis
+
+    def max_venue_basis_series(self) -> List[float]:
+        """Max absolute AMM-vs-CLOB basis across all AMM venues."""
+        if not self.amm_mid_series:
+            return [0.0 for _ in self.clob_mid_series]
+
+        out = []
+        for idx, clob_mid in enumerate(self.clob_mid_series):
+            vals = []
+            for venue in self.amm_mid_series:
+                if idx >= len(self.amm_mid_series[venue]):
+                    continue
+                amm_mid = self.amm_mid_series[venue][idx]
+                if math.isfinite(clob_mid) and math.isfinite(amm_mid) and clob_mid > 0:
+                    vals.append(abs(10_000.0 * (amm_mid - clob_mid) / clob_mid))
+            out.append(max(vals) if vals else float('nan'))
+        return out
+
     def flow_share(self, venue: str) -> List[float]:
         """Fraction of total volume routed to *venue* each period."""
         if venue not in self.flow_volume:
@@ -241,20 +275,12 @@ class MetricsLogger:
                 total.append(0.0)
         return total
 
-    def cost_correlation(self, v1: str, v2: str, Q: float) -> float:
-        """Pearson correlation of cost series between two venues at size Q."""
-        s1 = self.cost_series(v1, Q)
-        s2 = self.cost_series(v2, Q)
-        n = min(len(s1), len(s2))
-        if n < 3:
-            return 0.0
-
-        s1, s2 = s1[:n], s2[:n]
-        # Filter infs
-        pairs = [(a, b) for a, b in zip(s1, s2)
-                 if math.isfinite(a) and math.isfinite(b)]
+    @staticmethod
+    def _finite_correlation(series_1: List[float], series_2: List[float]) -> float:
+        pairs = [(x, y) for x, y in zip(series_1, series_2)
+                 if math.isfinite(x) and math.isfinite(y)]
         if len(pairs) < 3:
-            return 0.0
+            return float('nan')
 
         xs, ys = zip(*pairs)
         n = len(xs)
@@ -264,8 +290,35 @@ class MetricsLogger:
         sx = (sum((x - mx) ** 2 for x in xs) / n) ** 0.5
         sy = (sum((y - my) ** 2 for y in ys) / n) ** 0.5
         if sx == 0 or sy == 0:
-            return 0.0
+            return float('nan')
         return cov / (sx * sy)
+
+    def series_correlation(self, series_1: List[float], series_2: List[float]) -> float:
+        """Pearson correlation between two generic finite series."""
+        n = min(len(series_1), len(series_2))
+        if n < 3:
+            return 0.0
+        corr = self._finite_correlation(series_1[:n], series_2[:n])
+        return corr if math.isfinite(corr) else 0.0
+
+    def series_commonality_before_after(self, series_1: List[float], series_2: List[float],
+                                        split_at: int) -> dict:
+        """Correlation of two generic series before vs after *split_at*."""
+        n = min(len(series_1), len(series_2))
+        if n < 3:
+            return {'before': float('nan'), 'after': float('nan')}
+
+        idx = max(0, min(int(split_at), n))
+        return {
+            'before': self._finite_correlation(series_1[:idx], series_2[:idx]),
+            'after': self._finite_correlation(series_1[idx:], series_2[idx:]),
+        }
+
+    def cost_correlation(self, v1: str, v2: str, Q: float) -> float:
+        """Pearson correlation of cost series between two venues at size Q."""
+        s1 = self.cost_series(v1, Q)
+        s2 = self.cost_series(v2, Q)
+        return self.series_correlation(s1, s2)
 
     def commonality_before_after(self, v1: str, v2: str, Q: float,
                                  stress_start: int) -> dict:
@@ -274,29 +327,7 @@ class MetricsLogger:
         """
         s1 = self.cost_series(v1, Q)
         s2 = self.cost_series(v2, Q)
-        n = min(len(s1), len(s2))
-        idx = min(stress_start, n)
-
-        def _corr(a, b):
-            pairs = [(x, y) for x, y in zip(a, b)
-                     if math.isfinite(x) and math.isfinite(y)]
-            if len(pairs) < 3:
-                return float('nan')
-            xs, ys = zip(*pairs)
-            n_ = len(xs)
-            mx = sum(xs) / n_
-            my = sum(ys) / n_
-            cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / n_
-            sx = (sum((x - mx) ** 2 for x in xs) / n_) ** 0.5
-            sy = (sum((y - my) ** 2 for y in ys) / n_) ** 0.5
-            if sx == 0 or sy == 0:
-                return float('nan')
-            return cov / (sx * sy)
-
-        return {
-            'before': _corr(s1[:idx], s2[:idx]),
-            'after': _corr(s1[idx:], s2[idx:])
-        }
+        return self.series_commonality_before_after(s1, s2, stress_start)
 
     def summary(self) -> dict:
         """Return a concise summary dict for printing."""
