@@ -27,20 +27,18 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python main.py
 python main.py --amm-share 30
-python generate_resilience_study_fixed.py --seeds 40
-python generate_resilience_study_aware.py --seeds 40
 
 # Multi-seed resilience scatter study
-python resilience_test.py --seeds 40
+python tests/resilience_test.py --seeds 40
 
 # Censor-aware resilience study with 80% retracement recovery
-python resilience_test.py
+python tests/resilience_test.py
 
 # Override sample size / observation window if needed
-python resilience_test.py --seeds 300 --min-post-shock-window 600
+python tests/resilience_test.py --seeds 300 --min-post-shock-window 600
 
-# Paired fixed_share vs liquidity_aware comparison on identical seeds
-python generate_routing_comparison.py --seeds 30
+# Save resilience artifacts into a custom folder
+python tests/resilience_test.py --out-dir output/resilience_custom
 ```
 
 The resilience study now writes these artifacts into `output/resilience/`:
@@ -57,8 +55,9 @@ The resilience study now writes these artifacts into `output/resilience/`:
 
 Dedicated resilience entrypoints:
 
-- `generate_resilience_study_fixed.py` writes the same resilience artifacts into `output/resilience_fixed/`
-- `generate_resilience_study_aware.py` writes the same resilience artifacts into `output/resilience_aware/`
+- `tests/resilience_test.py` writes to `output/resilience/` by default.
+- Override with `--out-dir` to change only the destination folder.
+- By default, `tests/resilience_test.py` uses `fixed_share` top-level venue routing.
 
 Routing note:
 
@@ -68,9 +67,3 @@ Routing note:
 - Dashboards and plots remain separated by effective routing mode.
 - `main.py` writes into `output/main_aware/` when the effective venue rule is `liquidity_aware`.
 - `main.py` writes into `output/main_fixed/` when the effective venue rule is `fixed_share`.
-
-The paired routing comparison study writes three CSV artifacts into `output/routing_comparison/`:
-
-- `routing_comparison_seed_metrics.csv` — seed-level metrics for each scenario and routing mode
-- `routing_comparison_paired_deltas.csv` — same-seed deltas `liquidity_aware - fixed_share`
-- `routing_comparison_summary.csv` — paired mean deltas, paired t-tests, and paired bootstrap confidence intervals

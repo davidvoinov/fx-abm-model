@@ -7,11 +7,17 @@ import argparse
 import csv
 import math
 import os
+import sys
+from pathlib import Path
 
 import matplotlib
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from main import _apply_preset_defaults, _auto_stress_around_shock, _seed_all, build_parser, build_sim
 from AgentBasedModel.metrics.resilience import (
