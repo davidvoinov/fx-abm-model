@@ -31,13 +31,13 @@ python generate_resilience_study_fixed.py --seeds 40
 python generate_resilience_study_aware.py --seeds 40
 
 # Multi-seed resilience scatter study
-python generate_resilience_study.py --seeds 40
+python resilience_test.py --seeds 40
 
 # Censor-aware resilience study with 80% retracement recovery
-python generate_resilience_study.py
+python resilience_test.py
 
 # Override sample size / observation window if needed
-python generate_resilience_study.py --seeds 300 --min-post-shock-window 600
+python resilience_test.py --seeds 300 --min-post-shock-window 600
 
 # Paired fixed_share vs liquidity_aware comparison on identical seeds
 python generate_routing_comparison.py --seeds 30

@@ -1,2 +1,4 @@
 output/
 .obsidian-vault/
+.DS_Store
+.pytest_cache/

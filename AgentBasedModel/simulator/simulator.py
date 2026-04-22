@@ -70,6 +70,42 @@ class Simulator:
     def multi_venue(self) -> bool:
         return self.clob is not None and (bool(self.amm_pools) or bool(self.fx_traders))
 
+    def _market_makers(self) -> List[MarketMaker]:
+        if not self.traders:
+            return []
+        return [tr for tr in self.traders if isinstance(tr, MarketMaker)]
+
+    def _market_maker_state_summary(self) -> Dict[str, Any]:
+        market_makers = self._market_makers()
+        states = ('active', 'defensive', 'withdrawn', 'reentering')
+        counts = {state: 0 for state in states}
+        if not market_makers:
+            return {
+                'n_market_makers': 0,
+                'counts': counts,
+                'shares': {state: 0.0 for state in states},
+                'avg_withdrawal_score': float('nan'),
+                'avg_loss_bps_ewma': float('nan'),
+                'avg_inventory_ratio': float('nan'),
+            }
+
+        for mm in market_makers:
+            counts[getattr(mm, 'mm_state', 'active')] = counts.get(getattr(mm, 'mm_state', 'active'), 0) + 1
+
+        n_market_makers = len(market_makers)
+        return {
+            'n_market_makers': n_market_makers,
+            'counts': counts,
+            'shares': {state: counts.get(state, 0) / n_market_makers for state in states},
+            'avg_withdrawal_score': sum(getattr(mm, 'mm_withdrawal_score', 0.0) for mm in market_makers) / n_market_makers,
+            'avg_loss_bps_ewma': sum(getattr(mm, '_loss_bps_ewma', 0.0) for mm in market_makers) / n_market_makers,
+            'avg_inventory_ratio': (
+                sum(max(abs(getattr(mm, 'inventory', 0.0)), abs(float(getattr(mm, 'assets', 0.0)))) /
+                    max(float(getattr(mm, 'softlimit', 1.0)), 1.0) for mm in market_makers)
+                / n_market_makers
+            ),
+        }
+
     def _estimate_recovery_support(self) -> float:
         fast_agents = [tr for tr in self.book_agents if isinstance(tr, FastRecyclerLP)]
         latent_agents = [tr for tr in self.book_agents if isinstance(tr, LatentLP)]
@@ -78,7 +114,10 @@ class Simulator:
         latent_total = len(latent_agents)
         fast_active = sum(1 for tr in fast_agents if getattr(tr, 'last_quoted', False))
         latent_active = sum(1 for tr in latent_agents if getattr(tr, 'last_quoted', False))
-        mm_active = 1.0 if self.mm is not None and getattr(self.mm, 'orders', None) else 0.0
+        market_makers = self._market_makers()
+        mm_active = 0.0
+        if market_makers:
+            mm_active = sum(1 for mm in market_makers if getattr(mm, 'mm_state', 'active') != 'withdrawn') / len(market_makers)
 
         static_support = 0.85 + 0.02 * fast_total + 0.03 * latent_total
         dynamic_support = 0.0
@@ -86,7 +125,7 @@ class Simulator:
             dynamic_support += 0.14 * (fast_active / fast_total)
         if latent_total > 0:
             dynamic_support += 0.18 * (latent_active / latent_total)
-        dynamic_support += 0.05 * mm_active
+        dynamic_support += 0.08 * mm_active
 
         return max(0.75, min(1.65, static_support + dynamic_support))
 
@@ -347,22 +386,20 @@ class Simulator:
                     pass
 
             # 2. CLOB market maker quotes (paused during shock aftermath)
+            mm_paused = (self.env is not None and self.env.mm_pause_ticks > 0)
             if self.mm is not None:
-                mm_paused = (self.env is not None and self.env.mm_pause_ticks > 0)
                 if mm_paused:
                     # MM withdraws — cancel all quotes but don't requote
-                    for order in self.mm.orders.copy():
-                        try:
-                            self.mm._cancel_order(order)
-                        except Exception:
-                            pass
-                    self.mm.orders.clear()
+                    self.mm.cancel_all_quotes()
                 else:
                     self.mm.call()
 
             # 3. CLOB book agents (diverse limit-order providers)
             random.shuffle(self.book_agents)
             for tr in self.book_agents:
+                if mm_paused and isinstance(tr, MarketMaker):
+                    tr.cancel_all_quotes()
+                    continue
                 try:
                     tr.call()
                 except Exception:
@@ -406,7 +443,8 @@ class Simulator:
             # 10. Metrics snapshot
             if self.logger is not None:
                 self.logger.snapshot(t, self.clob, self.amm_pools,
-                                    self.env, period_trades)
+                                    self.env, period_trades,
+                                    mm_state_summary=self._market_maker_state_summary())
 
         return self
 
@@ -457,6 +495,11 @@ class Simulator:
                    clob_amm_interaction: str = 'competition',
                    clob_amm_spread_impact_bps: float = 3.0,
                    clob_amm_depth_impact: float = 60.0,
+                   mm_withdraw_threshold: float = 1.8,
+                   mm_reentry_threshold: float = 1.05,
+                   mm_loss_threshold_bps: float = 20.0,
+                   mm_min_withdraw_ticks: int = 4,
+                   mm_reentry_ticks: int = 3,
                    amm_liq: float = 1.0,
                    match_initial_depth: bool = False,
                    shock_iter: Optional[int] = None,
@@ -643,7 +686,12 @@ class Simulator:
                               n_levels=5,
                               venue_interaction_mode=clob_amm_interaction,
                               amm_spread_impact_bps=clob_amm_spread_impact_bps,
-                              amm_depth_impact=clob_amm_depth_impact)
+                              amm_depth_impact=clob_amm_depth_impact,
+                              withdrawal_threshold=mm_withdraw_threshold,
+                              reentry_threshold=mm_reentry_threshold,
+                              loss_threshold_bps=mm_loss_threshold_bps,
+                              min_withdraw_ticks=mm_min_withdraw_ticks,
+                              reentry_ticks=mm_reentry_ticks)
             if mm is None:
                 mm = _mm           # first MM → self.mm (step 2)
             else:

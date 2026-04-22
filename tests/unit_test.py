@@ -82,8 +82,8 @@ from AgentBasedModel.metrics.statistics import (
     bootstrap_diff_ci,
     bootstrap_mean_ci,
     bootstrap_paired_diff_ci,
-    paired_t_test,
-    welch_t_test,
+    independent_permutation_test,
+    paired_permutation_test,
 )
 import main as main_module
 from collections import Counter
@@ -740,10 +740,14 @@ def test_mm_amm_interaction():
     section("MARKET MAKER / AMM INTERACTION — Unit Tests")
 
     class MockEnv:
-        def __init__(self, sigma=0.01, c=0.002, sigma_low=0.01):
+        def __init__(self, sigma=0.01, c=0.002, sigma_low=0.01, c_low=0.002):
             self.sigma = sigma
             self.funding_cost = c
             self.sigma_low = sigma_low
+            self.c_low = c_low
+            self.fair_price = 100.0
+            self.systemic_liquidity = 1.0
+            self.order_flow_imbalance = 0.0
 
     ex = _make_exchange(BIDS, ASKS)
     env = MockEnv()
@@ -788,6 +792,84 @@ def test_mm_amm_interaction():
     check_bool("AMM support fades in stress",
                support_stress < support_calm,
                f"calm={support_calm:.3f}, stress={support_stress:.3f}")
+
+
+def test_endogenous_mm_withdrawal():
+    """MarketMaker can retreat and re-enter based on endogenous stress signals."""
+    section("ENDOGENOUS MM WITHDRAWAL — Unit Tests")
+
+    class MockEnv:
+        def __init__(self, sigma=0.01, c=0.002, sigma_low=0.01, c_low=0.002):
+            self.sigma = sigma
+            self.funding_cost = c
+            self.sigma_low = sigma_low
+            self.c_low = c_low
+            self.fair_price = 100.0
+            self.systemic_liquidity = 1.0
+            self.order_flow_imbalance = 0.0
+
+    env = MockEnv()
+    ex = _make_exchange(BIDS, ASKS)
+    mm = MarketMaker(
+        ex,
+        cash=1e4,
+        env=env,
+        venue_interaction_mode='none',
+        withdrawal_threshold=1.0,
+        reentry_threshold=0.35,
+        loss_threshold_bps=10.0,
+        min_withdraw_ticks=2,
+        reentry_ticks=2,
+    )
+
+    mm._update_endogenous_state(100.0)
+    check_bool("Calm MM starts active",
+               mm.mm_state == 'active',
+               f"state={mm.mm_state}, score={mm.mm_withdrawal_score:.3f}")
+
+    env.sigma = 0.05
+    env.funding_cost = 0.02
+    env.systemic_liquidity = 0.45
+    env.order_flow_imbalance = 0.9
+    mm.inventory = 90.0
+    mm._ofi_window = [0.9] * 5
+    mm._loss_bps_ewma = 30.0
+    mm._update_endogenous_state(100.0)
+    check_bool("Large loss and stress trigger withdrawal",
+               mm.mm_state == 'withdrawn',
+               f"state={mm.mm_state}, score={mm.mm_withdrawal_score:.3f}")
+
+    mm.call()
+    check_bool("Withdrawn MM keeps no resting quotes",
+               len(mm.orders) == 0,
+               f"orders={len(mm.orders)}")
+
+    env.sigma = 0.01
+    env.funding_cost = 0.002
+    env.systemic_liquidity = 1.0
+    env.order_flow_imbalance = 0.0
+    mm.inventory = 0.0
+    mm._ofi_window = [0.0]
+    mm._loss_bps_ewma = 0.0
+
+    mm._update_endogenous_state(100.0)
+    mm._update_endogenous_state(100.0)
+    check_bool("Recovered conditions move MM into reentering",
+               mm.mm_state == 'reentering',
+               f"state={mm.mm_state}, timer={mm.mm_state_timer}")
+
+    mm._update_endogenous_state(100.0)
+    mm._update_endogenous_state(100.0)
+    check_bool("Reentry completes back to active",
+               mm.mm_state == 'active',
+               f"state={mm.mm_state}, timer={mm.mm_state_timer}")
+
+    mm.mm_state = 'defensive'
+    mm.mm_withdrawal_score = 0.9
+    defensive_adj = mm._state_quote_adjustments()
+    check_bool("Defensive MM widens spreads and thins depth",
+               defensive_adj['spread_mult'] > 1.0 and defensive_adj['depth_mult'] < 1.0,
+               f"spread_mult={defensive_adj['spread_mult']:.3f}, depth_mult={defensive_adj['depth_mult']:.3f}")
 
 
 # =====================================================================
@@ -1081,9 +1163,11 @@ def test_mm_withdrawal_preset():
     check_bool("MM withdrawal fades liquidity stress faster than dealer-liquidity crisis",
                args.liquidity_shock_decay < main_module.REALISM_PRESETS['dealer_liquidity_crisis']['liquidity_shock_decay'],
                f"mm={args.liquidity_shock_decay}, dealer={main_module.REALISM_PRESETS['dealer_liquidity_crisis']['liquidity_shock_decay']}")
-    check_bool("MM withdrawal raises latent liquidity support above the parser default",
-               args.n_latent_lp > parser.get_default('n_latent_lp') and args.n_fast_lp > parser.get_default('n_fast_lp'),
-               f"n_fast_lp={args.n_fast_lp}, n_latent_lp={args.n_latent_lp}")
+    check_bool("MM withdrawal keeps the default CLOB build for apples-to-apples stats",
+               args.n_fast_lp == parser.get_default('n_fast_lp')
+               and args.n_latent_lp == parser.get_default('n_latent_lp')
+               and args.clob_near_mid_target_ratio == parser.get_default('clob_near_mid_target_ratio'),
+               f"n_fast_lp={args.n_fast_lp}, n_latent_lp={args.n_latent_lp}, near_mid={args.clob_near_mid_target_ratio}")
     check_bool("MM withdrawal accelerates near-mid background replenishment",
                args.bg_target_ratio_recovery > main_module.REALISM_PRESETS['funding_liquidity_shock']['bg_target_ratio_recovery'],
                f"mm={args.bg_target_ratio_recovery}, funding={main_module.REALISM_PRESETS['funding_liquidity_shock']['bg_target_ratio_recovery']}")
@@ -1388,7 +1472,7 @@ def test_priority_resilience_metrics():
 
 
 def test_resilience_statistical_metrics():
-    """Bootstrap CI and Welch/paired t-tests should expose stable effect estimates."""
+    """Bootstrap CI and permutation tests should expose stable effect estimates."""
     section("RESILIENCE STATISTICS — Unit Tests")
 
     sample = [1.0, 2.0, 3.0, 4.0]
@@ -1401,22 +1485,22 @@ def test_resilience_statistical_metrics():
 
     sample_a = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
     sample_b = [2.0, 3.0, 2.0, 3.0, 2.0, 3.0]
-    ttest = welch_t_test(sample_a, sample_b)
+    permutation = independent_permutation_test(sample_a, sample_b, n_perm=2000, seed=11)
     boot_diff = bootstrap_diff_ci(sample_a, sample_b, n_boot=1000, ci_level=0.95, seed=11)
 
-    check_bool("Welch t-test detects lower mean in sample_a",
-         math.isfinite(ttest['p_value']) and ttest['p_value'] < 0.01 and ttest['mean_diff'] < 0,
-         f"p={ttest['p_value']}, diff={ttest['mean_diff']}")
+    check_bool("Independent permutation test detects lower mean in sample_a",
+         math.isfinite(permutation['p_value']) and permutation['p_value'] < 0.05 and permutation['mean_diff'] < 0,
+         f"p={permutation['p_value']}, diff={permutation['mean_diff']}")
     check_bool("Bootstrap diff CI stays below zero when sample_a < sample_b",
          boot_diff['ci_hi'] < 0.0,
          f"ci=({boot_diff['ci_lo']:.3f}, {boot_diff['ci_hi']:.3f})")
 
-    paired_a = [10.0, 12.0, 11.0, 13.0, 14.0]
-    paired_b = [9.0, 10.0, 10.0, 11.0, 12.0]
-    paired_test = paired_t_test(paired_a, paired_b)
+    paired_a = [10.0, 12.0, 11.0, 13.0, 14.0, 15.0]
+    paired_b = [9.0, 10.0, 10.0, 11.0, 12.0, 13.0]
+    paired_test = paired_permutation_test(paired_a, paired_b, n_perm=2000, seed=13)
     paired_boot = bootstrap_paired_diff_ci(paired_a, paired_b, n_boot=1000, ci_level=0.95, seed=13)
 
-    check_bool("Paired t-test detects positive within-seed delta",
+    check_bool("Paired permutation test detects positive within-seed delta",
          math.isfinite(paired_test['p_value']) and paired_test['p_value'] < 0.05 and paired_test['mean_diff'] > 0.0,
          f"p={paired_test['p_value']}, diff={paired_test['mean_diff']}")
     check_bool("Paired bootstrap CI stays above zero for positive deltas",
@@ -2033,6 +2117,7 @@ if __name__ == '__main__':
     test_hfmm()
     test_routing()
     test_mm_amm_interaction()
+    test_endogenous_mm_withdrawal()
     test_fee_accounting()
     test_fundamentalist_anchor()
     test_environment_price_process()

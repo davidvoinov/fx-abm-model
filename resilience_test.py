@@ -20,8 +20,8 @@ from AgentBasedModel.metrics.statistics import (
     bootstrap_diff_ci,
     bootstrap_mean_ci,
     bootstrap_paired_diff_ci,
-    paired_t_test,
-    welch_t_test,
+    independent_permutation_test,
+    paired_permutation_test,
 )
 from AgentBasedModel.visualization.resilience_plots import (
     plot_kaplan_meier_panels,
@@ -528,7 +528,8 @@ def _save_statistical_summary_csv(panel_specs, out_dir: str,
 def _save_pairwise_tests_csv(panel_specs, out_dir: str,
                              bootstrap_reps: int,
                              ci_level: float,
-                             base_seed: int) -> str:
+                             base_seed: int,
+                             permutation_reps: int) -> str:
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, 'resilience_pairwise_tests.csv')
     with open(path, 'w', newline='') as handle:
@@ -537,7 +538,7 @@ def _save_pairwise_tests_csv(panel_specs, out_dir: str,
             fieldnames=[
                 'series_key', 'series_label', 'amm_enabled', 'metric_name', 'metric_label', 'endpoint_name', 'endpoint_label', 'sample_filter',
                 'panel_a', 'panel_b', 'n_a', 'n_b', 'mean_a', 'mean_b', 'mean_diff_a_minus_b',
-                't_stat', 'p_value', 'ci_level', 'diff_ci_lo', 'diff_ci_hi',
+                'permutation_stat', 'permutation_p_value', 'ci_level', 'diff_ci_lo', 'diff_ci_hi',
             ],
         )
         writer.writeheader()
@@ -554,7 +555,12 @@ def _save_pairwise_tests_csv(panel_specs, out_dir: str,
                         values = _extract_endpoint_values(panel['points'], field, sample_filter=sample_filter, binary=binary)
                         panel_series.append((panel['panel_label'], values))
                     for (panel_a, sample_a), (panel_b, sample_b) in itertools.combinations(panel_series, 2):
-                        ttest = welch_t_test(sample_a, sample_b)
+                        permutation = independent_permutation_test(
+                            sample_a,
+                            sample_b,
+                            n_perm=permutation_reps,
+                            seed=_stat_seed(base_seed, 'independent_perm', group['metric_name'], series_key, endpoint_name, panel_a, panel_b),
+                        )
                         boot = bootstrap_diff_ci(
                             sample_a,
                             sample_b,
@@ -573,13 +579,13 @@ def _save_pairwise_tests_csv(panel_specs, out_dir: str,
                             'sample_filter': sample_filter,
                             'panel_a': panel_a,
                             'panel_b': panel_b,
-                            'n_a': ttest['n_a'],
-                            'n_b': ttest['n_b'],
-                            'mean_a': ttest['mean_a'],
-                            'mean_b': ttest['mean_b'],
-                            'mean_diff_a_minus_b': ttest['mean_diff'],
-                            't_stat': ttest['t_stat'],
-                            'p_value': ttest['p_value'],
+                            'n_a': permutation['n_a'],
+                            'n_b': permutation['n_b'],
+                            'mean_a': permutation['mean_a'],
+                            'mean_b': permutation['mean_b'],
+                            'mean_diff_a_minus_b': permutation['mean_diff'],
+                            'permutation_stat': permutation['stat'],
+                            'permutation_p_value': permutation['p_value'],
                             'ci_level': ci_level,
                             'diff_ci_lo': boot['ci_lo'],
                             'diff_ci_hi': boot['ci_hi'],
@@ -619,7 +625,8 @@ def _extract_paired_series_values(points_with: list, points_without: list,
 def _save_with_without_amm_comparison_csv(panel_specs, out_dir: str,
                                           bootstrap_reps: int,
                                           ci_level: float,
-                                          base_seed: int) -> str:
+                                          base_seed: int,
+                                          permutation_reps: int) -> str:
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, 'resilience_comparison_summary.csv')
     with open(path, 'w', newline='') as handle:
@@ -630,7 +637,7 @@ def _save_with_without_amm_comparison_csv(panel_specs, out_dir: str,
                 'endpoint_name', 'endpoint_label', 'sample_filter', 'n_pairs',
                 'mean_with_amm', 'mean_without_amm', 'mean_delta_with_minus_without',
                 'median_delta_with_minus_without', 'share_positive_delta',
-                'paired_t_stat', 'paired_p_value', 'ci_level', 'delta_ci_lo', 'delta_ci_hi',
+                'permutation_stat', 'permutation_p_value', 'ci_level', 'delta_ci_lo', 'delta_ci_hi',
             ],
         )
         writer.writeheader()
@@ -651,7 +658,12 @@ def _save_with_without_amm_comparison_csv(panel_specs, out_dir: str,
                         sample_filter=sample_filter,
                         binary=binary,
                     )
-                    paired = paired_t_test(sample_with, sample_without)
+                    paired = paired_permutation_test(
+                        sample_with,
+                        sample_without,
+                        n_perm=permutation_reps,
+                        seed=_stat_seed(base_seed, 'paired_perm', panel_label, group['metric_name'], endpoint_name),
+                    )
                     boot = bootstrap_paired_diff_ci(
                         sample_with,
                         sample_without,
@@ -678,8 +690,8 @@ def _save_with_without_amm_comparison_csv(panel_specs, out_dir: str,
                         'mean_delta_with_minus_without': paired['mean_diff'],
                         'median_delta_with_minus_without': _median_finite(deltas),
                         'share_positive_delta': _mean_finite(1.0 if value > 0 else 0.0 for value in deltas),
-                        'paired_t_stat': paired['t_stat'],
-                        'paired_p_value': paired['p_value'],
+                        'permutation_stat': paired['stat'],
+                        'permutation_p_value': paired['p_value'],
                         'ci_level': ci_level,
                         'delta_ci_lo': boot['ci_lo'],
                         'delta_ci_hi': boot['ci_hi'],
@@ -696,6 +708,8 @@ def _run_study(forced_venue_choice_rule: str | None = None,
                         help='Number of sequential seeds per panel (default: 300)')
     parser.add_argument('--base-seed', type=int, default=42,
                         help='Starting seed (default: 42)')
+    parser.add_argument('--permutation-reps', type=int, default=10000,
+                        help='Permutation repetitions for p-values (default: 10000)')
     parser.add_argument('--n-iter', type=int, default=900,
                         help='Simulation length for each run (default: 900)')
     parser.add_argument('--avg-window', type=int, default=20,
@@ -785,6 +799,7 @@ def _run_study(forced_venue_choice_rule: str | None = None,
         bootstrap_reps=args.bootstrap_reps,
         ci_level=args.ci_level,
         base_seed=args.base_seed,
+        permutation_reps=args.permutation_reps,
     )
     comparison_path = _save_with_without_amm_comparison_csv(
         panel_specs,
@@ -792,6 +807,7 @@ def _run_study(forced_venue_choice_rule: str | None = None,
         bootstrap_reps=args.bootstrap_reps,
         ci_level=args.ci_level,
         base_seed=args.base_seed,
+        permutation_reps=args.permutation_reps,
     )
 
     print(f'Saved resilience scatter panels to {png_path}')

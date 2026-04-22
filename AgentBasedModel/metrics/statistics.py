@@ -4,7 +4,6 @@ import math
 from typing import Iterable, Sequence
 
 import numpy as np
-from scipy.stats import ttest_1samp, ttest_ind
 
 
 def finite_sample(values: Iterable[float]) -> list[float]:
@@ -61,7 +60,9 @@ def bootstrap_mean_ci(values: Sequence[float], n_boot: int = 2000,
     }
 
 
-def welch_t_test(sample_a: Sequence[float], sample_b: Sequence[float]) -> dict:
+def independent_permutation_test(sample_a: Sequence[float], sample_b: Sequence[float],
+                                 n_perm: int = 10000,
+                                 seed: int | None = None) -> dict:
     clean_a = finite_sample(sample_a)
     clean_b = finite_sample(sample_b)
     mean_a = float(np.mean(clean_a)) if clean_a else float('nan')
@@ -75,19 +76,45 @@ def welch_t_test(sample_a: Sequence[float], sample_b: Sequence[float]) -> dict:
             'mean_a': mean_a,
             'mean_b': mean_b,
             'mean_diff': mean_diff,
-            't_stat': float('nan'),
+            'stat': float('nan'),
             'p_value': float('nan'),
         }
 
-    result = ttest_ind(clean_a, clean_b, equal_var=False, nan_policy='omit')
+    clean_a_arr = np.asarray(clean_a, dtype=float)
+    clean_b_arr = np.asarray(clean_b, dtype=float)
+    n_a = len(clean_a)
+    n_b = len(clean_b)
+    observed_abs = abs(mean_diff)
+
+    if n_a == 1 and n_b == 1:
+        return {
+            'n_a': n_a,
+            'n_b': n_b,
+            'mean_a': mean_a,
+            'mean_b': mean_b,
+            'mean_diff': mean_diff,
+            'stat': mean_diff,
+            'p_value': 1.0,
+        }
+
+    pooled = np.concatenate([clean_a_arr, clean_b_arr])
+    n_perm = max(1, int(n_perm))
+    rng = np.random.default_rng(seed)
+    exceed = 0
+    for _ in range(n_perm):
+        permuted = rng.permutation(pooled)
+        perm_diff = float(permuted[:n_a].mean() - permuted[n_a:].mean())
+        if abs(perm_diff) >= observed_abs:
+            exceed += 1
+
     return {
-        'n_a': len(clean_a),
-        'n_b': len(clean_b),
+        'n_a': n_a,
+        'n_b': n_b,
         'mean_a': mean_a,
         'mean_b': mean_b,
         'mean_diff': mean_diff,
-        't_stat': float(result.statistic),
-        'p_value': float(result.pvalue),
+        'stat': mean_diff,
+        'p_value': float((exceed + 1) / (n_perm + 1)),
     }
 
 
@@ -141,7 +168,9 @@ def bootstrap_diff_ci(sample_a: Sequence[float], sample_b: Sequence[float],
     }
 
 
-def paired_t_test(sample_a: Sequence[float], sample_b: Sequence[float]) -> dict:
+def paired_permutation_test(sample_a: Sequence[float], sample_b: Sequence[float],
+                            n_perm: int = 10000,
+                            seed: int | None = None) -> dict:
     clean_pairs = [
         (float(value_a), float(value_b))
         for value_a, value_b in zip(sample_a, sample_b)
@@ -155,7 +184,7 @@ def paired_t_test(sample_a: Sequence[float], sample_b: Sequence[float]) -> dict:
             'mean_a': float('nan'),
             'mean_b': float('nan'),
             'mean_diff': float('nan'),
-            't_stat': float('nan'),
+            'stat': float('nan'),
             'p_value': float('nan'),
         }
 
@@ -166,24 +195,31 @@ def paired_t_test(sample_a: Sequence[float], sample_b: Sequence[float]) -> dict:
     mean_b = float(clean_b.mean())
     mean_diff = float(diff.mean())
 
-    if n < 2:
+    if n == 1:
         return {
             'n': n,
             'mean_a': mean_a,
             'mean_b': mean_b,
             'mean_diff': mean_diff,
-            't_stat': float('nan'),
-            'p_value': float('nan'),
+            'stat': mean_diff,
+            'p_value': 1.0,
         }
 
-    result = ttest_1samp(diff, popmean=0.0, nan_policy='omit')
+    n_perm = max(1, int(n_perm))
+    rng = np.random.default_rng(seed)
+    signs = rng.choice(np.array([-1.0, 1.0]), size=(n_perm, n), replace=True)
+    perm_stats = (signs * diff).mean(axis=1)
+    observed_abs = abs(mean_diff)
+    exceed = int(np.count_nonzero(np.abs(perm_stats) >= observed_abs))
+    p_value = float((exceed + 1) / (n_perm + 1))
+
     return {
         'n': n,
         'mean_a': mean_a,
         'mean_b': mean_b,
         'mean_diff': mean_diff,
-        't_stat': float(result.statistic),
-        'p_value': float(result.pvalue),
+        'stat': mean_diff,
+        'p_value': p_value,
     }
 
 

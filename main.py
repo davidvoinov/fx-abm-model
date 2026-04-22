@@ -1,27 +1,31 @@
 """
 main.py — Interactive demo of the multi-venue FX ABM.
 
-Run:
-    python3 main.py --seed 42                                    # configurable entrypoint
-    python3 main.py --seed 42 --amm-share 30                     # fixed_share routing via legacy AMM/CLOB split
-    python3 main.py --seed 42 --preset baseline                  # realism baseline preset
-    python3 main.py --seed 42 --preset mm_withdrawal             # realism dealer withdrawal shock
-    python3 main.py --seed 42 --preset flash_crash               # realism flash-crash shock
-    python3 main.py --seed 42 --preset dealer_liquidity_crisis   # realism dealer liquidity crisis
-    python3 main.py --seed 42 --preset funding_liquidity_shock   # realism funding/liquidity squeeze
-    python3 main.py --seed 42 --preset high_vol_stress           # realism high-volatility stress
+Base scenario (without any shocks):     
+    python3 main.py --seed 42 --preset baseline   
+
+Event simulations presets (with different shock types/mechanics):                                 
+    python3 main.py --seed 42 --preset mm_withdrawal            
+    python3 main.py --seed 42 --preset flash_crash              
+    python3 main.py --seed 42 --preset dealer_liquidity_crisis  
+    python3 main.py --seed 42 --preset funding_liquidity_shock   
+    python3 main.py --seed 42 --preset high_vol_stress           
+
+Shock scenarios:
     python3 main.py --seed 42 --shock-iter 350 --shock-mode realism --fundamental-shock-pct -12
     python3 main.py --seed 42 --shock-iter 350 --shock-mode realism --liquidity-shock-frac 0.45
     python3 main.py --seed 42 --shock-iter 350 --shock-mode realism --funding-vol-shock-intensity 1.0
     python3 main.py --seed 42 --shock-iter 350 --shock-mode realism --order-flow-shock-qty 250
 
-    python3 main.py --seed 42 --preset high_vol_stress --robustness-check --robustness-seeds 5
-                                                              # short multi-seed sanity check
-    python3 main.py --seed 42 --shock-iter 350 --shock-pct -20   # legacy/research pure shock
-    python3 main.py --seed 42 --preset shock_stress              # legacy stress preset
-    python3 main.py --seed 42 --shock-iter 350 --shock-regime-stress
+Fixed liquidity share scenarios (no shocks, but different AMM/CLOB splits):
+     python3 main.py --seed 42 --amm-share 30      
 
-    python3 main.py --help                                       # full list
+CLOB/AAMM only:
+    python3 main.py --seed 42 --preset clob_only
+    python3 main.py --seed 42 --preset amm_only              
+
+Full list:
+    python3 main.py --help                                       
 
 All configurable parameters are exposed as CLI flags.
 Use  python3 main.py --help  for the full list.
@@ -119,15 +123,14 @@ REALISM_PRESETS = {
         shock_mode="realism",
         # Narrow microstructure event: dealers pull quotes under one-sided flow,
         # but latent fair value does not fully re-anchor.
+        # Keep the CLOB build identical to the default so cross-scenario
+        # statistical tests differ by shock mechanics, not book composition.
         fundamental_shock_pct=0.0,
         order_flow_shock_qty=135.0,
         order_flow_shock_side="sell",
         liquidity_shock_frac=0.54,
         funding_vol_shock_intensity=0.35,
         arb_trade_fraction_cap=0.08,
-        n_fast_lp=8,
-        n_latent_lp=10,
-        clob_near_mid_target_ratio=0.48,
         # Recovery is slower than the original soft preset, but materially
         # faster than the full dealer-liquidity-crisis scenario.
         reprice_prob_recovery=0.045,
@@ -135,6 +138,11 @@ REALISM_PRESETS = {
         bg_target_ratio_recovery=0.085,
         toxic_flow_decay=0.83,
         liquidity_shock_decay=0.87,
+        mm_withdraw_threshold=1.70,
+        mm_reentry_threshold=1.00,
+        mm_loss_threshold_bps=19.0,
+        mm_min_withdraw_ticks=4,
+        mm_reentry_ticks=2,
     ),
     "flash_crash": dict(
         shock_iter=350,
@@ -699,6 +707,16 @@ def build_parser(default_venue_choice_rule: str = "liquidity_aware") -> argparse
                    help="Sensitivity of MM spread-risk relief/penalty from AMM conditions (default: 3.0)")
     g.add_argument("--clob-amm-depth-impact", type=float, default=60.0,
                    help="Sensitivity of MM inventory/depth relief from AMM conditions (default: 60.0)")
+    g.add_argument("--mm-withdraw-threshold", type=float, default=1.8,
+                   help="Withdrawal score threshold for endogenous MM retreat (default: 1.8)")
+    g.add_argument("--mm-reentry-threshold", type=float, default=1.05,
+                   help="Re-entry score threshold for endogenous MM quoting to resume (default: 1.05)")
+    g.add_argument("--mm-loss-threshold-bps", type=float, default=20.0,
+                   help="EWMA mark-to-market loss in bps that maps to a unit withdrawal-loss score (default: 20)")
+    g.add_argument("--mm-min-withdraw-ticks", type=int, default=4,
+                   help="Minimum time endogenous MM stays withdrawn once it retreats (default: 4)")
+    g.add_argument("--mm-reentry-ticks", type=int, default=3,
+                   help="Ticks spent in the reentering state before returning to normal quoting (default: 3)")
 
     g = p.add_argument_group(
         "FX liquidity takers",
@@ -870,6 +888,11 @@ def build_sim(args: argparse.Namespace) -> Simulator:
         clob_amm_interaction=args.clob_amm_interaction,
         clob_amm_spread_impact_bps=args.clob_amm_spread_impact_bps,
         clob_amm_depth_impact=args.clob_amm_depth_impact,
+        mm_withdraw_threshold=args.mm_withdraw_threshold,
+        mm_reentry_threshold=args.mm_reentry_threshold,
+        mm_loss_threshold_bps=args.mm_loss_threshold_bps,
+        mm_min_withdraw_ticks=args.mm_min_withdraw_ticks,
+        mm_reentry_ticks=args.mm_reentry_ticks,
         enable_amm=bool(args.enable_amm),
         amm_liq=args.amm_liq,
         match_initial_depth=args.match_initial_depth,

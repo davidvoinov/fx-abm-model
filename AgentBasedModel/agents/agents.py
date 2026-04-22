@@ -1481,7 +1481,12 @@ class MarketMaker(Trader):
                  venue_interaction_mode: str = 'competition',
                  amm_spread_impact_bps: float = 3.0,
                  amm_depth_impact: float = 60.0,
-                 amm_reference_q: float = 5.0):
+                 amm_reference_q: float = 5.0,
+                 withdrawal_threshold: float = 1.8,
+                 reentry_threshold: float = 1.05,
+                 loss_threshold_bps: float = 20.0,
+                 min_withdraw_ticks: int = 4,
+                 reentry_ticks: int = 3):
         super().__init__(market, cash, assets,
                          clob=clob, amm_pools=amm_pools, env=env,
                          amm_share_pct=amm_share_pct, deterministic_venue=deterministic_venue,
@@ -1508,11 +1513,24 @@ class MarketMaker(Trader):
         self.amm_spread_impact_bps = max(0.0, amm_spread_impact_bps)
         self.amm_depth_impact = max(0.0, amm_depth_impact)
         self.amm_reference_q = max(1.0, float(amm_reference_q))
+        self.withdrawal_threshold = max(0.1, float(withdrawal_threshold))
+        self.reentry_threshold = max(0.0, min(self.withdrawal_threshold, float(reentry_threshold)))
+        self.loss_threshold_bps = max(1.0, float(loss_threshold_bps))
+        self.min_withdraw_ticks = max(1, int(min_withdraw_ticks))
+        self.reentry_ticks = max(1, int(reentry_ticks))
 
         # Inventory & order-flow tracking
         self.inventory: float = 0.0       # net position (+ = long)
         self._ofi_window: List[float] = []  # recent order-flow imbalance
         self._ofi_maxlen: int = 20
+        self.mm_state: str = 'active'
+        self.mm_state_timer: int = 0
+        self.mm_withdrawal_score: float = 0.0
+        self.mm_state_details: Dict[str, float] = {}
+        self._mtm_wealth_prev: Optional[float] = None
+        self._mtm_pnl_bps_ewma: float = 0.0
+        self._loss_bps_ewma: float = 0.0
+        self._signal_decay: float = 0.85
 
     def _recent_ofi(self) -> float:
         """Average recent order-flow imbalance (positive = buy pressure)."""
@@ -1664,6 +1682,139 @@ class MarketMaker(Trader):
         """Skew mid-price away from inventory risk (bps → price offset)."""
         return -self.inv_skew_bps * self.inventory * mid / 10_000.0
 
+    def cancel_all_quotes(self):
+        for order in self.orders.copy():
+            try:
+                self._cancel_order(order)
+            except Exception:
+                pass
+        self.orders.clear()
+
+    def _mark_to_market(self, mid: float) -> float:
+        return self.cash + self.assets * mid
+
+    def _update_mtm_signals(self, mid: float):
+        wealth = self._mark_to_market(mid)
+        if self._mtm_wealth_prev is None:
+            self._mtm_wealth_prev = wealth
+            return
+
+        base = max(abs(self._mtm_wealth_prev), 1e-9)
+        pnl_bps = 10_000.0 * (wealth - self._mtm_wealth_prev) / base
+        decay = self._signal_decay
+        self._mtm_pnl_bps_ewma = decay * self._mtm_pnl_bps_ewma + (1.0 - decay) * pnl_bps
+        self._loss_bps_ewma = decay * self._loss_bps_ewma + (1.0 - decay) * max(0.0, -pnl_bps)
+        self._mtm_wealth_prev = wealth
+
+    def _withdrawal_components(self, mid: float) -> Dict[str, float]:
+        sigma_base = max(getattr(self.env, 'sigma_low', self.env.sigma), 1e-6)
+        funding_base = max(getattr(self.env, 'c_low', self.env.funding_cost), 1e-6)
+        liquidity_factor = self._liquidity_factor()
+
+        sigma_score = min(2.5, max(0.0, self.env.sigma / sigma_base - 1.0))
+        funding_score = min(2.5, max(0.0, self.env.funding_cost / funding_base - 1.0))
+        inventory_abs = max(abs(self.inventory), abs(float(self.assets)))
+        inventory_ratio = min(1.5, inventory_abs / max(1.5 * float(self.softlimit), 1.0))
+        ofi_score = min(2.0, abs(self._recent_ofi()))
+        liquidity_damage = min(1.5, max(0.0, 1.0 - liquidity_factor))
+        outside_option_score = min(1.5, self._amm_support_score(mid))
+        loss_score = min(3.0, self._loss_bps_ewma / self.loss_threshold_bps)
+
+        score = (
+            0.40 * loss_score
+            + 0.12 * sigma_score
+            + 0.05 * funding_score
+            + 0.22 * inventory_ratio
+            + 0.22 * ofi_score
+            + 0.32 * liquidity_damage
+            + 0.10 * outside_option_score
+        )
+        return {
+            'score': score,
+            'loss_score': loss_score,
+            'sigma_score': sigma_score,
+            'funding_score': funding_score,
+            'inventory_ratio': inventory_ratio,
+            'ofi_score': ofi_score,
+            'liquidity_factor': liquidity_factor,
+            'outside_option_score': outside_option_score,
+            'loss_bps_ewma': self._loss_bps_ewma,
+            'mtm_pnl_bps_ewma': self._mtm_pnl_bps_ewma,
+        }
+
+    def _update_endogenous_state(self, mid: float) -> str:
+        if self.env is None:
+            self.mm_state = 'active'
+            self.mm_state_timer = 0
+            self.mm_withdrawal_score = 0.0
+            self.mm_state_details = {'score': 0.0, 'liquidity_factor': self._liquidity_factor()}
+            return self.mm_state
+
+        self._update_mtm_signals(mid)
+        details = self._withdrawal_components(mid)
+        score = details['score']
+        defensive_threshold = max(self.reentry_threshold, 0.60 * self.withdrawal_threshold)
+        withdraw_release_threshold = max(defensive_threshold, 0.85 * self.withdrawal_threshold)
+        liquidity_ok = details['liquidity_factor'] >= 0.55
+
+        self.mm_withdrawal_score = score
+        self.mm_state_details = details
+
+        if self.mm_state == 'withdrawn':
+            if self.mm_state_timer > 0:
+                self.mm_state_timer -= 1
+            if self.mm_state_timer <= 0 and score <= withdraw_release_threshold and liquidity_ok:
+                self.mm_state = 'reentering'
+                self.mm_state_timer = self.reentry_ticks
+            return self.mm_state
+
+        if self.mm_state == 'reentering':
+            if score >= self.withdrawal_threshold:
+                self.mm_state = 'withdrawn'
+                self.mm_state_timer = self.min_withdraw_ticks
+                return self.mm_state
+
+            if self.mm_state_timer > 0:
+                self.mm_state_timer -= 1
+            if self.mm_state_timer <= 0:
+                self.mm_state = 'active' if score < 0.5 * self.reentry_threshold else 'defensive'
+            return self.mm_state
+
+        if score >= self.withdrawal_threshold:
+            self.mm_state = 'withdrawn'
+            self.mm_state_timer = self.min_withdraw_ticks
+        elif score >= defensive_threshold:
+            self.mm_state = 'defensive'
+            self.mm_state_timer = 0
+        elif self.mm_state == 'defensive' and score > self.reentry_threshold:
+            self.mm_state = 'defensive'
+        else:
+            self.mm_state = 'active'
+            self.mm_state_timer = 0
+        return self.mm_state
+
+    def _state_quote_adjustments(self) -> Dict[str, float | bool]:
+        if self.mm_state == 'withdrawn':
+            return {'can_quote': False, 'spread_mult': float('inf'), 'depth_mult': 0.0}
+
+        if self.mm_state == 'reentering':
+            progress = 1.0 - self.mm_state_timer / max(1, self.reentry_ticks)
+            return {
+                'can_quote': True,
+                'spread_mult': max(1.05, 1.30 - 0.20 * progress),
+                'depth_mult': min(0.80, 0.35 + 0.35 * progress),
+            }
+
+        if self.mm_state == 'defensive':
+            score_ratio = min(1.5, self.mm_withdrawal_score / max(self.withdrawal_threshold, 1e-9))
+            return {
+                'can_quote': True,
+                'spread_mult': 1.0 + 0.30 * score_ratio,
+                'depth_mult': max(0.25, 1.0 - 0.40 * score_ratio),
+            }
+
+        return {'can_quote': True, 'spread_mult': 1.0, 'depth_mult': 1.0}
+
     def call(self):
         # ---------- multi-venue mode (σ/c-dependent MM) -------------------
         if self.env is not None:
@@ -1680,13 +1831,7 @@ class MarketMaker(Trader):
                             self.inventory += filled
                         else:
                             self.inventory -= filled
-            # that were partially or fully filled (qty changed since placement)
-            for order in self.orders.copy():
-                try:
-                    self._cancel_order(order)
-                except Exception:
-                    pass
-            self.orders.clear()
+            self.cancel_all_quotes()
 
             sp = self.market.spread()
             fair_mid = getattr(self.env, 'fair_price', None)
@@ -1698,12 +1843,19 @@ class MarketMaker(Trader):
             if mid is None or mid <= 0:
                 return
 
+            self._update_endogenous_state(mid)
+            quote_state = self._state_quote_adjustments()
+            if not quote_state['can_quote']:
+                return
+
             # Apply inventory skew: shift effective mid away from risk
             skew = self._inventory_skew(mid)
             eff_mid = mid + skew
 
-            half_spread = mid * self._target_spread_bps(mid) / 10_000.0 / 2.0
-            total_depth = max(1, int(self._target_depth(mid)))
+            half_spread = (
+                mid * self._target_spread_bps(mid) * quote_state['spread_mult'] / 10_000.0 / 2.0
+            )
+            total_depth = max(1, int(self._target_depth(mid) * quote_state['depth_mult']))
 
             # Inventory-based one-sided thinning: reduce depth on the
             # overexposed side to encourage inventory mean-reversion
@@ -1730,8 +1882,7 @@ class MarketMaker(Trader):
 
         # ---------- classic single-venue mode (inventory balance) ---------
         # Clear previous orders
-        for order in self.orders.copy():
-            self._cancel_order(order)
+        self.cancel_all_quotes()
 
         spread = self.market.spread()
 

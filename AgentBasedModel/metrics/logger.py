@@ -97,6 +97,14 @@ class MetricsLogger:
             b: {} for b in SIZE_BUCKETS
         }
 
+        self.mm_states = ('active', 'defensive', 'withdrawn', 'reentering')
+        self.mm_state_counts: Dict[str, List[float]] = {state: [] for state in self.mm_states}
+        self.mm_state_shares: Dict[str, List[float]] = {state: [] for state in self.mm_states}
+        self.n_market_makers_series: List[float] = []
+        self.mm_avg_withdrawal_score_series: List[float] = []
+        self.mm_avg_loss_bps_series: List[float] = []
+        self.mm_avg_inventory_ratio_series: List[float] = []
+
     # ---- initialization --------------------------------------------------
 
     def _ensure_pool(self, name: str):
@@ -123,7 +131,8 @@ class MetricsLogger:
                  clob: 'CLOBVenue',
                  amm_pools: Dict[str, 'CPMMPool | HFMMPool'],
                  env: 'MarketEnvironment',
-                 period_trades: List[dict]):
+                 period_trades: List[dict],
+                 mm_state_summary: Optional[dict] = None):
         """
         Record all metrics for iteration *t*.
         """
@@ -222,6 +231,24 @@ class MetricsLogger:
                 avg_c = (sum(costs_list) / len(costs_list)) if costs_list else float('nan')
                 self.bin_costs[b][v].append(avg_c)
                 self.bin_flow[b][v].append(bin_vol_acc[b].get(v, 0))
+
+        mm_state_summary = mm_state_summary or {}
+        counts = mm_state_summary.get('counts', {})
+        shares = mm_state_summary.get('shares', {})
+        n_market_makers = float(mm_state_summary.get('n_market_makers', 0))
+        self.n_market_makers_series.append(n_market_makers)
+        for state in self.mm_states:
+            self.mm_state_counts[state].append(float(counts.get(state, 0.0)))
+            self.mm_state_shares[state].append(float(shares.get(state, 0.0)))
+        self.mm_avg_withdrawal_score_series.append(
+            float(mm_state_summary.get('avg_withdrawal_score', float('nan')))
+        )
+        self.mm_avg_loss_bps_series.append(
+            float(mm_state_summary.get('avg_loss_bps_ewma', float('nan')))
+        )
+        self.mm_avg_inventory_ratio_series.append(
+            float(mm_state_summary.get('avg_inventory_ratio', float('nan')))
+        )
 
     # ---- analysis helpers ------------------------------------------------
 
@@ -353,6 +380,15 @@ class MetricsLogger:
             fs = self.flow_share(v)
             if fs:
                 result[f'avg_flow_share_{v}'] = sum(fs) / len(fs)
+
+        for state in self.mm_states:
+            shares = [x for x in self.mm_state_shares[state] if math.isfinite(x)]
+            if shares:
+                result[f'avg_mm_share_{state}'] = sum(shares) / len(shares)
+
+        mm_scores = [x for x in self.mm_avg_withdrawal_score_series if math.isfinite(x)]
+        if mm_scores:
+            result['avg_mm_withdrawal_score'] = sum(mm_scores) / len(mm_scores)
 
         return result
 
