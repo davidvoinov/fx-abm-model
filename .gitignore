@@ -3,6 +3,7 @@ output/*
 !output/resilience_aware_300/**
 !output/scenario_stats_300/
 !output/scenario_stats_300/**
+.github/
 .obsidian-vault/
 .vscode/
 .venv/
