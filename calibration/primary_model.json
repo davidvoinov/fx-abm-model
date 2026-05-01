@@ -1,0 +1,126 @@
+{
+  "model_name": "primary_fx_micromarket",
+  "version": "2026-04-28",
+  "notes": "Single primary FX model entrypoint. Defaults are wired into main.py so calibration work has one canonical runtime target.",
+  "pair_class": "EUR/USD major ECN-style FX market",
+  "session_scope": "Normal and stress sessions with event windows; no full Asia/London/New York intraday decomposition yet.",
+  "fit_date": "2026-04-28",
+  "calibration_sources": [
+    "bid-ask.pdf",
+    "liquidity.pdf",
+    "orderflow.pdf",
+    "Lo_Hall_Resiliency_of_the_limit_order_book_Accepted_Manuscript.pdf",
+    "risk.pdf",
+    "bis.pdf",
+    "jrfm-16-00259.pdf",
+    "ssrn-3808755.pdf",
+    "r_qt1312e.pdf"
+  ],
+  "accepted_error_bands": {
+    "quoted_spread_bps": {
+      "relative": 0.25
+    },
+    "near_touch_depth": {
+      "relative": 0.3
+    },
+    "order_flow_autocorrelation": {
+      "absolute": 0.1
+    },
+    "impact_curve": {
+      "relative": 0.3
+    },
+    "dealer_withdrawal_share": {
+      "absolute": 0.1
+    },
+    "recovery_half_life_ticks": {
+      "relative": 0.35
+    },
+    "cross_venue_basis_bps": {
+      "relative": 0.35
+    },
+    "amm_volume_share": {
+      "absolute": 0.08
+    }
+  },
+  "cli_defaults": {
+    "price": 100.0,
+    "n_noise": 12,
+    "n_mm": 2,
+    "n_fast_lp": 10,
+    "n_latent_lp": 6,
+    "n_clob_fund": 2,
+    "n_clob_chart": 0,
+    "n_clob_univ": 1,
+    "enable_clob_mm": 1,
+    "clob_std": 2.0,
+    "clob_volume": 1000,
+    "clob_anchor_strength": 0.35,
+    "clob_anchor_threshold_bps": 5.0,
+    "clob_near_mid_target_ratio": 1.0,
+    "clob_support_max_share": 0.45,
+    "clob_amm_interaction": "competition",
+    "clob_amm_spread_impact_bps": 3.0,
+    "clob_amm_depth_impact": 60.0,
+    "mm_alpha0_base": 2.1,
+    "mm_alpha0_step": 0.3,
+    "mm_alpha1": 320.0,
+    "mm_alpha2": 700.0,
+    "mm_alpha3": 35.0,
+    "mm_d0_base": 138.0,
+    "mm_d0_step": 5.0,
+    "mm_d1": 560.0,
+    "mm_d2": 360.0,
+    "mm_d3": 12.0,
+    "mm_withdraw_threshold": 1.8,
+    "mm_reentry_threshold": 1.05,
+    "mm_loss_threshold_bps": 20.0,
+    "mm_min_withdraw_ticks": 4,
+    "mm_reentry_ticks": 3,
+    "maintenance_margin_ratio": 0.06,
+    "liquidation_fraction": 0.75,
+    "borrow_spread_multiplier": 0.6,
+    "short_borrow_spread_multiplier": 0.8,
+    "n_fx_takers": 15,
+    "n_fx_fund": 5,
+    "n_retail": 10,
+    "n_institutional": 3,
+    "hedger_flow_persistence": 0.24,
+    "retail_flow_persistence": 0.42,
+    "institutional_flow_persistence": 0.24,
+    "amm_share_pct": 30.0,
+    "venue_choice_rule": "liquidity_aware",
+    "beta_amm": 0.05,
+    "cpmm_bias_bps": 0.0,
+    "cost_noise_std": 1.5,
+    "clob_liq": 1.0,
+    "amm_liq": 1.0,
+    "match_initial_depth": false,
+    "enable_amm": 1,
+    "cpmm_reserves": 3600.0,
+    "hfmm_reserves": 3400.0,
+    "cpmm_fee": 0.002,
+    "hfmm_fee": 0.0005,
+    "hfmm_A": 18.0,
+    "stress_start": -1,
+    "stress_end": -1,
+    "sigma_low": 0.01,
+    "sigma_high": 0.05,
+    "c_low": 0.002,
+    "c_high": 0.02,
+    "shock_iter": null,
+    "shock_mode": "realism",
+    "shock_pct": -20.0,
+    "fundamental_shock_pct": 0.0,
+    "order_flow_shock_qty": 0.0,
+    "order_flow_shock_side": "auto",
+    "liquidity_shock_frac": 0.0,
+    "funding_vol_shock_intensity": 0.0,
+    "arb_max_correction_pct": 10.0,
+    "arb_trade_fraction_cap": 0.45,
+    "amm_lp_wallet_cash_buffer_ratio": 0.2,
+    "amm_lp_wallet_base_buffer_ratio": 0.2,
+    "amm_arb_cash_buffer_ratio": 0.15,
+    "amm_arb_base_buffer_ratio": 0.15,
+    "dynamic_fee": false
+  }
+}

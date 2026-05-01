@@ -38,6 +38,7 @@ DEFAULT_SCENARIOS = [
     ('flash_crash', 'Flash Crash'),
     ('dealer_liquidity_crisis', 'Dealer Liquidity Crisis'),
     ('funding_liquidity_shock', 'Funding Liquidity Shock'),
+    ('high_vol_stress', 'High-Vol Stress'),
 ]
 
 MARKET_STRUCTURES = [
@@ -50,6 +51,7 @@ PRICE_TARGET_MODE = {
     'flash_crash': 'pre_shock_baseline',
     'dealer_liquidity_crisis': 'fair_value_gap',
     'funding_liquidity_shock': 'pre_shock_baseline',
+    'high_vol_stress': 'pre_shock_baseline',
 }
 
 RQ_FIGURE_METRICS = {
@@ -261,6 +263,18 @@ def _shock_iter_from_sim(sim) -> int | None:
     return shock_iter
 
 
+def _event_iter_from_sim(sim) -> int | None:
+    shock_iter = _shock_iter_from_sim(sim)
+    if shock_iter is not None:
+        return int(shock_iter)
+
+    env = getattr(sim, 'env', None)
+    stress_start = getattr(env, 'stress_start', None) if env is not None else None
+    if stress_start is not None and stress_start >= 0:
+        return int(stress_start)
+    return None
+
+
 def _base_args_for_scenario(preset: str, n_iter: int,
                             venue_choice_rule: str = 'liquidity_aware'):
     parser = build_parser(default_venue_choice_rule=venue_choice_rule)
@@ -300,17 +314,17 @@ def _scenario_metrics(sim, scenario_key: str,
         'avg_mm_share_withdrawn': float(summary.get('avg_mm_share_withdrawn', float('nan'))),
         'avg_mm_withdrawal_score': float(summary.get('avg_mm_withdrawal_score', float('nan'))),
     }
-    shock_iter = _shock_iter_from_sim(sim)
-    if shock_iter is None:
+    event_iter = _event_iter_from_sim(sim)
+    if event_iter is None:
         return metrics
 
-    horizon_end = min(len(logger.iterations), shock_iter + max(50, resilience_horizon))
+    horizon_end = min(len(logger.iterations), event_iter + max(50, resilience_horizon))
     target_mode = PRICE_TARGET_MODE.get(scenario_key, 'pre_shock_baseline')
     target_series = logger.fair_price_series if target_mode == 'fair_value_gap' else None
 
     price_metrics = price_resilience_metrics(
         logger.clob_mid_series,
-        shock_iter=shock_iter,
+        shock_iter=event_iter,
         baseline_window=50,
         avg_window=avg_window,
         stable_window=stable_window,
@@ -322,7 +336,7 @@ def _scenario_metrics(sim, scenario_key: str,
     )
     spread_metrics = series_resilience_metrics(
         logger.clob_qspr,
-        shock_iter=shock_iter,
+        shock_iter=event_iter,
         baseline_window=50,
         avg_window=avg_window,
         stable_window=stable_window,
@@ -333,7 +347,7 @@ def _scenario_metrics(sim, scenario_key: str,
     )
     depth_metrics = series_resilience_metrics(
         depth_series,
-        shock_iter=shock_iter,
+        shock_iter=event_iter,
         baseline_window=50,
         avg_window=avg_window,
         stable_window=stable_window,
@@ -344,7 +358,7 @@ def _scenario_metrics(sim, scenario_key: str,
     )
     systemic_metrics = series_resilience_metrics(
         logger.systemic_liquidity_series,
-        shock_iter=shock_iter,
+        shock_iter=event_iter,
         baseline_window=50,
         avg_window=avg_window,
         stable_window=stable_window,
@@ -364,12 +378,12 @@ def _scenario_metrics(sim, scenario_key: str,
         'depth_recovery_steps': depth_metrics.get('recovery_steps', float('nan')),
         'liquidity_composite_recovery_steps': liquidity_metrics.get('recovery_steps', float('nan')),
         'liquidity_composite_recovered': 1.0 if liquidity_metrics.get('recovered', False) else 0.0,
-        'post_shock_avg_clob_spread_bps': _window_mean(logger.clob_qspr, shock_iter, horizon_end),
-        'post_shock_avg_clob_depth': _window_mean(depth_series, shock_iter, horizon_end),
-        'post_shock_avg_systemic_liquidity': _window_mean(logger.systemic_liquidity_series, shock_iter, horizon_end),
-        'post_shock_avg_realized_volatility': _window_mean(realized_vol, shock_iter, horizon_end),
-        'post_shock_mm_share_withdrawn': _window_mean(logger.mm_state_shares['withdrawn'], shock_iter, horizon_end),
-        'post_shock_mm_withdrawal_score': _window_mean(logger.mm_avg_withdrawal_score_series, shock_iter, horizon_end),
+        'post_shock_avg_clob_spread_bps': _window_mean(logger.clob_qspr, event_iter, horizon_end),
+        'post_shock_avg_clob_depth': _window_mean(depth_series, event_iter, horizon_end),
+        'post_shock_avg_systemic_liquidity': _window_mean(logger.systemic_liquidity_series, event_iter, horizon_end),
+        'post_shock_avg_realized_volatility': _window_mean(realized_vol, event_iter, horizon_end),
+        'post_shock_mm_share_withdrawn': _window_mean(logger.mm_state_shares['withdrawn'], event_iter, horizon_end),
+        'post_shock_mm_withdrawal_score': _window_mean(logger.mm_avg_withdrawal_score_series, event_iter, horizon_end),
     })
     return metrics
 

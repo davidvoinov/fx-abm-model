@@ -57,13 +57,19 @@ class CLOBVenue:
         sp = self.exchange.spread()
         if sp is not None:
             return (sp['bid'] + sp['ask']) / 2.0
-        # Fallback to exchange.price() which rounds to 0.1
-        try:
-            return self.exchange.price()
-        except Exception:
-            if hasattr(self.exchange, 'dividend_book') and self.exchange.dividend_book:
-                return self.exchange.dividend_book[-1]
-            return 100.0
+
+        bid_book = self.exchange.order_book.get('bid')
+        ask_book = self.exchange.order_book.get('ask')
+        if bid_book:
+            return float(bid_book.first.price)
+        if ask_book:
+            return float(ask_book.first.price)
+
+        cached_mid = getattr(self.exchange, '_last_book_mid_price', None)
+        if cached_mid is not None and cached_mid > 0:
+            return float(cached_mid)
+
+        return 100.0
 
     def spread(self) -> Optional[dict]:
         return self.exchange.spread()

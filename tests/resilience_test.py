@@ -40,6 +40,7 @@ DEFAULT_PANELS = [
     ('flash_crash', 'Flash Crash', '#2ca02c', 'pre_shock_baseline', 'Pre-shock baseline'),
     ('dealer_liquidity_crisis', 'Dealer Liquidity Crisis', '#ff7f0e', 'fair_value_gap', 'Fair-value gap'),
     ('funding_liquidity_shock', 'Funding Liquidity Shock', '#d62728', 'pre_shock_baseline', 'Pre-shock baseline'),
+    ('high_vol_stress', 'High-Vol Stress', '#9467bd', 'pre_shock_baseline', 'Pre-stress baseline'),
 ]
 
 COMPARISON_SERIES = [
@@ -72,7 +73,7 @@ RECOVERY_COMPARISON_ENDPOINTS = [
 
 def _base_args_for_preset(preset: str, n_iter: int, min_post_shock_window: int,
                           forced_venue_choice_rule: str | None = None):
-    parser = build_parser(default_venue_choice_rule=forced_venue_choice_rule or 'fixed_share')
+    parser = build_parser(default_venue_choice_rule=forced_venue_choice_rule or 'liquidity_aware')
     args = parser.parse_args([])
     args.preset = preset
     args.n_iter = n_iter
@@ -251,6 +252,20 @@ def _priority_metric_points(price_metrics: dict, logger, shock_iter: int,
     return rows
 
 
+def _event_iter_from_sim(sim) -> int | None:
+    shock_iter = getattr(sim, 'shock_iter', None)
+    if shock_iter is None:
+        shock_iter = getattr(sim, '_shock_iter', None)
+    if shock_iter is not None:
+        return int(shock_iter)
+
+    env = getattr(sim, 'env', None)
+    stress_start = getattr(env, 'stress_start', None) if env is not None else None
+    if stress_start is not None and stress_start >= 0:
+        return int(stress_start)
+    return None
+
+
 def _collect_points(preset: str, seeds: int, base_seed: int,
                     n_iter: int, tolerance_pct: float,
                     stable_window: int, avg_window: int,
@@ -282,19 +297,19 @@ def _collect_points(preset: str, seeds: int, base_seed: int,
         sim = build_sim(args)
         sim.simulate(args.n_iter, silent=True)
 
-        shock_iter = getattr(sim, 'shock_iter', None)
-        if shock_iter is None:
+        event_iter = _event_iter_from_sim(sim)
+        if event_iter is None:
             continue
 
         target_series = None
         if target_mode == 'fair_value_gap':
             target_series = getattr(sim.logger, 'fair_price_series', None)
 
-        horizon = max(50, min(args.n_iter - shock_iter, min_post_shock_window))
+        horizon = max(50, min(args.n_iter - event_iter, min_post_shock_window))
 
         metrics = price_resilience_metrics(
             sim.logger.clob_mid_series,
-            shock_iter=shock_iter,
+            shock_iter=event_iter,
             baseline_window=50,
             avg_window=avg_window,
             tolerance_pct=tolerance_pct,
@@ -330,7 +345,7 @@ def _collect_points(preset: str, seeds: int, base_seed: int,
         for metric_point in _priority_metric_points(
             metrics,
             sim.logger,
-            shock_iter,
+            event_iter,
             stable_window=stable_window,
             avg_window=avg_window,
             tolerance_pct=tolerance_pct,
@@ -720,8 +735,8 @@ def _run_study(forced_venue_choice_rule: str | None = None,
                         help='Simulation length for each run (default: 900)')
     parser.add_argument('--avg-window', type=int, default=20,
                         help='Window used for average post-shock price change (default: 20)')
-    parser.add_argument('--tolerance-pct', type=float, default=1.0,
-                        help='Legacy fixed recovery band retained for reference columns (default: 1.0)')
+    parser.add_argument('--tolerance-pct', type=float, default=50.0,
+                        help='Reference fixed-band threshold in percent around baseline (default: 50.0 = [0.5x, 1.5x])')
     parser.add_argument('--retracement-fraction', type=float, default=0.8,
                         help='Fraction of initial dislocation that must be closed to count as recovery (default: 0.8)')
     parser.add_argument('--impact-window', type=int, default=10,

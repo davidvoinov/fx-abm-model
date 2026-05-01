@@ -66,6 +66,46 @@ class Simulator:
         else:
             self.info = None
 
+    def _risk_managed_traders(self):
+        seen = set()
+        traders = []
+        for trader in list(self.book_agents) + list(self.fx_traders) + ([self.mm] if self.mm is not None else []):
+            if trader is None:
+                continue
+            trader_id = getattr(trader, 'id', id(trader))
+            if trader_id in seen:
+                continue
+            seen.add(trader_id)
+            traders.append(trader)
+        return traders
+
+    def _apply_balance_sheet_controls(self):
+        if self.exchange is None:
+            return
+        reference_price = None
+        try:
+            if self.clob is not None:
+                reference_price = self.clob.mid_price()
+        except Exception:
+            reference_price = None
+        if reference_price is None:
+            try:
+                reference_price = self.exchange.price()
+            except Exception:
+                reference_price = None
+        funding_cost = 0.0
+        if self.env is not None:
+            funding_cost = max(0.0, float(getattr(self.env, 'funding_cost', 0.0)))
+
+        for trader in self._risk_managed_traders():
+            if getattr(trader, 'defaulted', False):
+                continue
+            try:
+                trader.apply_financing_charge(reference_price, funding_cost)
+                trader.enforce_balance_sheet_discipline(reference_price)
+            except Exception:
+                pass
+
     @property
     def multi_venue(self) -> bool:
         return self.clob is not None and (bool(self.amm_pools) or bool(self.fx_traders))
@@ -133,6 +173,29 @@ class Simulator:
         if self.env is None or not hasattr(self.env, 'set_recovery_support'):
             return
         self.env.set_recovery_support(self._estimate_recovery_support())
+
+    def _restore_clob_near_mid_liquidity(self):
+        if self.env is None or self.exchange is None or self.clob is None:
+            return
+
+        fair_price = getattr(self.env, 'fair_price', None)
+        if fair_price is None or fair_price <= 0:
+            return
+
+        try:
+            near_mid_depth = self.clob.total_depth(25)
+        except Exception:
+            return
+
+        if near_mid_depth.get('total', 0.0) > 1e-9:
+            return
+
+        self.exchange.rebalance_background_liquidity(
+            fair_price,
+            corridor_bps=25.0,
+            target_ratio=max(0.5, float(getattr(self.env, 'systemic_liquidity', 1.0))),
+            respect_trader_cap=False,
+        )
 
     # ------------------------------------------------------------------
     # Classic helpers
@@ -340,13 +403,24 @@ class Simulator:
                 # during shock aftermath for natural price discovery lag
                 fp = self.env.fair_price
                 if fp is not None:
-                    rp = self.env.reprice_prob_override if self.env.reprice_prob_override is not None else 0.6
-                    anchor_strength = None
-                    background_target_ratio = self.env.systemic_liquidity
+                    base_rp = self.env.reprice_prob_override if self.env.reprice_prob_override is not None else 0.6
+                    liquidity_factor = max(0.2, min(1.0, self.env.systemic_liquidity))
+                    venue_basis_bps = max(0.0, getattr(self.env, 'venue_basis_bps', 0.0))
+                    arbitrage_capacity = max(0.0, min(1.0, getattr(self.env, 'arbitrage_capacity', 1.0)))
+                    basis_damp = 1.0 / (1.0 + venue_basis_bps / 35.0)
+                    rp = base_rp * (0.55 + 0.45 * liquidity_factor) * basis_damp
+                    rp = max(0.05, min(base_rp, rp))
+
+                    base_anchor_strength = getattr(self.exchange, '_anchor_strength', 0.25)
+                    anchor_strength = base_anchor_strength * (0.45 + 0.55 * arbitrage_capacity) * basis_damp
+                    anchor_strength = max(0.02, min(base_anchor_strength, anchor_strength))
+
+                    background_target_ratio = max(0.35, self.env.systemic_liquidity)
                     if self.shock_mode == 'realism' and self.env.shock_ticks_remaining > 0:
-                        anchor_strength = self.env.anchor_strength_override
+                        if self.env.anchor_strength_override is not None:
+                            anchor_strength = min(anchor_strength, self.env.anchor_strength_override * basis_damp)
                         if self.env.background_target_ratio_override is not None:
-                            background_target_ratio = self.env.background_target_ratio_override
+                            background_target_ratio = min(background_target_ratio, self.env.background_target_ratio_override)
                     self.exchange.recenter_book(
                         fp,
                         reprice_prob=rp,
@@ -367,8 +441,12 @@ class Simulator:
             #     close to S_t even under high-σ GBM dynamics.
             skip_pretrade_arb = (
                 self.shock_mode == 'realism'
-                and self.shock_iter is not None
-                and t == self.shock_iter
+                and self.env is not None
+                and self.env.shock_ticks_remaining > 0
+                and (
+                    self.env.systemic_liquidity < 0.80
+                    or getattr(self.env, 'arbitrage_capacity', 0.0) < 0.12
+                )
             )
             if self.arbitrageur is not None and not skip_pretrade_arb:
                 self.arbitrageur.arbitrage()
@@ -397,6 +475,8 @@ class Simulator:
             # 3. CLOB book agents (diverse limit-order providers)
             random.shuffle(self.book_agents)
             for tr in self.book_agents:
+                if getattr(tr, 'defaulted', False):
+                    continue
                 if mm_paused and isinstance(tr, MarketMaker):
                     tr.cancel_all_quotes()
                     continue
@@ -416,6 +496,8 @@ class Simulator:
             period_trades: List[dict] = []
             random.shuffle(self.fx_traders)
             for tr in self.fx_traders:
+                if getattr(tr, 'defaulted', False):
+                    continue
                 result = tr.call()
                 if result is not None:
                     period_trades.append(result)
@@ -426,6 +508,13 @@ class Simulator:
             # 7. Arbitrageurs align AMM prices
             if self.arbitrageur is not None:
                 self.arbitrageur.arbitrage()
+
+            if self.env is not None and self.amm_pools:
+                self.env.observe_venue_conditions(
+                    self.clob,
+                    self.amm_pools,
+                    arbitrageur=self.arbitrageur,
+                )
 
             # 7a. Expire stale orders (TTL-based lifecycle)
             fp = self.env.fair_price if self.env is not None else None
@@ -439,6 +528,13 @@ class Simulator:
             # 9. Record AMM state
             for pool in self.amm_pools.values():
                 pool.record_state()
+
+            # 9a. Funding carry, maintenance checks, and explicit default handling
+            self._apply_balance_sheet_controls()
+
+            # Restore minimal anonymous support if the book is technically
+            # non-empty but no liquidity remains near fair value.
+            self._restore_clob_near_mid_liquidity()
 
             # 10. Metrics snapshot
             if self.logger is not None:
@@ -492,14 +588,32 @@ class Simulator:
                    clob_anchor_strength: float = 0.35,
                    clob_anchor_threshold_bps: float = 5.0,
                    clob_background_target_ratio: float = 1.5,
+                   clob_support_max_share: float = 1.0,
                    clob_amm_interaction: str = 'competition',
                    clob_amm_spread_impact_bps: float = 3.0,
                    clob_amm_depth_impact: float = 60.0,
+                   mm_alpha0_base: float = 2.1,
+                   mm_alpha0_step: float = 0.3,
+                   mm_alpha1: float = 320.0,
+                   mm_alpha2: float = 560.0,
+                   mm_alpha3: float = 35.0,
+                   mm_d0_base: float = 90.0,
+                   mm_d0_step: float = 5.0,
+                   mm_d1: float = 620.0,
+                   mm_d2: float = 420.0,
+                   mm_d3: float = 18.0,
+                   hedger_flow_persistence: float = 0.10,
+                   retail_flow_persistence: float = 0.28,
+                   institutional_flow_persistence: float = 0.18,
                    mm_withdraw_threshold: float = 1.8,
                    mm_reentry_threshold: float = 1.05,
                    mm_loss_threshold_bps: float = 20.0,
                    mm_min_withdraw_ticks: int = 4,
                    mm_reentry_ticks: int = 3,
+                   maintenance_margin_ratio: float = 0.06,
+                   liquidation_fraction: float = 0.75,
+                   borrow_spread_multiplier: float = 0.6,
+                   short_borrow_spread_multiplier: float = 0.8,
                    amm_liq: float = 1.0,
                    match_initial_depth: bool = False,
                    shock_iter: Optional[int] = None,
@@ -512,6 +626,10 @@ class Simulator:
                    funding_vol_shock_intensity: float = 0.0,
                    arb_max_correction_pct: float = 10.0,
                    arb_trade_fraction_cap: float = 0.20,
+                   amm_lp_wallet_cash_buffer_ratio: float = 0.20,
+                   amm_lp_wallet_base_buffer_ratio: float = 0.20,
+                   amm_arb_cash_buffer_ratio: float = 0.15,
+                   amm_arb_base_buffer_ratio: float = 0.15,
                    dynamic_fee: bool = False,
                    # ── liquidity shock decay rates ──────────────
                    reprice_prob_recovery: Optional[float] = None,
@@ -598,6 +716,7 @@ class Simulator:
         exchange = ExchangeAgent(price=price, std=clob_std,
                      volume=eff_clob_volume,
                      background_target_ratio=clob_background_target_ratio,
+                     background_max_share_of_trader_depth=clob_support_max_share,
                      anchor_strength=clob_anchor_strength,
                      anchor_threshold_bps=clob_anchor_threshold_bps)
 
@@ -634,11 +753,15 @@ class Simulator:
                 AMMProvider(cpmm, env,
                             phi1=0.45, phi2=1.6, phi3=0.8,
                             core_liquidity_ratio=0.45,
-                            stabilizing_bias=0.01),
+                            stabilizing_bias=0.01,
+                            wallet_cash_buffer_ratio=amm_lp_wallet_cash_buffer_ratio,
+                            wallet_base_buffer_ratio=amm_lp_wallet_base_buffer_ratio),
                 AMMProvider(hfmm, env,
                             phi1=0.55, phi2=1.0, phi3=0.5,
                             core_liquidity_ratio=0.75,
-                            stabilizing_bias=0.03),
+                            stabilizing_bias=0.03,
+                            wallet_cash_buffer_ratio=amm_lp_wallet_cash_buffer_ratio,
+                            wallet_base_buffer_ratio=amm_lp_wallet_base_buffer_ratio),
             ]
             arb = AMMArbitrageur(
                 clob,
@@ -646,6 +769,8 @@ class Simulator:
                 env=env,
                 max_correction_pct=arb_max_correction_pct,
                 trade_fraction_cap=arb_trade_fraction_cap,
+                cash_buffer_ratio=amm_arb_cash_buffer_ratio,
+                asset_buffer_ratio=amm_arb_base_buffer_ratio,
             )
 
         if not shadow_clob:
@@ -658,31 +783,49 @@ class Simulator:
                 for pool in amm_pools.values()
             )
             if aggregate_amm_depth > 0:
-                exchange.set_background_depth_target(ref_mid, aggregate_amm_depth)
+                exchange.set_background_depth_target(
+                    ref_mid,
+                    aggregate_amm_depth,
+                    respect_trader_cap=False,
+                )
 
         # ── CLOB book agents (diverse limit-order providers) ─────
+        def _set_risk_limits(trader, cash_borrow: float, short_assets: float):
+            trader.max_cash_borrow = max(0.0, float(cash_borrow))
+            trader.max_short_assets = max(0.0, float(short_assets))
+
+        def _set_risk_policy(trader):
+            trader.maintenance_margin_ratio = max(0.0, float(maintenance_margin_ratio))
+            trader.liquidation_fraction = max(0.0, min(1.0, float(liquidation_fraction)))
+            trader.borrow_spread_multiplier = max(0.0, float(borrow_spread_multiplier))
+            trader.short_borrow_spread_multiplier = max(0.0, float(short_borrow_spread_multiplier))
+
         book_agents = [Random(exchange, cash=1e4, env=env)
                        for _ in range(eff_n_noise)]
         for _ in range(eff_n_fast_lp):
-            book_agents.append(FastRecyclerLP(exchange, cash=1e4, env=env))
+            book_agents.append(FastRecyclerLP(exchange, cash=2e4, env=env))
         for _ in range(eff_n_latent_lp):
-            book_agents.append(LatentLP(exchange, cash=1e4, env=env))
+            book_agents.append(LatentLP(exchange, cash=2e4, env=env))
         for _ in range(n_clob_fund):
             book_agents.append(Fundamentalist(exchange, cash=1e4, access=1, env=env))
         for _ in range(n_clob_chart):
             book_agents.append(Chartist(exchange, cash=1e4, env=env))
         for _ in range(n_clob_univ):
             book_agents.append(Universalist(exchange, cash=1e4, access=1, env=env))
+        for agent in book_agents:
+            _set_risk_limits(agent, cash_borrow=2.5e4, short_assets=75.0)
+            _set_risk_policy(agent)
 
         # ── Market Makers ────────────────────────────────────────────
         mm = None
         for i in range(n_mm):
-            _mm = MarketMaker(exchange, cash=1e4, env=env,
+            _mm = MarketMaker(exchange, cash=7e4, env=env,
                               amm_pools=amm_pools,
-                              alpha0=1.5 + i * 0.3,
-                              alpha1=300.0, alpha2=500.0,
-                              d0=max(5.0, eff_d0 - i * 5.0),
-                              d1=750.0, d2=500.0, d_min=3.0,
+                              alpha0=mm_alpha0_base + i * mm_alpha0_step,
+                              alpha1=mm_alpha1, alpha2=mm_alpha2,
+                              alpha3=mm_alpha3,
+                              d0=max(5.0, mm_d0_base * clob_liq - i * mm_d0_step),
+                              d1=mm_d1, d2=mm_d2, d3=mm_d3, d_min=3.0,
                               n_levels=5,
                               venue_interaction_mode=clob_amm_interaction,
                               amm_spread_impact_bps=clob_amm_spread_impact_bps,
@@ -692,6 +835,8 @@ class Simulator:
                               loss_threshold_bps=mm_loss_threshold_bps,
                               min_withdraw_ticks=mm_min_withdraw_ticks,
                               reentry_ticks=mm_reentry_ticks)
+            _set_risk_limits(_mm, cash_borrow=8.0e4, short_assets=250.0)
+            _set_risk_policy(_mm)
             if mm is None:
                 mm = _mm           # first MM → self.mm (step 2)
             else:
@@ -700,7 +845,7 @@ class Simulator:
         # ── Liquidity takers with venue routing ─────────────────────
         fx_traders: List = []
         for _ in range(n_fx_takers):
-            fx_traders.append(Random(
+            trader = Random(
                 exchange, cash=1e4,
                 clob=clob, amm_pools=amm_pools, env=env,
                 amm_share_pct=amm_share_pct,
@@ -708,10 +853,14 @@ class Simulator:
                 deterministic_venue=deterministic,
                 beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
                 cost_noise_std=cost_noise_std,
-                trade_prob=0.3, q_min=1, q_max=5, label='Noise',
-            ))
+                trade_prob=0.28, q_min=1, q_max=4, label='Hedger',
+                flow_role='Hedger', flow_persistence=hedger_flow_persistence, session_sensitivity=0.8,
+            )
+            _set_risk_limits(trader, cash_borrow=5.0e3, short_assets=12.0)
+            _set_risk_policy(trader)
+            fx_traders.append(trader)
         for _ in range(n_fx_fund):
-            fx_traders.append(Fundamentalist(
+            trader = Fundamentalist(
                 exchange, cash=1e4,
                 clob=clob, amm_pools=amm_pools, env=env,
                 amm_share_pct=amm_share_pct,
@@ -720,9 +869,13 @@ class Simulator:
                 beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
                 cost_noise_std=cost_noise_std,
                 fundamental_rate=price, fx_gamma=5e-3, fx_q_max=10,
-            ))
+                flow_role='LeveragedDirectional',
+            )
+            _set_risk_limits(trader, cash_borrow=7.5e3, short_assets=20.0)
+            _set_risk_policy(trader)
+            fx_traders.append(trader)
         for _ in range(n_retail):
-            fx_traders.append(Random(
+            trader = Random(
                 exchange, cash=1e4,
                 clob=clob, amm_pools=amm_pools, env=env,
                 amm_share_pct=amm_share_pct,
@@ -730,10 +883,14 @@ class Simulator:
                 deterministic_venue=deterministic,
                 beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
                 cost_noise_std=cost_noise_std,
-                trade_prob=0.4, q_min=1, q_max=2, label='Retail',
-            ))
+                trade_prob=0.42, q_min=1, q_max=2, label='RetailToxic',
+                flow_role='RetailToxic', flow_persistence=retail_flow_persistence, session_sensitivity=1.1,
+            )
+            _set_risk_limits(trader, cash_borrow=2.5e3, short_assets=6.0)
+            _set_risk_policy(trader)
+            fx_traders.append(trader)
         for _ in range(n_institutional):
-            fx_traders.append(Random(
+            trader = Random(
                 exchange, cash=5e4,
                 clob=clob, amm_pools=amm_pools, env=env,
                 amm_share_pct=amm_share_pct,
@@ -741,8 +898,12 @@ class Simulator:
                 deterministic_venue=deterministic,
                 beta_amm=beta_amm, cpmm_bias_bps=cpmm_bias_bps,
                 cost_noise_std=cost_noise_std,
-                trade_prob=0.15, q_min=15, q_max=50, label='Institutional',
-            ))
+                trade_prob=0.14, q_min=15, q_max=50, label='RealMoney',
+                flow_role='RealMoney', flow_persistence=institutional_flow_persistence, session_sensitivity=1.15,
+            )
+            _set_risk_limits(trader, cash_borrow=3.0e4, short_assets=120.0)
+            _set_risk_policy(trader)
+            fx_traders.append(trader)
 
         # Logger
         logger = MetricsLogger(

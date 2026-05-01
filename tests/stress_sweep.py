@@ -77,6 +77,10 @@ Stress Sweep — Simulation + Analysis (unified)
 import sys, os, random, math, re, glob, warnings, argparse
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from typing import Optional
 from itertools import chain as _chain
 
 warnings.filterwarnings('ignore')
@@ -92,6 +96,13 @@ from AgentBasedModel.venues.clob import CLOBVenue, ShadowCLOB
 from AgentBasedModel.venues.amm import CPMMPool, HFMMPool
 from AgentBasedModel.environment.processes import MarketEnvironment
 from AgentBasedModel.metrics.logger import MetricsLogger
+from main import (
+    build_parser as main_build_parser,
+    _apply_preset_defaults as main_apply_preset_defaults,
+    build_sim as main_build_sim,
+    _seed_all as main_seed_all,
+    _shock_metric_snapshot as main_shock_metric_snapshot,
+)
 
 # ======================================================================
 #  Constants
@@ -105,6 +116,50 @@ DEPTH       = 1000        # comparable CLOB volume & AMM reserves per pool
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), '..', 'output', 'stress')
 os.makedirs(OUT_DIR, exist_ok=True)
+
+CONSISTENT_OUT_DIR = os.path.join(OUT_DIR, 'consistent')
+os.makedirs(CONSISTENT_OUT_DIR, exist_ok=True)
+
+CONSISTENT_Q = 10.0
+CONSISTENT_MAX_AGENT = 5
+CONSISTENT_DEFAULT_SHORTLIST = 12
+CONSISTENT_DEFAULT_HYBRID_PRESETS = (
+    'mm_withdrawal',
+    'flash_crash',
+)
+CONSISTENT_DEFAULT_HFMM_A_GRID = (5.0, 10.0, 25.0, 50.0)
+CONSISTENT_DEFAULT_HFMM_FEE_GRID = (0.0005, 0.0010, 0.0015)
+CONSISTENT_DEFAULT_HFMM_RESERVE_GRID = (500.0, 1000.0, 1500.0)
+
+CONSISTENT_STAGE1_WEIGHTS = {
+    'realized_cost_med': 2.0,
+    'quoted_cost_q_med': 2.0,
+    'spread_tail_mean': 1.5,
+    'fill_rate': 2.0,
+    'depth_tail_mean': 2.0,
+    'systemic_liquidity_tail_mean': 1.0,
+}
+CONSISTENT_STAGE2_WEIGHTS = {
+    'realized_cost_med': 1.0,
+    'post_cost_med': 3.0,
+    'spread_ratio': 2.0,
+    'system_recovery_ticks': 3.0,
+    'fill_rate': 1.0,
+    'depth_tail_mean': 1.0,
+    'depth_ratio': 2.0,
+}
+CONSISTENT_HYBRID_WEIGHTS = {
+    'realized_cost_med': 1.0,
+    'post_cost_med': 3.0,
+    'spread_ratio': 2.5,
+    'system_recovery_ticks': 3.0,
+    'avg_basis_bps_0_20': 2.0,
+    'fill_rate': 1.0,
+    'depth_ratio': 2.0,
+    'shock_systemic_liquidity': 1.5,
+}
+
+_CONSISTENT_MAIN_PARSER = main_build_parser(default_venue_choice_rule='liquidity_aware')
 
 
 # ######################################################################
@@ -799,6 +854,682 @@ def _recovery_summary(rec_series, label):
         print(f'    {label}:  no data')
 
 
+# -- Consistent sweep on the main simulator ----------------------------
+
+def _finite_values(values):
+    return [float(v) for v in values if math.isfinite(v)]
+
+
+def _median_from(values):
+    clean = _finite_values(values)
+    return float(np.median(clean)) if clean else float('nan')
+
+
+def _mean_from(values):
+    clean = _finite_values(values)
+    return float(np.mean(clean)) if clean else float('nan')
+
+
+def _tail_slice(values, tail=100):
+    return values[-tail:] if len(values) > tail else values
+
+
+def _trade_frame_from_logger(sim):
+    df = pd.DataFrame(sim.logger.trade_log)
+    if df.empty:
+        return pd.DataFrame(columns=['t', 'venue', 'cost_bps', 'quantity'])
+    for col in ['t', 'venue', 'cost_bps', 'quantity']:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df
+
+
+def _median_trade_cost(df, start_t=None, end_t=None, venue=None):
+    if df.empty:
+        return float('nan')
+    sub = df
+    if start_t is not None:
+        sub = sub[sub['t'] >= start_t]
+    if end_t is not None:
+        sub = sub[sub['t'] < end_t]
+    if venue == 'amm':
+        sub = sub[sub['venue'] != 'clob']
+    elif venue is not None:
+        sub = sub[sub['venue'] == venue]
+    sub = sub[np.isfinite(sub['cost_bps'])]
+    return float(sub['cost_bps'].median()) if len(sub) else float('nan')
+
+
+def _fill_rate(df, venue=None):
+    if df.empty:
+        return float('nan')
+    sub = df
+    if venue == 'amm':
+        sub = sub[sub['venue'] != 'clob']
+    elif venue is not None:
+        sub = sub[sub['venue'] == venue]
+    if len(sub) == 0:
+        return float('nan')
+    return 100.0 * float(np.isfinite(sub['cost_bps']).mean())
+
+
+def _average_actual_amm_share(sim):
+    logger = sim.logger
+    if not sim.amm_pools or not logger.iterations:
+        return 0.0
+    amm_share = []
+    for idx in range(len(logger.iterations)):
+        total = 0.0
+        amm = 0.0
+        for venue, volume in logger.flow_volume.items():
+            if idx >= len(volume):
+                continue
+            val = float(volume[idx])
+            total += val
+            if venue != 'clob':
+                amm += val
+        amm_share.append(100.0 * amm / total if total > 0 else 0.0)
+    return _mean_from(amm_share)
+
+
+def _composite_rank(df, *, lower_better, higher_better, weights=None):
+    ranked = df.copy()
+    rank_cols = []
+    weight_map = weights or {}
+    for col in lower_better:
+        rank_col = f'rank_{col}'
+        ranked[rank_col] = ranked[col].rank(method='average', ascending=True, na_option='bottom')
+        rank_cols.append(rank_col)
+    for col in higher_better:
+        rank_col = f'rank_{col}'
+        ranked[rank_col] = ranked[col].rank(method='average', ascending=False, na_option='bottom')
+        rank_cols.append(rank_col)
+    total_weight = 0.0
+    weighted_sum = 0.0
+    for rank_col in rank_cols:
+        metric = rank_col.replace('rank_', '', 1)
+        weight = float(weight_map.get(metric, 1.0))
+        weighted_sum = weighted_sum + ranked[rank_col] * weight
+        total_weight += weight
+        ranked[f'weight_{metric}'] = weight
+    ranked['composite_rank'] = weighted_sum / total_weight if total_weight > 0 else ranked[rank_cols].mean(axis=1)
+    ranked['composite_weight_total'] = total_weight
+    return ranked.sort_values(['composite_rank', lower_better[0]])
+
+
+def _amm_overrides(hfmm_A, hfmm_fee, hfmm_reserves):
+    return {
+        'hfmm_A': float(hfmm_A),
+        'hfmm_fee': float(hfmm_fee),
+        'hfmm_reserves': float(hfmm_reserves),
+    }
+
+
+def _consistent_clob_configs(limit=0):
+    configs = []
+    for n_mm in range(CONSISTENT_MAX_AGENT + 1):
+        for n_noise in range(CONSISTENT_MAX_AGENT + 1):
+            for n_fund in range(CONSISTENT_MAX_AGENT + 1):
+                for n_chart in range(CONSISTENT_MAX_AGENT + 1):
+                    for n_univ in range(CONSISTENT_MAX_AGENT + 1):
+                        configs.append({
+                            'n_mm': n_mm,
+                            'n_noise': n_noise,
+                            'n_clob_fund': n_fund,
+                            'n_clob_chart': n_chart,
+                            'n_clob_univ': n_univ,
+                            'config_id': (
+                                f'clob_mm{n_mm}_noise{n_noise}_fund{n_fund}'
+                                f'_chart{n_chart}_univ{n_univ}'
+                            ),
+                        })
+    return configs[:limit] if limit and limit > 0 else configs
+
+
+def _build_consistent_args(seed, *, preset, n_iter, overrides):
+    args = _CONSISTENT_MAIN_PARSER.parse_args([])
+    args.preset = preset
+    main_apply_preset_defaults(_CONSISTENT_MAIN_PARSER, args)
+    args.seed = seed
+    args.n_iter = n_iter
+    args.silent = True
+    args.no_plots = True
+    args.no_summary = True
+    args.comparison = False
+    args.venue_choice_rule = 'liquidity_aware'
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _run_consistent_sim(seed, *, preset, n_iter, overrides):
+    args = _build_consistent_args(seed, preset=preset, n_iter=n_iter, overrides=overrides)
+    main_seed_all(seed)
+    sim = main_build_sim(args)
+    sim.simulate(args.n_iter, silent=True)
+    return args, sim
+
+
+def _extract_consistent_baseline_metrics(sim):
+    logger = sim.logger
+    trades = _trade_frame_from_logger(sim)
+    depth_series = [d.get('total', float('nan')) for d in logger.clob_depth]
+    clob_cost_q = logger.cost_series('clob', CONSISTENT_Q)
+    return {
+        'fill_rate': _fill_rate(trades, venue='clob'),
+        'realized_cost_med': _median_trade_cost(trades, venue='clob'),
+        'quoted_cost_q_med': _median_from(_tail_slice(clob_cost_q)),
+        'spread_tail_mean': _mean_from(_tail_slice(logger.clob_qspr)),
+        'depth_tail_mean': _mean_from(_tail_slice(depth_series)),
+        'systemic_liquidity_tail_mean': _mean_from(_tail_slice(logger.systemic_liquidity_series)),
+    }
+
+
+def _safe_normalization_time(series, *, shock_iter, baseline,
+                             direction, rel_tol, abs_tol=0.0,
+                             window=5, horizon=100):
+    if not math.isfinite(baseline):
+        return float('nan')
+    end = min(len(series), shock_iter + horizon)
+    post = pd.Series(series[shock_iter:end], dtype='float64')
+    rolled = post.rolling(window, min_periods=window).median()
+    if direction == 'upper':
+        target = max(baseline * (1.0 + rel_tol), baseline + abs_tol)
+        hits = rolled[rolled <= target]
+    else:
+        target = baseline * (1.0 - rel_tol)
+        hits = rolled[rolled >= target]
+    if len(hits) == 0:
+        return float('inf')
+    return float(max(0, int(hits.index[0])))
+
+
+def _local_shock_snapshot(sim):
+    logger = sim.logger
+    shock_iter = getattr(sim, 'shock_iter', None)
+    if shock_iter is None:
+        return {}
+
+    n = len(logger.iterations)
+    pre_start = max(0, shock_iter - 30)
+    pre_end = min(n, shock_iter)
+    shock_end = min(n, shock_iter + 5)
+    post_start = min(n, shock_iter + 5)
+    post_end = min(n, shock_iter + 20)
+
+    depth_series = [d.get('total', float('nan')) for d in logger.clob_depth]
+    basis_series = logger.max_venue_basis_series()
+
+    pre_spread = _median_from(logger.clob_qspr[pre_start:pre_end])
+    shock_spread = _median_from(logger.clob_qspr[shock_iter:shock_end])
+    pre_depth = _median_from(depth_series[pre_start:pre_end])
+    shock_depth = _median_from(depth_series[shock_iter:shock_end])
+    shock_liq = _median_from(logger.systemic_liquidity_series[shock_iter:post_end])
+    max_basis = _mean_from(basis_series[shock_iter:post_end])
+
+    spread_ratio = float('nan')
+    if math.isfinite(pre_spread) and pre_spread > 0 and math.isfinite(shock_spread):
+        spread_ratio = shock_spread / pre_spread
+
+    depth_ratio = float('nan')
+    if math.isfinite(pre_depth) and pre_depth > 0 and math.isfinite(shock_depth):
+        depth_ratio = shock_depth / pre_depth
+
+    recovery_candidates = []
+    for series, direction, rel_tol, abs_tol in [
+        (logger.clob_qspr, 'upper', 0.50, 10.0),
+        (depth_series, 'lower', 0.25, 0.0),
+        (logger.systemic_liquidity_series, 'lower', 0.15, 0.0),
+        (basis_series, 'upper', 0.25, 5.0),
+    ]:
+        baseline = _median_from(series[pre_start:pre_end])
+        recovery_candidates.append(
+            _safe_normalization_time(
+                series,
+                shock_iter=shock_iter,
+                baseline=baseline,
+                direction=direction,
+                rel_tol=rel_tol,
+                abs_tol=abs_tol,
+            )
+        )
+
+    if any(val == float('inf') for val in recovery_candidates):
+        system_recovery = float('inf')
+    else:
+        system_recovery = max(_finite_values(recovery_candidates)) if _finite_values(recovery_candidates) else float('nan')
+
+    return {
+        'spread_ratio': spread_ratio,
+        'depth_ratio': depth_ratio,
+        'avg_basis_bps_0_20': max_basis,
+        'system_recovery_ticks': system_recovery,
+        'shock_spread_bps': shock_spread,
+        'shock_depth': shock_depth,
+        'shock_systemic_liquidity': shock_liq,
+    }
+
+
+def _extract_consistent_shock_metrics(sim):
+    logger = sim.logger
+    trades = _trade_frame_from_logger(sim)
+    shock_iter = getattr(sim, 'shock_iter', None)
+    try:
+        snapshot = main_shock_metric_snapshot(sim) or {}
+    except TypeError:
+        snapshot = _local_shock_snapshot(sim)
+    depth_series = [d.get('total', float('nan')) for d in logger.clob_depth]
+    return {
+        'fill_rate': _fill_rate(trades),
+        'clob_fill_rate': _fill_rate(trades, venue='clob'),
+        'amm_fill_rate': _fill_rate(trades, venue='amm'),
+        'realized_cost_med': _median_trade_cost(trades),
+        'post_cost_med': _median_trade_cost(trades, start_t=shock_iter),
+        'post_clob_cost_med': _median_trade_cost(trades, start_t=shock_iter, venue='clob'),
+        'post_amm_cost_med': _median_trade_cost(trades, start_t=shock_iter, venue='amm'),
+        'spread_tail_mean': _mean_from(_tail_slice(logger.clob_qspr)),
+        'depth_tail_mean': _mean_from(_tail_slice(depth_series)),
+        'actual_amm_share_pct': _average_actual_amm_share(sim),
+        'spread_ratio': snapshot.get('spread_ratio', float('nan')),
+        'depth_ratio': snapshot.get('depth_ratio', float('nan')),
+        'avg_basis_bps_0_20': snapshot.get('avg_basis_bps_0_20', float('nan')),
+        'system_recovery_ticks': snapshot.get('system_recovery_ticks', float('nan')),
+        'shock_spread_bps': snapshot.get('shock_spread_bps', float('nan')),
+        'shock_depth': snapshot.get('shock_depth', float('nan')),
+        'shock_systemic_liquidity': snapshot.get('shock_systemic_liquidity', float('nan')),
+    }
+
+
+def _aggregate_consistent_rows(rows, group_cols):
+    df = pd.DataFrame(rows)
+    value_cols = [col for col in df.columns if col not in set(group_cols) | {'seed'}]
+    agg = df.groupby(group_cols, dropna=False)[value_cols].mean().reset_index()
+    agg['n_seeds'] = df.groupby(group_cols, dropna=False).size().values
+    return agg
+
+
+def _clob_overrides_from_config(config, *, enable_amm, amm_share_pct):
+    return {
+        'enable_amm': 1 if enable_amm else 0,
+        'amm_share_pct': float(amm_share_pct),
+        'n_mm': int(config['n_mm']),
+        'enable_clob_mm': 1,
+        'n_noise': int(config['n_noise']),
+        'n_clob_fund': int(config['n_clob_fund']),
+        'n_clob_chart': int(config['n_clob_chart']),
+        'n_clob_univ': int(config['n_clob_univ']),
+    }
+
+
+def run_consistent_clob_selection(*, seeds, base_seed, n_iter,
+                                  shock_preset, shortlist,
+                                  stage1_limit=0):
+    _section('CONSISTENT BLOCK A -- Main-model CLOB selection')
+    configs = _consistent_clob_configs(limit=stage1_limit)
+    print(f'  Stage 1 configs: {len(configs)}  |  Stage 2 shortlist: {shortlist}')
+    print(f'  Shock preset for final ranking: {shock_preset}')
+
+    stage1_rows = []
+    for idx, config in enumerate(configs, 1):
+        if idx % 25 == 0 or idx == 1 or idx == len(configs):
+            print(f'    Stage 1 progress: {idx}/{len(configs)}', flush=True)
+        _args, sim = _run_consistent_sim(
+            base_seed,
+            preset='baseline',
+            n_iter=n_iter,
+            overrides=_clob_overrides_from_config(config, enable_amm=False, amm_share_pct=0),
+        )
+        metrics = _extract_consistent_baseline_metrics(sim)
+        stage1_rows.append({**config, **metrics})
+
+    stage1_df = _composite_rank(
+        pd.DataFrame(stage1_rows),
+        lower_better=['realized_cost_med', 'quoted_cost_q_med', 'spread_tail_mean'],
+        higher_better=['fill_rate', 'depth_tail_mean', 'systemic_liquidity_tail_mean'],
+        weights=CONSISTENT_STAGE1_WEIGHTS,
+    )
+    stage1_path = os.path.join(CONSISTENT_OUT_DIR, 'clob_stage1_baseline.csv')
+    stage1_df.to_csv(stage1_path, index=False)
+
+    shortlisted = stage1_df.head(shortlist).to_dict('records')
+    stage2_rows = []
+    for idx, config in enumerate(shortlisted, 1):
+        print(f'    Stage 2 config {idx}/{len(shortlisted)}: {config["config_id"]}', flush=True)
+        for seed in range(base_seed, base_seed + seeds):
+            _args, sim = _run_consistent_sim(
+                seed,
+                preset=shock_preset,
+                n_iter=n_iter,
+                overrides=_clob_overrides_from_config(config, enable_amm=False, amm_share_pct=0),
+            )
+            metrics = _extract_consistent_shock_metrics(sim)
+            stage2_rows.append({**config, 'seed': seed, **metrics})
+
+    stage2_df = _aggregate_consistent_rows(
+        stage2_rows,
+        ['config_id', 'n_mm', 'n_noise', 'n_clob_fund', 'n_clob_chart', 'n_clob_univ'],
+    )
+    stage2_df = _composite_rank(
+        stage2_df,
+        lower_better=['realized_cost_med', 'post_cost_med', 'spread_ratio', 'system_recovery_ticks'],
+        higher_better=['fill_rate', 'depth_tail_mean', 'depth_ratio'],
+        weights=CONSISTENT_STAGE2_WEIGHTS,
+    )
+    stage2_path = os.path.join(CONSISTENT_OUT_DIR, 'clob_stage2_shock.csv')
+    stage2_df.to_csv(stage2_path, index=False)
+
+    winner = stage2_df.iloc[0].to_dict()
+    winner_path = os.path.join(CONSISTENT_OUT_DIR, 'best_clob_config.csv')
+    pd.DataFrame([winner]).to_csv(winner_path, index=False)
+
+    print('\n  Best CLOB config for extrapolation into the main model:')
+    print(f'    {winner["config_id"]}')
+    print(f'    MM={int(winner["n_mm"])} Noise={int(winner["n_noise"])} '
+          f'Fund={int(winner["n_clob_fund"])} Chart={int(winner["n_clob_chart"])} '
+          f'Univ={int(winner["n_clob_univ"])}')
+    print(f'    composite_rank={winner["composite_rank"]:.2f}  '
+          f'post_cost_med={winner["post_cost_med"]:.2f}  '
+          f'recovery={winner["system_recovery_ticks"]:.1f}')
+    print(f'  Saved: {stage1_path}')
+    print(f'  Saved: {stage2_path}')
+    print(f'  Saved: {winner_path}')
+    return winner, stage1_df, stage2_df
+
+
+def run_consistent_hybrid_shock_sweep(best_clob, *, seeds, base_seed, n_iter,
+                                      shock_presets, amm_share_grid,
+                                      hfmm_A_grid, hfmm_fee_grid,
+                                      hfmm_reserve_grid):
+    _section('CONSISTENT BLOCK D -- Hybrid shock sweep on main model')
+    print(f'  Using best CLOB: {best_clob["config_id"]}')
+    print(f'  Shock presets: {", ".join(shock_presets)}')
+    print(f'  AMM share grid: {amm_share_grid}')
+    print(f'  HFMM A grid: {list(hfmm_A_grid)}')
+    print(f'  HFMM fee grid: {list(hfmm_fee_grid)}')
+    print(f'  HFMM reserve grid: {list(hfmm_reserve_grid)}')
+
+    rows = []
+    base_config = {
+        'n_mm': int(best_clob['n_mm']),
+        'n_noise': int(best_clob['n_noise']),
+        'n_clob_fund': int(best_clob['n_clob_fund']),
+        'n_clob_chart': int(best_clob['n_clob_chart']),
+        'n_clob_univ': int(best_clob['n_clob_univ']),
+        'config_id': best_clob['config_id'],
+    }
+
+    total = len(shock_presets) * len(amm_share_grid) * len(hfmm_A_grid) * len(hfmm_fee_grid) * len(hfmm_reserve_grid)
+    done = 0
+    for preset in shock_presets:
+        for amm_pct in amm_share_grid:
+            for hfmm_A in hfmm_A_grid:
+                for hfmm_fee in hfmm_fee_grid:
+                    for hfmm_reserves in hfmm_reserve_grid:
+                        done += 1
+                        print(
+                            f'    Hybrid progress: {done}/{total}  preset={preset} amm={amm_pct}% '
+                            f'A={hfmm_A:g} fee={hfmm_fee:.4f} R={hfmm_reserves:.0f}',
+                            flush=True,
+                        )
+                        overrides = _clob_overrides_from_config(base_config, enable_amm=True, amm_share_pct=amm_pct)
+                        overrides.update(_amm_overrides(hfmm_A, hfmm_fee, hfmm_reserves))
+                        for seed in range(base_seed, base_seed + seeds):
+                            _args, sim = _run_consistent_sim(
+                                seed,
+                                preset=preset,
+                                n_iter=n_iter,
+                                overrides=overrides,
+                            )
+                            metrics = _extract_consistent_shock_metrics(sim)
+                            rows.append({
+                                'preset': preset,
+                                'amm_share_pct': amm_pct,
+                                'hfmm_A': float(hfmm_A),
+                                'hfmm_fee': float(hfmm_fee),
+                                'hfmm_reserves': float(hfmm_reserves),
+                                'seed': seed,
+                                **base_config,
+                                **metrics,
+                            })
+
+    detail_df = pd.DataFrame(rows)
+    detail_path = os.path.join(CONSISTENT_OUT_DIR, 'hybrid_shock_sweep_detail.csv')
+    detail_df.to_csv(detail_path, index=False)
+
+    summary_df = _aggregate_consistent_rows(
+        rows,
+        ['preset', 'amm_share_pct', 'hfmm_A', 'hfmm_fee', 'hfmm_reserves',
+         'config_id', 'n_mm', 'n_noise', 'n_clob_fund', 'n_clob_chart', 'n_clob_univ'],
+    )
+    ranked_parts = []
+    for preset, sub in summary_df.groupby('preset', sort=False):
+        ranked = _composite_rank(
+            sub,
+            lower_better=['realized_cost_med', 'post_cost_med', 'spread_ratio', 'system_recovery_ticks', 'avg_basis_bps_0_20'],
+            higher_better=['fill_rate', 'depth_ratio', 'shock_systemic_liquidity'],
+            weights=CONSISTENT_HYBRID_WEIGHTS,
+        )
+        ranked_parts.append(ranked)
+    ranked_df = pd.concat(ranked_parts, ignore_index=True)
+    summary_path = os.path.join(CONSISTENT_OUT_DIR, 'hybrid_shock_sweep_summary.csv')
+    ranked_df.to_csv(summary_path, index=False)
+
+    print('\n  Best hybrid configs by shock preset:')
+    for preset, sub in ranked_df.groupby('preset', sort=False):
+        best = sub.iloc[0]
+        print(
+            f'    {preset}: amm_share={int(best["amm_share_pct"])}%  '
+            f'A={best["hfmm_A"]:.0f}  fee={best["hfmm_fee"] * 10_000:.0f}bps  '
+            f'R={best["hfmm_reserves"]:.0f}  '
+            f'cost={best["post_cost_med"]:.2f}  '
+            f'spread_ratio={best["spread_ratio"]:.2f}  '
+            f'recovery={best["system_recovery_ticks"]:.1f}  '
+            f'score={best["composite_rank"]:.2f}'
+        )
+    print(f'  Saved: {detail_path}')
+    print(f'  Saved: {summary_path}')
+    return detail_df, ranked_df
+
+
+def run_consistent_sweep(args):
+    shock_presets = tuple(args.consistent_hybrid_presets) if args.consistent_hybrid_presets else CONSISTENT_DEFAULT_HYBRID_PRESETS
+    active_shock_presets = {args.consistent_clob_shock_preset, *shock_presets}
+    if args.consistent_n_iter <= SHOCK_ITER + 20 and any(preset != 'baseline' for preset in active_shock_presets):
+        print(
+            f'Warning: consistent_n_iter={args.consistent_n_iter} ends before the shock window is fully observed; '
+            'stability and recovery rankings may contain NaN values.',
+            flush=True,
+        )
+    winner, _stage1, _stage2 = run_consistent_clob_selection(
+        seeds=args.consistent_seeds,
+        base_seed=args.consistent_base_seed,
+        n_iter=args.consistent_n_iter,
+        shock_preset=args.consistent_clob_shock_preset,
+        shortlist=args.consistent_shortlist,
+        stage1_limit=args.consistent_stage1_limit,
+    )
+    run_consistent_hybrid_shock_sweep(
+        winner,
+        seeds=args.consistent_seeds,
+        base_seed=args.consistent_base_seed,
+        n_iter=args.consistent_n_iter,
+        shock_presets=shock_presets,
+        amm_share_grid=AMM_SHARE_GRID,
+        hfmm_A_grid=args.consistent_hfmm_A_grid,
+        hfmm_fee_grid=args.consistent_hfmm_fee_grid,
+        hfmm_reserve_grid=args.consistent_hfmm_reserve_grid,
+    )
+
+
+def _safe_series(values, fallback=0.0):
+    out = []
+    for v in values:
+        out.append(float(v) if (v is not None and math.isfinite(v)) else fallback)
+    return out
+
+
+def _rolling_corr(x, y, window):
+    sx = pd.Series(x, dtype='float64')
+    sy = pd.Series(y, dtype='float64')
+    return sx.rolling(window=window, min_periods=window).corr(sy).tolist()
+
+
+def _load_best_clob_for_spillover() -> Optional[dict]:
+    path = os.path.join(CONSISTENT_OUT_DIR, 'best_clob_config.csv')
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    row = df.iloc[0]
+    try:
+        return {
+            'n_mm': int(row.get('n_mm', 2)),
+            'n_noise': int(row.get('n_noise', 12)),
+            'n_clob_fund': int(row.get('n_clob_fund', 2)),
+            'n_clob_chart': int(row.get('n_clob_chart', 0)),
+            'n_clob_univ': int(row.get('n_clob_univ', 1)),
+            'config_id': str(row.get('config_id', 'unknown')),
+        }
+    except Exception:
+        return None
+
+
+def run_spillover_visualization(args):
+    _section('CONSISTENT SPILLOVER VISUALIZATION')
+
+    overrides = {
+        'enable_amm': 1,
+        'amm_share_pct': float(args.spillover_amm_share),
+        'hfmm_A': float(args.spillover_hfmm_A),
+        'hfmm_fee': float(args.spillover_hfmm_fee),
+        'hfmm_reserves': float(args.spillover_hfmm_reserves),
+    }
+
+    picked = 'defaults'
+    if args.spillover_use_best_clob:
+        best = _load_best_clob_for_spillover()
+        if best is not None:
+            overrides.update({
+                'n_mm': best['n_mm'],
+                'n_noise': best['n_noise'],
+                'n_clob_fund': best['n_clob_fund'],
+                'n_clob_chart': best['n_clob_chart'],
+                'n_clob_univ': best['n_clob_univ'],
+                'enable_clob_mm': 1,
+            })
+            picked = best.get('config_id', 'best_clob_config.csv')
+
+    _cfg_args, sim = _run_consistent_sim(
+        args.spillover_seed,
+        preset=args.spillover_preset,
+        n_iter=args.spillover_n_iter,
+        overrides=overrides,
+    )
+
+    logger = sim.logger
+    lag = max(1, int(args.spillover_lag))
+    window = max(5, int(args.spillover_roll_window))
+    split_at = getattr(sim, 'shock_iter', None)
+
+    clob_depth = logger.clob_total_depth_series()
+    amm_depth = logger.amm_total_depth_series()
+    d_clob = logger._log_diff(clob_depth)
+    d_amm = logger._log_diff(amm_depth)
+    roll_corr = _rolling_corr(d_clob, d_amm, window)
+
+    spill = logger.liquidity_spillover_metrics(lag=lag, split_at=split_at)
+
+    pre_end = min(len(clob_depth), split_at) if split_at is not None else len(clob_depth)
+    pre_clob = [x for x in clob_depth[:pre_end] if math.isfinite(x)]
+    pre_amm = [x for x in amm_depth[:pre_end] if math.isfinite(x)]
+    base_clob = (sum(pre_clob) / len(pre_clob)) if pre_clob else 1.0
+    base_amm = (sum(pre_amm) / len(pre_amm)) if pre_amm else 1.0
+    clob_idx = [x / base_clob if math.isfinite(x) and base_clob > 0 else float('nan') for x in clob_depth]
+    amm_idx = [x / base_amm if math.isfinite(x) and base_amm > 0 else float('nan') for x in amm_depth]
+
+    df = pd.DataFrame({
+        't': list(range(len(clob_depth))),
+        'clob_depth_total': _safe_series(clob_depth, fallback=float('nan')),
+        'amm_depth_total': _safe_series(amm_depth, fallback=float('nan')),
+        'clob_depth_index': _safe_series(clob_idx, fallback=float('nan')),
+        'amm_depth_index': _safe_series(amm_idx, fallback=float('nan')),
+    })
+    if len(d_clob):
+        df_d = pd.DataFrame({
+            't': list(range(1, len(clob_depth))),
+            'dlog_clob_depth': _safe_series(d_clob, fallback=float('nan')),
+            'dlog_amm_depth': _safe_series(d_amm, fallback=float('nan')),
+            f'rolling_corr_w{window}': _safe_series(roll_corr, fallback=float('nan')),
+        })
+        df = df.merge(df_d, on='t', how='left')
+
+    csv_path = os.path.join(CONSISTENT_OUT_DIR, f'spillover_{args.spillover_preset}_seed{args.spillover_seed}.csv')
+    df.to_csv(csv_path, index=False)
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=False)
+
+    x0 = np.arange(len(clob_idx))
+    axes[0].plot(x0, clob_idx, label='CLOB depth index', color='#1f77b4', lw=2)
+    axes[0].plot(x0, amm_idx, label='AMM depth index', color='#2ca02c', lw=2)
+    if split_at is not None:
+        axes[0].axvline(split_at, color='#d62728', ls='--', lw=1.5, label='shock')
+    axes[0].set_title('Liquidity Levels: CLOB vs AMM (indexed to pre-shock mean)')
+    axes[0].set_ylabel('Index')
+    axes[0].grid(alpha=0.3)
+    axes[0].legend(loc='upper right', fontsize=9)
+
+    x1 = np.arange(1, len(clob_depth))
+    axes[1].plot(x1, _safe_series(roll_corr, fallback=float('nan')), color='#9467bd', lw=2)
+    axes[1].axhline(0.0, color='#333333', ls=':', lw=1.0)
+    if split_at is not None:
+        axes[1].axvline(split_at, color='#d62728', ls='--', lw=1.5)
+    axes[1].set_title(f'Rolling correlation of liquidity changes (window={window})')
+    axes[1].set_ylabel('corr')
+    axes[1].grid(alpha=0.3)
+
+    labels = ['AMM->CLOB', 'CLOB->AMM']
+    full_betas = [spill['amm_to_clob'].get('beta', float('nan')), spill['clob_to_amm'].get('beta', float('nan'))]
+    before = spill.get('before_after', {}).get('before', {})
+    after = spill.get('before_after', {}).get('after', {})
+    before_betas = [before.get('amm_to_clob', {}).get('beta', float('nan')),
+                    before.get('clob_to_amm', {}).get('beta', float('nan'))]
+    after_betas = [after.get('amm_to_clob', {}).get('beta', float('nan')),
+                   after.get('clob_to_amm', {}).get('beta', float('nan'))]
+
+    pos = np.arange(len(labels))
+    wbar = 0.25
+    axes[2].bar(pos - wbar, full_betas, width=wbar, color='#1f77b4', label='full sample')
+    axes[2].bar(pos, before_betas, width=wbar, color='#ff7f0e', label='before')
+    axes[2].bar(pos + wbar, after_betas, width=wbar, color='#2ca02c', label='after')
+    axes[2].axhline(0.0, color='#333333', ls=':', lw=1.0)
+    axes[2].set_xticks(pos)
+    axes[2].set_xticklabels(labels)
+    axes[2].set_ylabel('beta')
+    axes[2].set_title(f'Directional spillovers (lag={lag})')
+    axes[2].grid(alpha=0.3)
+    axes[2].legend(loc='upper right', fontsize=9)
+
+    fig.suptitle(
+        f'Spillover diagnostics | preset={args.spillover_preset} seed={args.spillover_seed} '
+        f'| clob_cfg={picked}',
+        fontsize=12,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    png_path = os.path.join(CONSISTENT_OUT_DIR, f'spillover_{args.spillover_preset}_seed{args.spillover_seed}.png')
+    fig.savefig(png_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+
+    print(f'  spillover csv -> {csv_path}')
+    print(f'  spillover png -> {png_path}')
+    print(f'  avg flow shares: clob={spill.get("avg_flow_share_clob", float("nan")):.3f} '
+          f'amm={spill.get("avg_flow_share_amm", float("nan")):.3f}')
+
+
 # -- 1. Data overview --------------------------------------------------
 
 def report_overview(clob, amm):
@@ -1488,6 +2219,61 @@ def run_analysis():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Stress Sweep -- simulation + analysis')
+    parser.add_argument('--spillover-viz', action='store_true',
+                        help='Run one simulation and save spillover visual diagnostics (PNG + CSV)')
+    parser.add_argument('--spillover-preset', default='mm_withdrawal',
+                        choices=['baseline', 'mm_withdrawal', 'flash_crash', 'funding_liquidity_shock'],
+                        help='Scenario preset used for spillover visualization (default: mm_withdrawal)')
+    parser.add_argument('--spillover-seed', type=int, default=42,
+                        help='Seed for spillover visualization run (default: 42)')
+    parser.add_argument('--spillover-n-iter', type=int, default=900,
+                        help='Simulation length for spillover visualization (default: 900)')
+    parser.add_argument('--spillover-amm-share', type=float, default=30.0,
+                        help='Target AMM share in spillover visualization run (default: 30)')
+    parser.add_argument('--spillover-hfmm-A', type=float, default=25.0,
+                        help='HFMM amplification A in spillover visualization run (default: 25)')
+    parser.add_argument('--spillover-hfmm-fee', type=float, default=0.001,
+                        help='HFMM fee in spillover visualization run (default: 0.001)')
+    parser.add_argument('--spillover-hfmm-reserves', type=float, default=1000.0,
+                        help='HFMM reserves in spillover visualization run (default: 1000)')
+    parser.add_argument('--spillover-lag', type=int, default=1,
+                        help='Lag used in directional spillover regressions (default: 1)')
+    parser.add_argument('--spillover-roll-window', type=int, default=30,
+                        help='Rolling window for liquidity-change correlation (default: 30)')
+    parser.add_argument('--spillover-use-best-clob', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='Use best_clob_config.csv (if available) for spillover run (default: on)')
+    parser.add_argument('--consistent', action='store_true',
+                        help='Run the main-model consistent sweep instead of the legacy sandbox blocks')
+    parser.add_argument('--consistent-seeds', type=int, default=5,
+                        help='Sequential seed count for the consistent sweep (default: 5)')
+    parser.add_argument('--consistent-base-seed', type=int, default=42,
+                        help='First seed for the consistent sweep (default: 42)')
+    parser.add_argument('--consistent-n-iter', type=int, default=900,
+                        help='Simulation length for the consistent sweep (default: 900)')
+    parser.add_argument('--consistent-shortlist', type=int, default=CONSISTENT_DEFAULT_SHORTLIST,
+                        help='Top-K baseline CLOB configs re-evaluated under shock (default: 12)')
+    parser.add_argument('--consistent-stage1-limit', type=int, default=0,
+                        help='Optional cap on Stage-1 CLOB configs, useful for smoke tests (default: 0 = full grid)')
+    parser.add_argument('--consistent-clob-shock-preset', default='mm_withdrawal',
+                        choices=['baseline', 'mm_withdrawal', 'flash_crash', 'funding_liquidity_shock'],
+                        help='Shock preset used to rank shortlisted CLOB configs (default: mm_withdrawal)')
+    parser.add_argument('--consistent-hybrid-presets', nargs='*',
+                        default=list(CONSISTENT_DEFAULT_HYBRID_PRESETS),
+                        choices=['mm_withdrawal', 'flash_crash', 'funding_liquidity_shock'],
+                        help='Shock presets used for the CLOB+AMM sweep (default: mm_withdrawal flash_crash funding_liquidity_shock)')
+    parser.add_argument('--consistent-hfmm-A-grid', nargs='*', type=float,
+                        default=list(CONSISTENT_DEFAULT_HFMM_A_GRID),
+                        dest='consistent_hfmm_A_grid',
+                        help='HFMM amplification grid for the hybrid sweep (default: 5 10 25 50)')
+    parser.add_argument('--consistent-hfmm-fee-grid', nargs='*', type=float,
+                        default=list(CONSISTENT_DEFAULT_HFMM_FEE_GRID),
+                        dest='consistent_hfmm_fee_grid',
+                        help='HFMM fee grid for the hybrid sweep as fractions (default: 0.0005 0.0010 0.0015)')
+    parser.add_argument('--consistent-hfmm-reserve-grid', nargs='*', type=float,
+                        default=list(CONSISTENT_DEFAULT_HFMM_RESERVE_GRID),
+                        dest='consistent_hfmm_reserve_grid',
+                        help='HFMM reserve grid for the hybrid sweep (default: 500 1000 1500)')
     parser.add_argument('--analyze', action='store_true',
                         help='Skip simulation, run analysis only on existing CSVs')
     parser.add_argument('--block-c', action='store_true',
@@ -1496,7 +2282,11 @@ if __name__ == '__main__':
                         help='Run only Block D (multi-venue CLOB+AMM), then analyze all')
     args = parser.parse_args()
 
-    if args.block_c:
+    if args.spillover_viz:
+        run_spillover_visualization(args)
+    elif args.consistent:
+        run_consistent_sweep(args)
+    elif args.block_c:
         run_block_c()
     elif args.block_d:
         run_block_d()
@@ -1509,5 +2299,6 @@ if __name__ == '__main__':
         print('  Stress sweep complete.  Results -> output/stress/')
         print('=' * 70)
 
-    run_analysis()
+    if not args.consistent and not args.spillover_viz:
+        run_analysis()
     print('\nDone.')

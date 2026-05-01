@@ -13,6 +13,7 @@ Records per-iteration snapshots of:
 from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, List, Dict
 import math
+import numpy as np
 
 if TYPE_CHECKING:
     from AgentBasedModel.venues.clob import CLOBVenue
@@ -49,8 +50,10 @@ class MetricsLogger:
         self.sigma_series: List[float] = []
         self.c_series: List[float] = []
         self.regime_series: List[str] = []
+        self.session_series: List[str] = []
         self.systemic_liquidity_series: List[float] = []
         self.flow_imbalance_series: List[float] = []
+        self.clob_flow_imbalance_series: List[float] = []
 
         # Prices
         self.clob_mid_series: List[float] = []
@@ -142,8 +145,18 @@ class MetricsLogger:
         self.sigma_series.append(env.sigma)
         self.c_series.append(env.funding_cost)
         self.regime_series.append('stress' if env.is_stress() else 'normal')
+        self.session_series.append(getattr(env, 'session_name', 'Unknown'))
         self.systemic_liquidity_series.append(getattr(env, 'systemic_liquidity', 1.0))
-        self.flow_imbalance_series.append(getattr(env, 'order_flow_imbalance', 0.0))
+        self.flow_imbalance_series.append(
+            getattr(env, 'logged_order_flow_imbalance',
+                    getattr(env, 'order_flow_imbalance', 0.0))
+        )
+        self.clob_flow_imbalance_series.append(
+            getattr(env, 'logged_clob_order_flow_imbalance',
+                getattr(env, 'clob_order_flow_imbalance',
+                    getattr(env, 'logged_order_flow_imbalance',
+                        getattr(env, 'order_flow_imbalance', 0.0))))
+        )
 
         # CLOB basics
         try:
@@ -355,6 +368,252 @@ class MetricsLogger:
         s1 = self.cost_series(v1, Q)
         s2 = self.cost_series(v2, Q)
         return self.series_commonality_before_after(s1, s2, stress_start)
+
+    def clob_total_depth_series(self) -> List[float]:
+        """CLOB total depth time series within the logged near-mid band."""
+        out: List[float] = []
+        for row in self.clob_depth:
+            value = row.get('total', float('nan')) if isinstance(row, dict) else float('nan')
+            out.append(float(value) if math.isfinite(value) else float('nan'))
+        return out
+
+    def clob_touch_depth_series(self) -> List[float]:
+        """One-sided CLOB depth at the touch, proxied by min(best bid qty, best ask qty)."""
+        out: List[float] = []
+        for row in self.clob_depth:
+            if not isinstance(row, dict):
+                out.append(float('nan'))
+                continue
+            bid = float(row.get('bid', float('nan')))
+            ask = float(row.get('ask', float('nan')))
+            value = min(bid, ask) if math.isfinite(bid) and math.isfinite(ask) else float('nan')
+            out.append(value)
+        return out
+
+    def amm_total_depth_series(self) -> List[float]:
+        """Aggregate AMM effective depth across all pools per period."""
+        n = len(self.iterations)
+        if n == 0:
+            return []
+        if not self.amm_depth_series:
+            return [0.0 for _ in range(n)]
+
+        out: List[float] = []
+        for idx in range(n):
+            total = 0.0
+            has_finite = False
+            for series in self.amm_depth_series.values():
+                if idx >= len(series):
+                    continue
+                value = series[idx]
+                if math.isfinite(value):
+                    total += float(value)
+                    has_finite = True
+            out.append(total if has_finite else float('nan'))
+        return out
+
+    @staticmethod
+    def _log_diff(series: List[float], eps: float = 1e-9) -> List[float]:
+        """Finite log-difference transform for level series."""
+        if len(series) < 2:
+            return []
+        out: List[float] = []
+        for prev, curr in zip(series[:-1], series[1:]):
+            if not (math.isfinite(prev) and math.isfinite(curr)):
+                out.append(float('nan'))
+                continue
+            out.append(math.log(max(curr, eps)) - math.log(max(prev, eps)))
+        return out
+
+    @staticmethod
+    def _lag_regression(y: List[float], x: List[float], lag: int = 1) -> dict:
+        """
+        OLS with intercept: y_t = a + b x_{t-lag} + e_t.
+
+        Returns beta/alpha plus both classic t-stat and non-parametric
+        block-bootstrap confidence diagnostics.
+        """
+
+        def _bootstrap_beta_ci(xs_vals: List[float], ys_vals: List[float],
+                               n_boot: int = 400, block_size: int = 8) -> dict:
+            """Moving-block bootstrap for lag-regression beta without normality assumptions."""
+            n_vals = len(xs_vals)
+            if n_vals < 20:
+                return {
+                    'beta_boot_lo': float('nan'),
+                    'beta_boot_hi': float('nan'),
+                    'p_boot': float('nan'),
+                    'boot_n': 0,
+                }
+
+            block = max(2, min(int(block_size), n_vals))
+            n_blocks = int(math.ceil(n_vals / block))
+            # Deterministic seed to keep runs reproducible.
+            rng = np.random.default_rng(17_071 + n_vals * 31 + block * 7)
+
+            betas: List[float] = []
+            for _ in range(int(n_boot)):
+                starts = rng.integers(0, n_vals, size=n_blocks)
+                x_sample: List[float] = []
+                y_sample: List[float] = []
+
+                for start in starts:
+                    for shift in range(block):
+                        idx = int((start + shift) % n_vals)
+                        x_sample.append(xs_vals[idx])
+                        y_sample.append(ys_vals[idx])
+                        if len(x_sample) >= n_vals:
+                            break
+                    if len(x_sample) >= n_vals:
+                        break
+
+                m_x = sum(x_sample) / n_vals
+                m_y = sum(y_sample) / n_vals
+                s_xx = sum((xi - m_x) ** 2 for xi in x_sample)
+                if s_xx <= 0:
+                    continue
+                s_xy = sum((xi - m_x) * (yi - m_y) for xi, yi in zip(x_sample, y_sample))
+                b_hat = s_xy / s_xx
+                if math.isfinite(b_hat):
+                    betas.append(float(b_hat))
+
+            if len(betas) < max(50, int(n_boot) // 5):
+                return {
+                    'beta_boot_lo': float('nan'),
+                    'beta_boot_hi': float('nan'),
+                    'p_boot': float('nan'),
+                    'boot_n': len(betas),
+                }
+
+            beta_arr = np.array(betas, dtype='float64')
+            lo, hi = np.quantile(beta_arr, [0.025, 0.975])
+            p_pos = float(np.mean(beta_arr >= 0.0))
+            p_neg = float(np.mean(beta_arr <= 0.0))
+            p_boot = min(1.0, 2.0 * min(p_pos, p_neg))
+
+            return {
+                'beta_boot_lo': float(lo),
+                'beta_boot_hi': float(hi),
+                'p_boot': float(p_boot),
+                'boot_n': len(betas),
+            }
+
+        lag = max(1, int(lag))
+        if len(y) <= lag or len(x) <= lag:
+            return {
+                'alpha': float('nan'),
+                'beta': float('nan'),
+                't_beta': float('nan'),
+                'nobs': 0,
+                'beta_boot_lo': float('nan'),
+                'beta_boot_hi': float('nan'),
+                'p_boot': float('nan'),
+                'boot_n': 0,
+            }
+
+        ys = y[lag:]
+        xs = x[:-lag]
+        pairs = [(xi, yi) for xi, yi in zip(xs, ys) if math.isfinite(xi) and math.isfinite(yi)]
+        n = len(pairs)
+        if n < 3:
+            return {
+                'alpha': float('nan'),
+                'beta': float('nan'),
+                't_beta': float('nan'),
+                'nobs': n,
+                'beta_boot_lo': float('nan'),
+                'beta_boot_hi': float('nan'),
+                'p_boot': float('nan'),
+                'boot_n': 0,
+            }
+
+        xs_f, ys_f = zip(*pairs)
+        mx = sum(xs_f) / n
+        my = sum(ys_f) / n
+        sxx = sum((xi - mx) ** 2 for xi in xs_f)
+        if sxx <= 0:
+            return {
+                'alpha': float('nan'),
+                'beta': float('nan'),
+                't_beta': float('nan'),
+                'nobs': n,
+                'beta_boot_lo': float('nan'),
+                'beta_boot_hi': float('nan'),
+                'p_boot': float('nan'),
+                'boot_n': 0,
+            }
+
+        sxy = sum((xi - mx) * (yi - my) for xi, yi in pairs)
+        beta = sxy / sxx
+        alpha = my - beta * mx
+        boot = _bootstrap_beta_ci(list(xs_f), list(ys_f))
+
+        if n <= 2:
+            return {
+                'alpha': alpha,
+                'beta': beta,
+                't_beta': float('nan'),
+                'nobs': n,
+                **boot,
+            }
+
+        rss = sum((yi - (alpha + beta * xi)) ** 2 for xi, yi in pairs)
+        sigma2 = rss / max(1, n - 2)
+        se_beta = math.sqrt(sigma2 / sxx) if sxx > 0 else float('inf')
+        t_beta = beta / se_beta if se_beta > 0 and math.isfinite(se_beta) else float('nan')
+        return {
+            'alpha': alpha,
+            'beta': beta,
+            't_beta': t_beta,
+            'nobs': n,
+            **boot,
+        }
+
+    def liquidity_spillover_metrics(self, lag: int = 1,
+                                    split_at: Optional[int] = None) -> dict:
+        """
+        Directional spillovers between AMM and CLOB liquidity.
+
+        Uses log changes of aggregate AMM depth and CLOB near-mid depth.
+        """
+        clob_depth = self.clob_total_depth_series()
+        amm_depth = self.amm_total_depth_series()
+        d_clob = self._log_diff(clob_depth)
+        d_amm = self._log_diff(amm_depth)
+
+        out = {
+            'lag': max(1, int(lag)),
+            'n_points': min(len(d_clob), len(d_amm)),
+            'corr_dliq_clob_amm': self.series_correlation(d_clob, d_amm),
+            'amm_to_clob': self._lag_regression(d_clob, d_amm, lag=lag),
+            'clob_to_amm': self._lag_regression(d_amm, d_clob, lag=lag),
+            'avg_flow_share_clob': float('nan'),
+            'avg_flow_share_amm': float('nan'),
+        }
+
+        clob_share = self.flow_share('clob')
+        if clob_share:
+            finite_clob = [x for x in clob_share if math.isfinite(x)]
+            if finite_clob:
+                out['avg_flow_share_clob'] = sum(finite_clob) / len(finite_clob)
+                out['avg_flow_share_amm'] = 1.0 - out['avg_flow_share_clob']
+
+        if split_at is not None:
+            idx = max(0, min(int(split_at) - 1, min(len(d_clob), len(d_amm))))
+            out['before_after'] = {
+                'before': {
+                    'corr_dliq_clob_amm': self.series_correlation(d_clob[:idx], d_amm[:idx]),
+                    'amm_to_clob': self._lag_regression(d_clob[:idx], d_amm[:idx], lag=lag),
+                    'clob_to_amm': self._lag_regression(d_amm[:idx], d_clob[:idx], lag=lag),
+                },
+                'after': {
+                    'corr_dliq_clob_amm': self.series_correlation(d_clob[idx:], d_amm[idx:]),
+                    'amm_to_clob': self._lag_regression(d_clob[idx:], d_amm[idx:], lag=lag),
+                    'clob_to_amm': self._lag_regression(d_amm[idx:], d_clob[idx:], lag=lag),
+                },
+            }
+
+        return out
 
     def summary(self) -> dict:
         """Return a concise summary dict for printing."""

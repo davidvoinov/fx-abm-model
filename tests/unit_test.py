@@ -65,8 +65,8 @@ import sys, os, math, random, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from AgentBasedModel.utils.orders import Order, OrderList
-from AgentBasedModel.agents.agents import ExchangeAgent, Trader, Fundamentalist, MarketMaker, AMMArbitrageur, AMMProvider
-from AgentBasedModel.venues.clob import CLOBVenue
+from AgentBasedModel.agents.agents import ExchangeAgent, Trader, Random, Fundamentalist, MarketMaker, AMMArbitrageur, AMMProvider
+from AgentBasedModel.venues.clob import CLOBVenue, ShadowCLOB
 from AgentBasedModel.venues.amm import (
     CPMMPool, HFMMPool,
     _hfmm_get_D, _hfmm_get_y, _hfmm_mid_price,
@@ -85,6 +85,9 @@ from AgentBasedModel.metrics.statistics import (
     independent_permutation_test,
     paired_permutation_test,
 )
+from AgentBasedModel.simulator.simulator import Simulator
+from calibration.fitter import CalibrationFitter, build_acceptance_report
+import calibration.fitter as fitter_module
 import main as main_module
 from collections import Counter
 
@@ -273,9 +276,24 @@ def test_clob():
     ex_empty.dividend_book = [100.0]
     ex_empty.risk_free = 0.0
     ex_empty.transaction_cost = 0.0
+    ex_empty._last_book_mid_price = 100.0
     c_empty = CLOBVenue(ex_empty)
     check("Empty book: mid = 100 (fallback)", c_empty.mid_price(), 100.0)
     check("Empty book: qspr = inf", c_empty.quoted_spread_bps(), float('inf'))
+
+    subsection("Empty Book Avoids Fair-Price Fallback")
+    ex_stale = _make_exchange(BIDS, ASKS)
+    _ = ex_stale.spread()
+    for side in ('bid', 'ask'):
+        for order in list(ex_stale.order_book[side]):
+            ex_stale.order_book[side].remove(order)
+
+    class DummyEnv:
+        fair_price = 120.0
+
+    c_stale = CLOBVenue(ex_stale, env=DummyEnv())
+    check("Empty book keeps last endogenous mid instead of fair-price anchor",
+          c_stale.mid_price(), 100.0, abs_tol=1e-9)
 
     inserted = OrderList('bid')
     inserted.insert(Order(99.0, 10, 'bid', None))
@@ -301,6 +319,42 @@ def test_clob():
                             min_reprice_gap_bps=0.0)
     check("Anchor moves only 25% toward fair price",
           ex_anchor.price(), 102.5, abs_tol=1e-9)
+
+    subsection("Shock Recovery Re-seed")
+    ex_reseed = ExchangeAgent(price=100.0, std=2.0, volume=200)
+    for order in list(ex_reseed.order_book['ask']):
+        ex_reseed.order_book['ask'].remove(order)
+    check_bool("Ask side is empty before re-seeding",
+               ex_reseed.spread() is None,
+               f"bid_count={len(list(ex_reseed.order_book['bid']))}, ask_count={len(list(ex_reseed.order_book['ask']))}")
+    ex_reseed.recenter_book(100.0, reprice_prob=1.0,
+                            reprice_noise_bps=0.0,
+                            anchor_strength=0.25,
+                            min_reprice_gap_bps=0.0,
+                            background_target_ratio=1.0)
+    reseeded_spread = ex_reseed.spread()
+    check_bool("Recenter re-seeds an empty side after a shock",
+               reseeded_spread is not None and reseeded_spread['ask'] > reseeded_spread['bid'],
+               f"spread={reseeded_spread}")
+
+    subsection("Support Layer Cap")
+    ex_support = _make_exchange(BIDS, ASKS)
+    ex_support._background_corridor_bps = 200.0
+    ex_support._background_target_qty = {'bid': 40.0, 'ask': 40.0}
+    ex_support._background_floor_ratio = 0.25
+    ex_support._background_max_share_of_trader_depth = 0.5
+    ex_support._seed_qty_lo = 1
+    ex_support._seed_qty_hi = 5
+    support_trader = Trader(ex_support, cash=10_000.0, assets=20.0)
+    bid_order = Order(99.0, 20, 'bid', support_trader)
+    ask_order = Order(101.0, 20, 'ask', support_trader)
+    ex_support.order_book['bid'].append(bid_order)
+    ex_support.order_book['ask'].append(ask_order)
+    ex_support.rebalance_background_liquidity(100.0, corridor_bps=200.0, target_ratio=1.0)
+    bg_qty = ex_support._background_qty_near_mid(100.0, 200.0)
+    check_bool("Anonymous support is capped by trader-owned near-mid depth",
+               bg_qty['bid'] <= 20.0 + 1e-9 and bg_qty['ask'] <= 20.0 + 1e-9,
+               f"bid={bg_qty['bid']:.1f}, ask={bg_qty['ask']:.1f}")
 
 
 # =====================================================================
@@ -727,6 +781,68 @@ def test_routing():
                fixed_amm_share < 0.15 and liq_amm_share > 0.95,
                f"fixed_amm_share={fixed_amm_share:.3f}, liquidity_aware_amm_share={liq_amm_share:.3f}")
 
+    random.seed(42)
+    liq_inv = _make_trader(amm_share_pct=30, rule='liquidity_aware')
+    liq_inv.estimate_costs = lambda Q, side='buy': {'clob': 1.0, 'cpmm': 100.0, 'hfmm': 100.0}
+    clob_wins = sum(1 for _ in range(N) if liq_inv.choose_venue(5.0) == 'clob') / N
+    check_bool("Liquidity-aware routing follows extreme cost inversion toward CLOB",
+               clob_wins > 0.95,
+               f"clob_share={clob_wins:.3f}")
+
+    random.seed(42)
+    liq_inv_amm = _make_trader(amm_share_pct=30, rule='liquidity_aware')
+    liq_inv_amm.estimate_costs = lambda Q, side='buy': {'clob': 100.0, 'cpmm': 1.0, 'hfmm': 1.0}
+    amm_wins = sum(1 for _ in range(N) if liq_inv_amm.choose_venue(5.0) != 'clob') / N
+    check_bool("Liquidity-aware routing follows extreme cost inversion toward AMM",
+               amm_wins > 0.95,
+               f"amm_share={amm_wins:.3f}")
+
+    random.seed(42)
+    ex_flow = _make_exchange_r()
+    hedger = Random(
+        ex_flow,
+        cash=1e6,
+        assets=100,
+        clob=CLOBVenue(ex_flow),
+        amm_pools={'cpmm': CPMMPool(x=1000, y=100_000, fee=0.003),
+                   'hfmm': HFMMPool(x=1000, y=100_000, A=100, fee=0.001, rate=100.0)},
+        label='Hedger',
+        flow_role='Hedger',
+        flow_persistence=0.30,
+    )
+    same_side_share = 0.0
+    for _ in range(N):
+        hedger._last_fx_side = 'buy'
+        same_side_share += 1.0 if hedger._draw_flow_side() == 'buy' else 0.0
+    same_side_share /= N
+    check_bool("Hedger flow is not mechanically anti-persistent after one buy",
+               same_side_share > 0.50,
+               f"same_side_share={same_side_share:.3f}")
+
+    retail_prog = Random(
+        ex_flow,
+        cash=1e6,
+        assets=100,
+        clob=CLOBVenue(ex_flow),
+        amm_pools={'cpmm': CPMMPool(x=1000, y=100_000, fee=0.003),
+                   'hfmm': HFMMPool(x=1000, y=100_000, A=100, fee=0.001, rate=100.0)},
+        label='RetailToxic',
+        flow_role='RetailToxic',
+        flow_persistence=0.40,
+    )
+    retail_prog._flow_program_side = 'sell'
+    retail_prog._flow_program_remaining = 2
+    retail_prog._flow_program_qty_scale = 0.95
+    retail_prog._flow_program_trade_prob_mult = 1.08
+    side_1 = retail_prog._draw_flow_side()
+    side_2 = retail_prog._draw_flow_side()
+    check_bool("Execution program keeps taker flow on one side across slices",
+               side_1 == 'sell' and side_2 == 'sell',
+               f"side_1={side_1}, side_2={side_2}")
+    check_bool("Execution program clears after remaining slices are consumed",
+               retail_prog._flow_program_side is None,
+               f"remaining={retail_prog._flow_program_remaining}")
+
     # ── estimate_costs() ─────────────────────────────────────────────
     # Must return a dict with keys clob/cpmm/hfmm, all float.
     subsection("estimate_costs()")
@@ -872,6 +988,36 @@ def test_endogenous_mm_withdrawal():
                f"spread_mult={defensive_adj['spread_mult']:.3f}, depth_mult={defensive_adj['depth_mult']:.3f}")
 
 
+def test_market_maker_uses_clob_only_flow_imbalance():
+    """CLOB MM should react to CLOB taker flow, not AMM-only prints."""
+    section("MARKET MAKER CLOB-ONLY FLOW IMBALANCE — Unit Tests")
+
+    env = MarketEnvironment(price=100.0,
+                            sigma_low=0.01, sigma_high=0.05,
+                            c_low=0.001, c_high=0.01)
+    env.observe_order_flow([
+        {'venue': 'cpmm', 'side': 'buy', 'quantity': 20.0},
+        {'venue': 'hfmm', 'side': 'buy', 'quantity': 10.0},
+        {'venue': 'clob', 'side': 'sell', 'quantity': 5.0},
+    ])
+
+    check_bool("Aggregate flow keeps AMM activity in the global imbalance",
+               env.order_flow_imbalance > 0,
+               f"aggregate={env.order_flow_imbalance:.4f}")
+    check_bool("CLOB flow imbalance stays separate from AMM prints",
+               env.clob_order_flow_imbalance < 0,
+               f"clob={env.clob_order_flow_imbalance:.4f}")
+
+    ex = _make_exchange(BIDS, ASKS)
+    ex.spread_volume = lambda: None
+    mm = MarketMaker(ex, cash=1e4, env=env, venue_interaction_mode='none')
+    mm._update_ofi()
+
+    check_bool("MM OFI follows CLOB-side flow sign, not aggregate venue flow",
+               mm._recent_ofi() < 0,
+               f"ofi={mm._recent_ofi():.4f}, aggregate={env.order_flow_imbalance:.4f}, clob={env.clob_order_flow_imbalance:.4f}")
+
+
 # =====================================================================
 #  5. FEE ACCOUNTING & FUNDAMENTALIST ANCHOR
 # =====================================================================
@@ -910,6 +1056,240 @@ def test_fee_accounting():
         cum += 5 * 0.003 * q_sell['exec_price']
     check(f"Cumulative fee matches fee_revenue after 20 trades",
           p3.fee_revenue, cum, rel=1e-6)
+
+
+def test_balance_sheet_constraints():
+    """Resting orders reserve capital, CLOB/AMM execution settles, and no free short appears."""
+    section("BALANCE SHEETS / SETTLEMENT — Unit Tests")
+
+    subsection("1. Resting CLOB orders reserve and release capacity")
+    ex = _make_exchange(BIDS, ASKS)
+    buyer = Trader(ex, cash=500.0, assets=0.0)
+    buyer._buy_limit(3, 99.0)
+    check("Reserved cash = 3 × 99", buyer.reserved_cash, 297.0)
+    check("Available cash drops by reserved amount", buyer.available_cash(), 203.0)
+    check_bool("One resting bid is tracked", len(buyer.orders) == 1, f"orders={len(buyer.orders)}")
+    buyer._cancel_order(buyer.orders[0])
+    check("Cancel releases reserved cash", buyer.reserved_cash, 0.0)
+    check("Available cash restored after cancel", buyer.available_cash(), 500.0)
+
+    subsection("2. CLOB market buys clip to affordable quantity")
+    ex2 = _make_exchange(BIDS, ASKS)
+    clob_trader = Trader(ex2, cash=150.0, assets=0.0)
+    result = clob_trader._execute_clob(5, 'buy')
+    check("Executed qty clipped to one lot", result['executed_qty'], 1)
+    check("Cash debited by one best-ask fill", clob_trader.cash, 49.0)
+    check("Asset inventory increments by executed qty", clob_trader.assets, 1.0)
+
+    subsection("3. AMM trades settle directly on trader balance sheet")
+    ex3 = _make_exchange(BIDS, ASKS)
+    clob3 = CLOBVenue(ex3)
+    cpmm = CPMMPool(x=1000.0, y=100_000.0, fee=0.003)
+    amm_trader = Trader(ex3, cash=500.0, assets=0.0,
+                        clob=clob3, amm_pools={'cpmm': cpmm})
+    result = amm_trader._execute_on_venue('cpmm', 2.0, 'buy')
+    check_bool("AMM buy executes a positive quantity", result['executed_qty'] > 0.0,
+               f"executed={result['executed_qty']:.6f}")
+    check("AMM buy credits base inventory", amm_trader.assets, result['executed_qty'])
+    check("AMM buy debits quote cash", amm_trader.cash, 500.0 - result['delta_y'], rel=1e-9)
+
+    subsection("4. Sells respect explicit short limits")
+    ex4 = _make_exchange(BIDS, ASKS)
+    seller = Trader(ex4, cash=1_000.0, assets=0.0)
+    result = seller._execute_clob(2, 'sell')
+    check("No inventory and no short line -> no execution", result['executed_qty'], 0)
+    check("Cash stays unchanged when sell is infeasible", seller.cash, 1000.0)
+    check("Assets stay unchanged when sell is infeasible", seller.assets, 0.0)
+
+    subsection("5. Negative cash pays funding carry and breach triggers deleveraging")
+    ex5 = _make_exchange(BIDS, ASKS)
+    funded = Trader(ex5, cash=-100.0, assets=2.0, max_cash_borrow=50.0)
+    funded.maintenance_margin_ratio = 0.0
+    charge = funded.apply_financing_charge(100.0, 0.01)
+    check("Funding charge applies to borrowed cash", charge, 1.0, abs_tol=1e-9)
+    status = funded.enforce_balance_sheet_discipline(100.0)
+    check_bool("Forced deleveraging stabilizes cash breach",
+               status['status'] == 'stabilized' and funded.cash >= -50.0 - 1e-9,
+               f"status={status}, cash={funded.cash:.2f}, assets={funded.assets:.2f}")
+
+
+def test_amm_agent_capital_constraints():
+    """AMM-side LP/arbitrage agents should stop when their wallet budgets are exhausted."""
+    section("AMM AGENT CAPITAL CONSTRAINTS — Unit Tests")
+
+    subsection("1. LP cannot add liquidity without external wallet capital")
+    env = MarketEnvironment(price=100.0)
+    pool = CPMMPool(x=1000.0, y=100000.0, fee=0.003)
+    provider = AMMProvider(
+        pool,
+        env,
+        phi1=1.0,
+        phi2=0.0,
+        phi3=0.0,
+        max_adj=0.05,
+        wallet_cash=0.0,
+        wallet_base=0.0,
+    )
+    pool.period_fee_revenue = 10000.0
+    before_x, before_y = pool.x, pool.y
+    provider.update_liquidity()
+    check("LP with zero wallet cash leaves base reserves unchanged", pool.x, before_x)
+    check("LP with zero wallet cash leaves quote reserves unchanged", pool.y, before_y)
+
+    subsection("2. Arbitrageur cannot buy mispriced AMM inventory without cash")
+    class MockCLOB:
+        def mid_price(self):
+            return 100.0
+        def quoted_spread_bps(self):
+            return 10.0
+
+    mispriced_pool = CPMMPool(x=1000.0, y=80000.0, fee=0.003)
+    arb = AMMArbitrageur(
+        MockCLOB(),
+        {'cpmm': mispriced_pool},
+        max_correction_pct=50.0,
+        trade_fraction_cap=0.10,
+        cash=0.0,
+        assets=0.0,
+    )
+    before_x, before_y = mispriced_pool.x, mispriced_pool.y
+    arb._arb_one_pool(mispriced_pool, 100.0)
+    check("Cash-constrained arbitrageur leaves base reserves unchanged", mispriced_pool.x, before_x)
+    check("Cash-constrained arbitrageur leaves quote reserves unchanged", mispriced_pool.y, before_y)
+
+
+def test_primary_model_manifest_defaults():
+    """The main runtime should load one canonical primary-model manifest."""
+    section("PRIMARY MODEL MANIFEST — Unit Tests")
+
+    defaults = main_module.load_primary_model_defaults()
+    spec = main_module.load_primary_model_spec()
+    targets = main_module.load_primary_model_targets()
+    check_bool("Primary manifest is present", bool(defaults),
+               f"keys={sorted(defaults.keys())[:5]}")
+    check_bool("Primary manifest declares market contract",
+               spec.get('pair_class') == 'EUR/USD major ECN-style FX market'
+               and bool(spec.get('accepted_error_bands')),
+               f"pair={spec.get('pair_class')}, bands={bool(spec.get('accepted_error_bands'))}")
+    check_bool("Calibration target matrix is present", bool(targets.get('targets')),
+               f"target_count={len(targets.get('targets', []))}")
+    check_bool("Calibration suite declares multiple evaluation scenarios",
+               len(targets.get('calibration_scenarios', [])) >= 3,
+               f"scenarios={len(targets.get('calibration_scenarios', []))}")
+    numeric_targets = [
+        row for row in targets.get('targets', [])
+        if 'target_value' in row or 'target_range' in row or row.get('qualitative_bounds')
+    ]
+    check_bool("Calibration matrix now carries numeric/qualitative acceptance anchors",
+               len(numeric_targets) >= 8,
+               f"numeric_targets={len(numeric_targets)}")
+
+    parser = main_module.build_parser()
+    args = parser.parse_args([])
+
+    check_bool("Parser default for venue_choice_rule comes from primary manifest",
+               args.venue_choice_rule == defaults['venue_choice_rule'],
+               f"actual={args.venue_choice_rule}, expected={defaults['venue_choice_rule']}")
+    for field in ('amm_share_pct', 'cpmm_reserves', 'enable_amm', 'maintenance_margin_ratio'):
+        check(f"Parser default for {field} comes from primary manifest",
+              getattr(args, field), defaults[field])
+
+    sim = Simulator.default_fx(n_fx_takers=4, n_fx_fund=1, n_retail=2, n_institutional=1)
+    sim.simulate(20, silent=True)
+    breaches = [
+        tr for tr in sim.info.traders.values()
+        if getattr(tr, 'cash', 0.0) < -getattr(tr, 'max_cash_borrow', 0.0) - 1e-9
+        or getattr(tr, 'assets', 0.0) < -getattr(tr, 'max_short_assets', 0.0) - 1e-9
+    ]
+    check_bool("Short run respects explicit balance-sheet limits", not breaches,
+               f"breaches={[tr.name for tr in breaches[:3]]}")
+
+
+def test_primary_model_acceptance_report():
+    """Calibration scaffold should evaluate synthetic-perfect metrics and live simulations."""
+    section("PRIMARY MODEL ACCEPTANCE REPORT — Unit Tests")
+
+    targets = main_module.load_primary_model_targets()
+    fitter = CalibrationFitter(targets)
+    perfect_metrics = fitter.target_metric_defaults('baseline_primary')
+    check_bool("Target defaults include run-length diagnostic",
+               'order_flow_mean_run_length' in perfect_metrics,
+               f"keys={sorted(perfect_metrics.keys())}")
+    perfect_report = fitter.evaluate_metrics(
+        perfect_metrics,
+        run_label='unit-test',
+        scenario_name='baseline_primary',
+    )
+
+    check_bool("Synthetic target metrics produce a passing acceptance verdict",
+               perfect_report['summary']['status'] == 'pass'
+               and perfect_report['summary']['gating_failures'] == 0,
+               f"summary={perfect_report['summary']}")
+    check_bool("Perfect metrics give zero objective score",
+               abs(perfect_report['summary']['objective_score']) < 1e-12,
+               f"objective={perfect_report['summary']['objective_score']}")
+
+    perfect_suite_metrics = {
+        scenario['name']: fitter.target_metric_defaults(scenario['name'])
+        for scenario in targets.get('calibration_scenarios', [])
+    }
+    perfect_suite = fitter.evaluate_scenario_suite(perfect_suite_metrics, run_label='unit-test-suite')
+    check_bool("Scenario-suite perfect metrics produce a passing verdict",
+               perfect_suite['summary']['status'] == 'pass'
+               and perfect_suite['summary']['gating_failures'] == 0,
+               f"summary={perfect_suite['summary']}")
+
+    sim = Simulator.default_fx(n_fx_takers=4, n_fx_fund=1, n_retail=2, n_institutional=1)
+    sim.simulate(12, silent=True)
+    live_report = build_acceptance_report(
+        sim,
+        targets,
+        run_label='unit-test-live',
+        scenario_name='baseline_primary',
+    )
+
+    check_bool("Live acceptance report exposes summary and realized metrics",
+               bool(live_report.get('summary')) and bool(live_report.get('realized_metrics')),
+               f"summary={live_report.get('summary')}")
+    check_bool("Live acceptance report exposes run-length diagnostic",
+               'order_flow_mean_run_length' in live_report.get('realized_metrics', {}),
+               f"realized_keys={sorted(live_report.get('realized_metrics', {}).keys())}")
+
+
+def test_signed_flow_diagnostics():
+    """Signed-flow diagnostics should capture short same-sign runs while ignoring zero-flow ticks."""
+    section("SIGNED FLOW DIAGNOSTICS — Unit Tests")
+
+    raw_flow = [2.0, 0.0, 3.0, -1.0, -2.0, -4.0, float('nan'), 5.0, 6.0, 7.0, -1.0]
+    signs = fitter_module._signed_nonzero_series(raw_flow)
+    runs = fitter_module._run_lengths(signs)
+    diag = fitter_module._signed_flow_diagnostics(raw_flow)
+
+    check("Signed-flow helper removes zero and NaN observations",
+          len(signs), 9)
+    check("Run-length helper matches manual clustering",
+          diag['mean_run_length'], 2.25, abs_tol=1e-12)
+    check("Run counter matches manual grouping",
+        len(runs), 4)
+    check_bool("Lag-1 sign autocorrelation stays positive for clustered flow",
+               diag['lag1_sign_autocorr'] > 0.0,
+               f"rho={diag['lag1_sign_autocorr']}")
+
+
+def test_environment_session_cycle():
+    """Primary environment should expose an FX session cycle for flow calibration."""
+    section("FX SESSION CYCLE — Unit Tests")
+
+    env = MarketEnvironment(price=100.0)
+    seen = set()
+    for _ in range(24):
+        env.step()
+        seen.add(env.session_name)
+
+    check_bool("Session cycle includes Asia", 'Asia' in seen, f"seen={sorted(seen)}")
+    check_bool("Session cycle includes London", 'London' in seen, f"seen={sorted(seen)}")
+    check_bool("Session cycle includes Overlap", 'Overlap' in seen, f"seen={sorted(seen)}")
+    check_bool("Session cycle includes NewYork", 'NewYork' in seen, f"seen={sorted(seen)}")
 
 
 def test_fundamentalist_anchor():
@@ -1033,6 +1413,20 @@ def test_latent_anchor_reference():
                abs(ref - 100.0) < abs(ref - 110.0),
                f"ref={ref:.4f}")
 
+    subsection("Dispersed AMM pools do not self-anchor the reference")
+    dispersed_pools = {
+        'cpmm': CPMMPool(x=1000.0, y=105_000.0, fee=0.003),
+        'hfmm': HFMMPool(x=1000.0, y=170_000.0, A=10.0, fee=0.001, rate=100.0),
+    }
+    dispersed_ref = AMMArbitrageur(clob, dispersed_pools, env=env)._reference_price()
+
+    check_bool("Large AMM cross-pool dispersion does not pull reference above fair anchor",
+               100.0 < dispersed_ref < 110.0,
+               f"ref={dispersed_ref:.4f}")
+    check_bool("Dispersed AMM consensus is ignored in favor of observed CLOB price",
+               abs(dispersed_ref - 100.0) < abs(dispersed_ref - 110.0),
+               f"ref={dispersed_ref:.4f}")
+
 
 def test_systemic_liquidity_factor():
     """Shared liquidity factor should fall on shock / flow stress and later recover."""
@@ -1067,6 +1461,83 @@ def test_systemic_liquidity_factor():
     check_bool("Common liquidity factor partially recovers over time",
                env.systemic_liquidity > flow_liq,
                f"flow={flow_liq:.3f}, recovered={env.systemic_liquidity:.3f}")
+
+
+def test_environment_venue_signals():
+    """Environment should expose live AMM/CLOB venue-state signals without falling back to missing attrs."""
+    section("ENVIRONMENT VENUE SIGNALS — Unit Tests")
+
+    env = MarketEnvironment(price=100.0,
+                            sigma_low=0.01, sigma_high=0.05,
+                            c_low=0.001, c_high=0.01)
+    clob = ShadowCLOB(env)
+    cpmm = CPMMPool(x=1000.0, y=102_000.0, fee=0.003)
+    hfmm = HFMMPool(x=1000.0, y=99_500.0, A=10.0, fee=0.001, rate=100.0)
+    arb = AMMArbitrageur(clob, {'cpmm': cpmm, 'hfmm': hfmm}, env=env,
+                         trade_fraction_cap=0.15)
+
+    env.observe_order_flow([
+        {'venue': 'cpmm', 'side': 'buy', 'quantity': 5.0},
+        {'venue': 'hfmm', 'side': 'sell', 'quantity': 2.0},
+        {'venue': 'clob', 'side': 'sell', 'quantity': 1.0},
+    ])
+    env.observe_venue_conditions(clob, {'cpmm': cpmm, 'hfmm': hfmm}, arbitrageur=arb)
+
+    check_bool("AMM-only order-flow imbalance updates separately from aggregate flow",
+               env.amm_order_flow_imbalance > 0,
+               f"amm_imbalance={env.amm_order_flow_imbalance:.4f}")
+    check_bool("AMM slippage signal is finite and positive",
+               math.isfinite(env.amm_slippage_signal) and env.amm_slippage_signal > 0,
+               f"slippage={env.amm_slippage_signal:.4f}")
+    check_bool("Venue basis signal is finite and positive",
+               math.isfinite(env.venue_basis_bps) and env.venue_basis_bps > 0,
+               f"basis={env.venue_basis_bps:.4f}")
+    check_bool("Arbitrage capacity stays bounded in [0, 1]",
+               0.0 <= env.arbitrage_capacity <= 1.0,
+               f"capacity={env.arbitrage_capacity:.4f}")
+
+    subsection("Invalid pool mids do not poison valid venue signals")
+
+    class BadPool:
+        x = 1000.0
+        y = 100000.0
+
+        def mid_price(self):
+            raise RuntimeError('bad mid')
+
+        def effective_depth(self, *_args, **_kwargs):
+            return 999.0
+
+        def quote_buy(self, *_args, **_kwargs):
+            return {'slippage_bps': 999.0}
+
+        def quote_sell(self, *_args, **_kwargs):
+            return {'slippage_bps': 999.0}
+
+    class GoodPool:
+        x = 1000.0
+        y = 101000.0
+
+        def mid_price(self):
+            return 101.0
+
+        def effective_depth(self, *_args, **_kwargs):
+            return 100.0
+
+        def quote_buy(self, *_args, **_kwargs):
+            return {'slippage_bps': 1.0}
+
+        def quote_sell(self, *_args, **_kwargs):
+            return {'slippage_bps': 1.0}
+
+    env_bad = MarketEnvironment(price=100.0)
+    env_bad.observe_venue_conditions(clob, {'bad': BadPool(), 'good': GoodPool()})
+    check_bool("Only valid pools contribute to venue basis",
+               math.isfinite(env_bad.venue_basis_bps) and abs(env_bad.venue_basis_bps - 100.0) < 1e-9,
+               f"basis={env_bad.venue_basis_bps}")
+    check_bool("Only valid pools contribute to AMM slippage signal",
+               math.isfinite(env_bad.amm_slippage_signal) and abs(env_bad.amm_slippage_signal - 1.0) < 1e-9,
+               f"slippage={env_bad.amm_slippage_signal}")
 
 
 def test_shock_stress_cli_semantics():
@@ -1193,6 +1664,7 @@ def test_funding_liquidity_shock_preset():
     check_bool("Funding liquidity shock is milder than flash crash on quote withdrawal",
                args.liquidity_shock_frac < main_module.REALISM_PRESETS['flash_crash']['liquidity_shock_frac'],
                f"funding={args.liquidity_shock_frac}, flash={main_module.REALISM_PRESETS['flash_crash']['liquidity_shock_frac']}")
+
 
 
 def test_initial_depth_matching():
@@ -2119,10 +2591,12 @@ if __name__ == '__main__':
     test_mm_amm_interaction()
     test_endogenous_mm_withdrawal()
     test_fee_accounting()
+    test_balance_sheet_constraints()
     test_fundamentalist_anchor()
     test_environment_price_process()
     test_latent_anchor_reference()
     test_systemic_liquidity_factor()
+    test_primary_model_manifest_defaults()
     test_shock_stress_cli_semantics()
     test_flash_crash_preset()
     test_mm_withdrawal_preset()

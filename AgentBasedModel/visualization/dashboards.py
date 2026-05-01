@@ -513,6 +513,83 @@ def _window_avg(values, start: int, end: int) -> float:
     return sum(finite) / len(finite) if finite else float('nan')
 
 
+def _window_median(values, start: int, end: int) -> float:
+    finite = sorted(value for value in values[start:end] if math.isfinite(value))
+    if not finite:
+        return float('nan')
+    mid = len(finite) // 2
+    if len(finite) % 2:
+        return finite[mid]
+    return 0.5 * (finite[mid - 1] + finite[mid])
+
+
+def _resolve_stress_end(logger: 'MetricsLogger', stress_start: int, n: int) -> int:
+    regimes = list(getattr(logger, 'regime_series', []) or [])
+    if len(regimes) >= n:
+        end = stress_start
+        while end < n and regimes[end] == 'stress':
+            end += 1
+        if end > stress_start:
+            return end
+    return min(n, stress_start + 100)
+
+
+def _event_windows(logger: 'MetricsLogger',
+                   n: int,
+                   *,
+                   shock_iter: Optional[int] = None,
+                   stress_start: Optional[int] = None) -> dict:
+    if shock_iter is not None:
+        event_start = max(0, min(shock_iter, n))
+        event_end = min(n, event_start + 20)
+        return {
+            'mode': 'shock',
+            'has_event': event_start < n,
+            'title': f'Local Comparison Around Shock t={event_start}',
+            'subtitle': (
+                f'Full pre=[0,{event_start})   '
+                f'Local pre=[{max(0, event_start - 50)},{event_start})   '
+                f'Shock=[{event_start},{event_end})'
+            ),
+            'event_label': 'Shock/Stress',
+            'event_row_label': 'shock',
+            'full_pre': (0, event_start),
+            'local_pre': (max(0, event_start - 50), event_start),
+            'event': (event_start, event_end),
+        }
+
+    if stress_start is not None:
+        event_start = max(0, min(stress_start, n))
+        event_end = _resolve_stress_end(logger, event_start, n)
+        return {
+            'mode': 'stress',
+            'has_event': event_start < n,
+            'title': f'Comparison Around Stress t={event_start}',
+            'subtitle': (
+                f'Full pre=[0,{event_start})   '
+                f'Local pre=[{max(0, event_start - 50)},{event_start})   '
+                f'Stress=[{event_start},{event_end})'
+            ),
+            'event_label': 'Shock/Stress',
+            'event_row_label': 'stress',
+            'full_pre': (0, event_start),
+            'local_pre': (max(0, event_start - 50), event_start),
+            'event': (event_start, event_end),
+        }
+
+    return {
+        'mode': 'baseline',
+        'has_event': False,
+        'title': 'Market Quality Comparison',
+        'subtitle': '=' * 42,
+        'event_label': 'Shock/Stress',
+        'event_row_label': 'event',
+        'full_pre': (0, n),
+        'local_pre': (0, n),
+        'event': (0, n),
+    }
+
+
 def _fmt_metric(value: float, digits: int = 1) -> str:
     return f'{value:.{digits}f}' if math.isfinite(value) else 'N/A'
 
@@ -608,52 +685,70 @@ def dashboard_comparison(logger_amm: 'MetricsLogger',
     depth_no = _total_depth(logger_no_amm)
     vol_amm_all = _rolling_return_vol(logger_amm.clob_mid_series, vol_window)
     vol_no_all = _rolling_return_vol(logger_no_amm.clob_mid_series, vol_window)
+    event = _event_windows(logger_amm, n, shock_iter=shock_iter,
+                           stress_start=stress_start)
 
     def _delta(a, b):
         if b == 0 or not math.isfinite(a) or not math.isfinite(b):
             return 'N/A'
         return f'{(a - b) / abs(b):+.1%}'
 
-    if shock_iter is not None:
-        shock_idx = max(0, min(shock_iter, n))
-        pre_start = max(0, shock_idx - 50)
-        shock_end = min(n, shock_idx + 20)
+    if event['has_event']:
+        full_pre = event['full_pre']
+        local_pre = event['local_pre']
+        event_window = event['event']
+        row_suffix = event['event_row_label']
         rows = [
-            ('Spread pre (bps)',
-             _fmt_metric(_window_avg(logger_amm.clob_qspr, pre_start, shock_idx)),
-             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, pre_start, shock_idx)),
-             _delta(_window_avg(logger_amm.clob_qspr, pre_start, shock_idx),
-                    _window_avg(logger_no_amm.clob_qspr, pre_start, shock_idx))),
-            ('Spread shock (bps)',
-             _fmt_metric(_window_avg(logger_amm.clob_qspr, shock_idx, shock_end)),
-             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, shock_idx, shock_end)),
-             _delta(_window_avg(logger_amm.clob_qspr, shock_idx, shock_end),
-                    _window_avg(logger_no_amm.clob_qspr, shock_idx, shock_end))),
-            ('Depth pre',
-             _fmt_metric(_window_avg(depth_amm, pre_start, shock_idx), digits=0),
-             _fmt_metric(_window_avg(depth_no, pre_start, shock_idx), digits=0),
-             _delta(_window_avg(depth_amm, pre_start, shock_idx),
-                    _window_avg(depth_no, pre_start, shock_idx))),
-            ('Depth shock',
-             _fmt_metric(_window_avg(depth_amm, shock_idx, shock_end), digits=0),
-             _fmt_metric(_window_avg(depth_no, shock_idx, shock_end), digits=0),
-             _delta(_window_avg(depth_amm, shock_idx, shock_end),
-                    _window_avg(depth_no, shock_idx, shock_end))),
-            ('Vol pre',
-             _fmt_metric(_window_avg(vol_amm_all, pre_start, shock_idx), digits=4),
-             _fmt_metric(_window_avg(vol_no_all, pre_start, shock_idx), digits=4),
-             _delta(_window_avg(vol_amm_all, pre_start, shock_idx),
-                    _window_avg(vol_no_all, pre_start, shock_idx))),
-            ('Vol shock',
-             _fmt_metric(_window_avg(vol_amm_all, shock_idx, shock_end), digits=4),
-             _fmt_metric(_window_avg(vol_no_all, shock_idx, shock_end), digits=4),
-             _delta(_window_avg(vol_amm_all, shock_idx, shock_end),
-                    _window_avg(vol_no_all, shock_idx, shock_end))),
+            ('Spread full pre (bps)',
+             _fmt_metric(_window_avg(logger_amm.clob_qspr, *full_pre)),
+             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, *full_pre)),
+             _delta(_window_avg(logger_amm.clob_qspr, *full_pre),
+                _window_avg(logger_no_amm.clob_qspr, *full_pre))),
+            ('Spread local pre (bps)',
+             _fmt_metric(_window_avg(logger_amm.clob_qspr, *local_pre)),
+             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, *local_pre)),
+             _delta(_window_avg(logger_amm.clob_qspr, *local_pre),
+                _window_avg(logger_no_amm.clob_qspr, *local_pre))),
+            (f'Spread {row_suffix} (bps)',
+             _fmt_metric(_window_avg(logger_amm.clob_qspr, *event_window)),
+             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, *event_window)),
+             _delta(_window_avg(logger_amm.clob_qspr, *event_window),
+                _window_avg(logger_no_amm.clob_qspr, *event_window))),
+            ('Depth full pre',
+             _fmt_metric(_window_avg(depth_amm, *full_pre), digits=0),
+             _fmt_metric(_window_avg(depth_no, *full_pre), digits=0),
+             _delta(_window_avg(depth_amm, *full_pre),
+                _window_avg(depth_no, *full_pre))),
+            ('Depth local pre',
+             _fmt_metric(_window_avg(depth_amm, *local_pre), digits=0),
+             _fmt_metric(_window_avg(depth_no, *local_pre), digits=0),
+             _delta(_window_avg(depth_amm, *local_pre),
+                _window_avg(depth_no, *local_pre))),
+            (f'Depth {row_suffix}',
+             _fmt_metric(_window_avg(depth_amm, *event_window), digits=0),
+             _fmt_metric(_window_avg(depth_no, *event_window), digits=0),
+             _delta(_window_avg(depth_amm, *event_window),
+                _window_avg(depth_no, *event_window))),
+            ('Vol full pre',
+             _fmt_metric(_window_avg(vol_amm_all, *full_pre), digits=4),
+             _fmt_metric(_window_avg(vol_no_all, *full_pre), digits=4),
+             _delta(_window_avg(vol_amm_all, *full_pre),
+                _window_avg(vol_no_all, *full_pre))),
+            ('Vol local pre',
+             _fmt_metric(_window_avg(vol_amm_all, *local_pre), digits=4),
+             _fmt_metric(_window_avg(vol_no_all, *local_pre), digits=4),
+             _delta(_window_avg(vol_amm_all, *local_pre),
+                _window_avg(vol_no_all, *local_pre))),
+            (f'Vol {row_suffix}',
+             _fmt_metric(_window_avg(vol_amm_all, *event_window), digits=4),
+             _fmt_metric(_window_avg(vol_no_all, *event_window), digits=4),
+             _delta(_window_avg(vol_amm_all, *event_window),
+                _window_avg(vol_no_all, *event_window))),
         ]
-        ax.text(0.5, 0.92, f'Local Comparison Around Shock t={shock_iter}',
+        ax.text(0.5, 0.92, event['title'],
                 ha='center', va='center', fontsize=13, fontweight='bold',
                 transform=ax.transAxes)
-        ax.text(0.5, 0.86, f'Pre=[{pre_start},{shock_idx})   Shock=[{shock_idx},{shock_end})',
+        ax.text(0.5, 0.86, event['subtitle'],
                 ha='center', va='center', fontsize=10,
                 fontfamily='monospace', transform=ax.transAxes)
     else:
@@ -796,45 +891,66 @@ def save_comparison_individual(logger_amm: 'MetricsLogger',
     depth_no = _total_depth(logger_no_amm)
     vol_amm_all = _rolling_return_vol(logger_amm.clob_mid_series, vol_window)
     vol_no_all = _rolling_return_vol(logger_no_amm.clob_mid_series, vol_window)
+    event = _event_windows(logger_amm, n, shock_iter=shock_iter,
+                           stress_start=stress_start)
 
-    if shock_iter is not None:
-        shock_idx = max(0, min(shock_iter, n))
-        pre_start = max(0, shock_idx - 50)
-        shock_end = min(n, shock_idx + 20)
+    if event['has_event']:
+        full_pre = event['full_pre']
+        local_pre = event['local_pre']
+        event_window = event['event']
+        row_suffix = event['event_row_label']
         rows = [
-            ('Spread pre (bps)',
-             _fmt_metric(_window_avg(logger_amm.clob_qspr, pre_start, shock_idx)),
-             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, pre_start, shock_idx)),
-             _delta(_window_avg(logger_amm.clob_qspr, pre_start, shock_idx),
-                    _window_avg(logger_no_amm.clob_qspr, pre_start, shock_idx))),
-            ('Spread shock (bps)',
-             _fmt_metric(_window_avg(logger_amm.clob_qspr, shock_idx, shock_end)),
-             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, shock_idx, shock_end)),
-             _delta(_window_avg(logger_amm.clob_qspr, shock_idx, shock_end),
-                    _window_avg(logger_no_amm.clob_qspr, shock_idx, shock_end))),
-            ('Depth pre',
-             _fmt_metric(_window_avg(depth_amm, pre_start, shock_idx), digits=0),
-             _fmt_metric(_window_avg(depth_no, pre_start, shock_idx), digits=0),
-             _delta(_window_avg(depth_amm, pre_start, shock_idx),
-                    _window_avg(depth_no, pre_start, shock_idx))),
-            ('Depth shock',
-             _fmt_metric(_window_avg(depth_amm, shock_idx, shock_end), digits=0),
-             _fmt_metric(_window_avg(depth_no, shock_idx, shock_end), digits=0),
-             _delta(_window_avg(depth_amm, shock_idx, shock_end),
-                    _window_avg(depth_no, shock_idx, shock_end))),
-            ('Vol pre',
-             _fmt_metric(_window_avg(vol_amm_all, pre_start, shock_idx), digits=4),
-             _fmt_metric(_window_avg(vol_no_all, pre_start, shock_idx), digits=4),
-             _delta(_window_avg(vol_amm_all, pre_start, shock_idx),
-                    _window_avg(vol_no_all, pre_start, shock_idx))),
-            ('Vol shock',
-             _fmt_metric(_window_avg(vol_amm_all, shock_idx, shock_end), digits=4),
-             _fmt_metric(_window_avg(vol_no_all, shock_idx, shock_end), digits=4),
-             _delta(_window_avg(vol_amm_all, shock_idx, shock_end),
-                    _window_avg(vol_no_all, shock_idx, shock_end))),
+            ('Spread full pre (bps)',
+             _fmt_metric(_window_avg(logger_amm.clob_qspr, *full_pre)),
+             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, *full_pre)),
+             _delta(_window_avg(logger_amm.clob_qspr, *full_pre),
+                    _window_avg(logger_no_amm.clob_qspr, *full_pre))),
+            ('Spread local pre (bps)',
+             _fmt_metric(_window_avg(logger_amm.clob_qspr, *local_pre)),
+             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, *local_pre)),
+             _delta(_window_avg(logger_amm.clob_qspr, *local_pre),
+                    _window_avg(logger_no_amm.clob_qspr, *local_pre))),
+            (f'Spread {row_suffix} (bps)',
+             _fmt_metric(_window_avg(logger_amm.clob_qspr, *event_window)),
+             _fmt_metric(_window_avg(logger_no_amm.clob_qspr, *event_window)),
+             _delta(_window_avg(logger_amm.clob_qspr, *event_window),
+                    _window_avg(logger_no_amm.clob_qspr, *event_window))),
+            ('Depth full pre',
+             _fmt_metric(_window_avg(depth_amm, *full_pre), digits=0),
+             _fmt_metric(_window_avg(depth_no, *full_pre), digits=0),
+             _delta(_window_avg(depth_amm, *full_pre),
+                    _window_avg(depth_no, *full_pre))),
+            ('Depth local pre',
+             _fmt_metric(_window_avg(depth_amm, *local_pre), digits=0),
+             _fmt_metric(_window_avg(depth_no, *local_pre), digits=0),
+             _delta(_window_avg(depth_amm, *local_pre),
+                    _window_avg(depth_no, *local_pre))),
+            (f'Depth {row_suffix}',
+             _fmt_metric(_window_avg(depth_amm, *event_window), digits=0),
+             _fmt_metric(_window_avg(depth_no, *event_window), digits=0),
+             _delta(_window_avg(depth_amm, *event_window),
+                    _window_avg(depth_no, *event_window))),
+            ('Vol full pre',
+             _fmt_metric(_window_avg(vol_amm_all, *full_pre), digits=4),
+             _fmt_metric(_window_avg(vol_no_all, *full_pre), digits=4),
+             _delta(_window_avg(vol_amm_all, *full_pre),
+                    _window_avg(vol_no_all, *full_pre))),
+            ('Vol local pre',
+             _fmt_metric(_window_avg(vol_amm_all, *local_pre), digits=4),
+             _fmt_metric(_window_avg(vol_no_all, *local_pre), digits=4),
+             _delta(_window_avg(vol_amm_all, *local_pre),
+                    _window_avg(vol_no_all, *local_pre))),
+            (f'Vol {row_suffix}',
+             _fmt_metric(_window_avg(vol_amm_all, *event_window), digits=4),
+             _fmt_metric(_window_avg(vol_no_all, *event_window), digits=4),
+             _delta(_window_avg(vol_amm_all, *event_window),
+                    _window_avg(vol_no_all, *event_window))),
         ]
-        ax.set_title(f'Market Quality Around Shock t={shock_iter}',
-                     fontsize=14, fontweight='bold', pad=12)
+        ax.set_title(event['title'],
+                 fontsize=14, fontweight='bold', pad=12)
+        ax.text(0.5, 0.92, event['subtitle'],
+            transform=ax.transAxes, ha='center', va='top',
+            fontsize=9.5, fontfamily='monospace')
     else:
         avg_spr_amm = _mean(logger_amm.clob_qspr)
         avg_spr_no = _mean(logger_no_amm.clob_qspr)
@@ -858,8 +974,12 @@ def save_comparison_individual(logger_amm: 'MetricsLogger',
         colLabels=col_labels, loc='center', cellLoc='center',
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(12)
+    tbl.set_fontsize(11.5)
     tbl.scale(1.0, 1.7)
+    try:
+        tbl.auto_set_column_width(col=list(range(4)))
+    except AttributeError:
+        pass
     for j in range(4):
         tbl[0, j].set_facecolor('#4c72b0')
         tbl[0, j].set_text_props(color='white', fontweight='bold')
@@ -880,14 +1000,16 @@ def save_comparison_individual(logger_amm: 'MetricsLogger',
 
 def plot_market_quality_table(logger: 'MetricsLogger',
                               out_dir: str = 'output',
-                              stress_start: Optional[int] = None) -> str:
+                              stress_start: Optional[int] = None,
+                              shock_iter: Optional[int] = None) -> str:
     """
     Market-quality comparison table rendered as an image.
     Columns: Metric | Normal | Stress | Ratio.
     """
     os.makedirs(out_dir, exist_ok=True)
     n = len(logger.iterations)
-    idx = min(stress_start, n) if stress_start is not None else n
+    event = _event_windows(logger, n, shock_iter=shock_iter,
+                           stress_start=stress_start)
 
     # --- collect metrics ---
     def _mean(lst):
@@ -899,68 +1021,150 @@ def plot_market_quality_table(logger: 'MetricsLogger',
                    for d in logger.clob_depth]
 
     rows = []
-    # Quoted spread
-    n_spr = _mean(qspr[:idx])
-    s_spr = _mean(qspr[idx:])
-    rows.append(('CLOB Quoted Spread (bps)',
-                 f'{n_spr:.1f}', f'{s_spr:.1f}',
-                 f'{s_spr/n_spr:.2f}×' if n_spr > 0 else '—'))
+    if event['has_event']:
+        full_pre = event['full_pre']
+        local_pre = event['local_pre']
+        event_window = event['event']
 
-    # CLOB depth
-    n_dep = _mean(depth_total[:idx])
-    s_dep = _mean(depth_total[idx:])
-    rows.append(('CLOB Depth (units)',
-                 f'{n_dep:.0f}', f'{s_dep:.0f}',
-                 f'{s_dep/n_dep:.2f}×' if n_dep > 0 else '—'))
+        def _ratio(event_value: float, local_value: float, digits: int = 2) -> str:
+            if not (math.isfinite(event_value) and math.isfinite(local_value) and local_value != 0):
+                return '—'
+            return f'{event_value / local_value:.{digits}f}×'
 
-    # Cost Q=5 per venue
-    for v in ['clob'] + list(logger.amm_cost_curves.keys()):
-        s = logger.cost_series(v, 5)
-        n_c = _mean(s[:idx])
-        s_c = _mean(s[idx:])
-        rows.append((f'{v.upper()} Cost Q=5 (bps)',
-                     f'{n_c:.1f}' if math.isfinite(n_c) else 'N/A',
-                     f'{s_c:.1f}' if math.isfinite(s_c) else 'N/A',
-                     f'{s_c/n_c:.2f}×' if (math.isfinite(n_c) and n_c > 0) else '—'))
+        rows.append((
+            'CLOB Quoted Spread (bps)',
+            _fmt_metric(_window_avg(qspr, *full_pre)),
+            _fmt_metric(_window_avg(qspr, *local_pre)),
+            _fmt_metric(_window_avg(qspr, *event_window)),
+            _ratio(_window_avg(qspr, *event_window), _window_avg(qspr, *local_pre)),
+        ))
+        rows.append((
+            'CLOB Quoted Spread median',
+            _fmt_metric(_window_median(qspr, *full_pre)),
+            _fmt_metric(_window_median(qspr, *local_pre)),
+            _fmt_metric(_window_median(qspr, *event_window)),
+            _ratio(_window_median(qspr, *event_window), _window_median(qspr, *local_pre)),
+        ))
+        rows.append((
+            'CLOB Depth (units)',
+            _fmt_metric(_window_avg(depth_total, *full_pre), digits=0),
+            _fmt_metric(_window_avg(depth_total, *local_pre), digits=0),
+            _fmt_metric(_window_avg(depth_total, *event_window), digits=0),
+            _ratio(_window_avg(depth_total, *event_window), _window_avg(depth_total, *local_pre)),
+        ))
 
-    # AMM flow share
-    for v in logger.amm_cost_curves:
-        fs = logger.flow_share(v)
-        n_f = _mean(fs[:idx])
-        s_f = _mean(fs[idx:])
-        rows.append((f'{v.upper()} Flow Share',
-                     f'{n_f:.1%}', f'{s_f:.1%}',
-                     f'{s_f/n_f:.1f}×' if n_f > 0 else '—'))
+        for v in ['clob'] + list(logger.amm_cost_curves.keys()):
+            s = logger.cost_series(v, 5)
+            rows.append((
+                f'{v.upper()} Cost Q=5 (bps)',
+                _fmt_metric(_window_avg(s, *full_pre)),
+                _fmt_metric(_window_avg(s, *local_pre)),
+                _fmt_metric(_window_avg(s, *event_window)),
+                _ratio(_window_avg(s, *event_window), _window_avg(s, *local_pre)),
+            ))
 
-    # Correlation
-    for v in logger.amm_cost_curves:
-        if stress_start is not None:
-            ba = logger.commonality_before_after('clob', v, Q=5,
-                                                 stress_start=stress_start)
-            b_s = f'{ba["before"]:.3f}' if math.isfinite(ba['before']) else 'N/A'
-            a_s = f'{ba["after"]:.3f}' if math.isfinite(ba['after']) else 'N/A'
-        else:
+        for v in logger.amm_cost_curves:
+            fs = logger.flow_share(v)
+            full_share = _window_avg(fs, *full_pre)
+            local_share = _window_avg(fs, *local_pre)
+            event_share = _window_avg(fs, *event_window)
+            rows.append((
+                f'{v.upper()} Flow Share',
+                f'{full_share:.1%}' if math.isfinite(full_share) else 'N/A',
+                f'{local_share:.1%}' if math.isfinite(local_share) else 'N/A',
+                f'{event_share:.1%}' if math.isfinite(event_share) else 'N/A',
+                _ratio(event_share, local_share, digits=1),
+            ))
+
+        clob_cost = logger.cost_series('clob', 5)
+        for v in logger.amm_cost_curves:
+            venue_cost = logger.cost_series(v, 5)
+            full_rho = logger.series_correlation(clob_cost[full_pre[0]:full_pre[1]],
+                                                 venue_cost[full_pre[0]:full_pre[1]])
+            local_rho = logger.series_correlation(clob_cost[local_pre[0]:local_pre[1]],
+                                                  venue_cost[local_pre[0]:local_pre[1]])
+            event_rho = logger.series_correlation(clob_cost[event_window[0]:event_window[1]],
+                                                  venue_cost[event_window[0]:event_window[1]])
+            rows.append((
+                f'ρ CLOB↔{v.upper()} (Q=5)',
+                f'{full_rho:.3f}' if math.isfinite(full_rho) else 'N/A',
+                f'{local_rho:.3f}' if math.isfinite(local_rho) else 'N/A',
+                f'{event_rho:.3f}' if math.isfinite(event_rho) else 'N/A',
+                '',
+            ))
+    else:
+        avg_qspr = _mean(qspr)
+        med_qspr = _window_median(qspr, 0, n)
+        avg_depth = _mean(depth_total)
+        med_depth = _window_median(depth_total, 0, n)
+        rows.append((
+            'CLOB Quoted Spread (bps)',
+            _fmt_metric(avg_qspr),
+            _fmt_metric(med_qspr),
+            _fmt_metric(np.std([x for x in qspr if math.isfinite(x)]), digits=2),
+        ))
+        rows.append((
+            'CLOB Depth (units)',
+            _fmt_metric(avg_depth, digits=0),
+            _fmt_metric(med_depth, digits=0),
+            _fmt_metric(np.std([x for x in depth_total if math.isfinite(x)]), digits=1),
+        ))
+
+        for v in ['clob'] + list(logger.amm_cost_curves.keys()):
+            s = logger.cost_series(v, 5)
+            rows.append((
+                f'{v.upper()} Cost Q=5 (bps)',
+                _fmt_metric(_mean(s)),
+                _fmt_metric(_window_median(s, 0, len(s))),
+                _fmt_metric(np.std([x for x in s if math.isfinite(x)]), digits=2),
+            ))
+
+        for v in logger.amm_cost_curves:
+            fs = logger.flow_share(v)
+            rows.append((
+                f'{v.upper()} Flow Share',
+                f'{_mean(fs):.1%}' if math.isfinite(_mean(fs)) else 'N/A',
+                '—',
+                '—',
+            ))
+
+        for v in logger.amm_cost_curves:
             rho = logger.cost_correlation('clob', v, Q=5)
-            b_s = f'{rho:.3f}' if math.isfinite(rho) else 'N/A'
-            a_s = '—'
-        rows.append((f'ρ CLOB↔{v.upper()} (Q=5)', b_s, a_s, ''))
+            rows.append((
+                f'ρ CLOB↔{v.upper()} (Q=5)',
+                f'{rho:.3f}' if math.isfinite(rho) else 'N/A',
+                '—',
+                '—',
+            ))
 
     # --- render table ---
-    has_stress = stress_start is not None and idx < n
-    col_labels = ['Metric', 'Normal', 'Stress', 'Ratio'] if has_stress else ['Metric', 'Average', '', '']
-    cell_text = [[r[0], r[1], r[2], r[3]] for r in rows]
+    has_event = event['has_event']
+    if has_event:
+        col_labels = ['Metric', 'Full pre', 'Local pre', event['event_label'], 'Event / local']
+        cell_text = [[r[0], r[1], r[2], r[3], r[4]] for r in rows]
+    else:
+        col_labels = ['Metric', 'Average', 'Median', 'Std']
+        cell_text = [[r[0], r[1], r[2], r[3]] for r in rows]
 
-    fig, ax = plt.subplots(figsize=(10, 0.55 * len(rows) + 1.5))
+    fig, ax = plt.subplots(figsize=(13 if has_event else 10.5, 0.55 * len(rows) + 1.5))
     ax.axis('off')
-    ax.set_title('Market Quality Comparison: Normal vs Stress' if has_stress
+    ax.set_title('Market Quality: Full pre vs Local pre vs Shock/Stress' if has_event
                  else 'Market Quality Summary',
                  fontsize=14, fontweight='bold', pad=12)
+    if has_event:
+        ax.text(0.5, 0.98, event['subtitle'],
+                transform=ax.transAxes, ha='center', va='top',
+                fontsize=9.5, fontfamily='monospace')
 
     tbl = ax.table(cellText=cell_text, colLabels=col_labels,
                    loc='center', cellLoc='center')
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(11)
+    tbl.set_fontsize(10.5 if has_event else 11)
     tbl.scale(1.0, 1.6)
+    try:
+        tbl.auto_set_column_width(col=list(range(len(col_labels))))
+    except AttributeError:
+        pass
 
     # Style header
     for j in range(len(col_labels)):
@@ -1197,7 +1401,7 @@ def save_all_individual_plots(logger: 'MetricsLogger',
 
     # Direct-save plots (they handle savefig internally)
     direct_saves = [
-        (plot_market_quality_table, {'stress_start': stress_start}),
+        (plot_market_quality_table, {'stress_start': stress_start, 'shock_iter': shock_iter}),
         (plot_clob_depth,           {'rolling': rolling}),
         (plot_quoted_spread,        {'rolling': rolling}),
         (plot_h1_summary_table,     {}),

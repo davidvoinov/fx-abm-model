@@ -5,64 +5,64 @@
   },
   "metrics": {
     "avg_cost_bps": {
-      "clob_Q1": 22.406015519184894,
-      "clob_Q20": 278.68156147790955,
-      "clob_Q5": 39.40016422218678,
-      "cpmm_Q5": 118.65849187494123,
-      "hfmm_Q5": 15.126807126880749
+      "clob_Q1": 2.6676404180029656,
+      "clob_Q20": 3.7666378367992,
+      "clob_Q5": 2.855425384258986,
+      "cpmm_Q5": 249.47476495718496,
+      "hfmm_Q5": 16.53338664783849
     },
     "avg_flow_share": {
-      "clob": 0.6601721611712207,
+      "clob": 0.9854291243511777,
       "cpmm": 0.0,
-      "hfmm": 0.331494505495446
+      "hfmm": 0.006237542315488862
     },
     "cost_correlation_Q5": {
-      "clob_cpmm": -0.2709292987297268,
-      "clob_hfmm": 0.10549421808474223
+      "clob_cpmm": 0.18560934673659119,
+      "clob_hfmm": 0.3252615300147816
     },
     "n_iterations": 120,
-    "n_trades": 577,
+    "n_trades": 751,
     "theta_bins": {
       "large": {
         "clob": {
-          "avg_cost_bps": 9.681649648521462,
-          "total_volume": 562.0
+          "avg_cost_bps": 4.15342268512266,
+          "total_volume": 1283.0
         },
         "cpmm": {
           "avg_cost_bps": null,
           "total_volume": 0.0
         },
         "hfmm": {
-          "avg_cost_bps": 63.742151263973305,
-          "total_volume": 407.0
+          "avg_cost_bps": null,
+          "total_volume": 0.0
         }
       },
       "medium": {
         "clob": {
-          "avg_cost_bps": 5.293119587668235,
-          "total_volume": 301.0
+          "avg_cost_bps": 2.562001395804343,
+          "total_volume": 761.0
         },
         "cpmm": {
           "avg_cost_bps": null,
           "total_volume": 0.0
         },
         "hfmm": {
-          "avg_cost_bps": 21.221280221085745,
-          "total_volume": 164.0
+          "avg_cost_bps": 18.039399974314797,
+          "total_volume": 12.0
         }
       },
       "small": {
         "clob": {
-          "avg_cost_bps": 5.391519396613563,
-          "total_volume": 591.0
+          "avg_cost_bps": 1.378491648485549,
+          "total_volume": 953.0
         },
         "cpmm": {
           "avg_cost_bps": null,
           "total_volume": 0.0
         },
         "hfmm": {
-          "avg_cost_bps": 12.56010089657377,
-          "total_volume": 337.0
+          "avg_cost_bps": 12.243742963757853,
+          "total_volume": 25.0
         }
       }
     }

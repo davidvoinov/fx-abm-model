@@ -1,69 +1,79 @@
-# Agent-Based FX Market Model
+# FX ABM Model
 
-The model is an agent-based simulation of the foreign exchange (FX) market in which multiple execution venues - a classical stock market stack (CLOB) and two types of automated market makers (AMMs) - operate simultaneously, competing for the order flow of heterogeneous participants.
+Multi-venue FX agent-based model with one CLOB, one CPMM, and one HFMM. The codebase is centered on `main.py` for single-run simulation, `tests/resilience_test.py` for resilience event studies, `tests/stat_tests.py` for scenario-level statistical comparisons, and `calibration/runner.py` for primary-model acceptance checks.
 
-
-
-## Model structure
+## Structure
 
 ```text
 AgentBasedModel/
-  agents/         # different types of CLOB/AMM traders
-  environment/    # stress periods, exogeneous volatility, funding luquidity
-  events/         # market shocks
-  metrics/        # metrics aggregation
-  simulator/      # arbitary scenarios
-  states/         # market conditions
-  utils/          # math
-  venues/         # CLOB/AMM architecrure
-  visualization/  # graphs and dashboards
+  agents/           trader logic
+  environment/      volatility, funding, fair-price, session state
+  metrics/          logging, resilience, statistics
+  simulator/        main simulation loop
+  utils/            math and order-book primitives
+  venues/           CLOB and AMM venues
+  visualization/    dashboards and plots
+calibration/        primary model manifest, targets, fitter, search runner
+tests/              unit, resilience, scenario-stat, and sweep scripts
+output/             generated artifacts
 ```
 
-## Quick start
+## Setup
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python main.py
-python main.py --amm-share 30
-
-# Multi-seed resilience scatter study
-python tests/resilience_test.py --seeds 40
-
-# Censor-aware resilience study with 80% retracement recovery
-python tests/resilience_test.py
-
-# Override sample size / observation window if needed
-python tests/resilience_test.py --seeds 300 --min-post-shock-window 600
-
-# Save resilience artifacts into a custom folder
-python tests/resilience_test.py --out-dir output/resilience_custom
 ```
 
-The resilience study now writes these artifacts into `output/resilience/`:
+## Main Run
 
-- `resilience_scatter_panels.png` — normalized impact vs observed recovery time, overlaid for `With AMM` and `Without AMM`, with censored points marked separately
-- `recovery_survival_panels.png` — Kaplan-Meier recovery curves by scenario
-- `resilience_scatter_points.csv` — seed-level point data with `series_key`, `amm_enabled`, and `recovered` / `is_censored` flags
-- `resilience_panel_summary.csv` — panel-level summary statistics split by `With AMM` vs `Without AMM`
-- `resilience_priority_metric_points.csv` — seed-level resilience points for spread, depth, execution cost, and composite metrics
-- `resilience_priority_metric_summary.csv` — panel summaries for those priority resilience metrics
-- `resilience_statistical_summary.csv` — bootstrap mean/CI summaries for core resilience endpoints, split by `With AMM` vs `Without AMM`
-- `resilience_pairwise_tests.csv` — pairwise scenario-level statistical comparisons across panels, within each AMM series separately
-- `resilience_comparison_summary.csv` — paired within-seed `With AMM` vs `Without AMM` recovery comparison for each scenario and resilience metric
+```bash
+python main.py
+python main.py --help
+python main.py --preset dealer_liquidity_crisis
+```
 
-Dedicated resilience entrypoints:
+Default routing in `main.py` is `liquidity_aware`. The primary runtime defaults are stored in `calibration/primary_model.json`. Acceptance targets are stored in `calibration/primary_model_targets.json`.
 
-- `tests/resilience_test.py` writes to `output/resilience/` by default.
-- Override with `--out-dir` to change only the destination folder.
-- By default, `tests/resilience_test.py` uses `fixed_share` top-level venue routing.
+## Research Scripts
 
-Routing note:
+```bash
+python tests/unit_test.py
+python tests/resilience_test.py --seeds 300 --base-seed 42 --n-iter 900 --out-dir output/resilience_aware_300
+python tests/stat_tests.py --seeds 300 --base-seed 42 --n-iter 900 --out-dir output/scenario_stats_300
+python calibration/runner.py --current-only
+```
 
-- `main.py` now defaults to `liquidity_aware` top-level venue routing.
-- Explicit `--amm-share ...` opts into the legacy `fixed_share` AMM/CLOB split.
-- Explicit `--venue-choice-rule fixed_share` or `--venue-choice-rule liquidity_aware` still works for direct control.
-- Dashboards and plots remain separated by effective routing mode.
-- `main.py` writes into `output/main_aware/` when the effective venue rule is `liquidity_aware`.
-- `main.py` writes into `output/main_fixed/` when the effective venue rule is `fixed_share`.
+`tests/resilience_test.py` writes nine files per run:
+
+- `resilience_scatter_panels.png`
+- `recovery_survival_panels.png`
+- `resilience_scatter_points.csv`
+- `resilience_panel_summary.csv`
+- `resilience_priority_metric_points.csv`
+- `resilience_priority_metric_summary.csv`
+- `resilience_statistical_summary.csv`
+- `resilience_pairwise_tests.csv`
+- `resilience_comparison_summary.csv`
+
+`tests/stat_tests.py` writes nine files per run:
+
+- `rq1_effect_dashboard.png`
+- `rq1_tests.csv`
+- `rq2_effect_dashboard.png`
+- `rq2_tests.csv`
+- `rq_effect_heatmap_summary.png`
+- `rq_stat_points.csv`
+- `rq_stat_summary.csv`
+- `rq_statistical_summary.csv`
+- `rq_with_without_amm_tests.csv`
+
+## Outputs
+
+Versioned output directories in this repository:
+
+- `output/resilience_aware_300/`
+- `output/scenario_stats_300/`
+
+All other local output folders remain ignored.

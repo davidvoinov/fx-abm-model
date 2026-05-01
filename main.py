@@ -20,7 +20,7 @@ Shock scenarios:
 Fixed liquidity share scenarios (no shocks, but different AMM/CLOB splits):
      python3 main.py --seed 42 --amm-share 30      
 
-CLOB/AAMM only:
+CLOB/AMM only:
     python3 main.py --seed 42 --preset clob_only
     python3 main.py --seed 42 --preset amm_only              
 
@@ -32,10 +32,14 @@ Use  python3 main.py --help  for the full list.
 """
 
 import argparse
+import json
 import math
 import os
+import re
 import sys
 import statistics
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -46,6 +50,172 @@ from AgentBasedModel.visualization.dashboards import (
     generate_all_dashboards,
     save_all_individual_plots,
 )
+from calibration.fitter import build_acceptance_report
+
+
+PRIMARY_MODEL_PATH = Path(__file__).resolve().parent / "calibration" / "primary_model.json"
+PRIMARY_TARGETS_PATH = Path(__file__).resolve().parent / "calibration" / "primary_model_targets.json"
+
+
+def load_primary_model_spec(config_path: Optional[Path] = None) -> dict:
+    path = PRIMARY_MODEL_PATH if config_path is None else Path(config_path)
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def load_primary_model_defaults(config_path: Optional[Path] = None) -> dict:
+    payload = load_primary_model_spec(config_path)
+    return payload.get("cli_defaults", {})
+
+
+def load_primary_model_targets(path: Optional[Path] = None) -> dict:
+    target_path = PRIMARY_TARGETS_PATH if path is None else Path(path)
+    if not target_path.exists():
+        return {}
+    try:
+        with target_path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _infer_acceptance_scenario(args: argparse.Namespace) -> str:
+    if args.preset == 'baseline':
+        return 'baseline_primary'
+    if args.preset in REALISM_PRESETS:
+        return args.preset
+    if args.shock_iter is not None:
+        return 'custom_shock'
+    if args.stress_start >= 0:
+        return 'custom_stress'
+    return 'baseline_primary'
+
+
+def _apply_primary_model_parser_defaults(parser: argparse.ArgumentParser):
+    defaults = load_primary_model_defaults()
+    if not defaults:
+        return
+    for action in parser._actions:
+        if action.dest in defaults:
+            action.default = defaults[action.dest]
+
+
+_HELP_DEFAULT_PATTERN = re.compile(r'\(default:\s*([^)]+)\)')
+
+
+def _format_action_default_for_help(action: argparse.Action, original_fragment: str) -> str:
+    value = action.default
+    fragment = original_fragment.strip().lower()
+
+    if isinstance(value, bool):
+        return 'on' if value else 'off'
+    if value is None:
+        return 'off' if 'off' in fragment else 'None'
+
+    if isinstance(value, float):
+        numeric = f'{value:g}'
+    else:
+        numeric = str(value)
+
+    if '= off' in fragment:
+        return f'{numeric} = off' if isinstance(value, (int, float)) and float(value) < 0 else numeric
+    if '=' in fragment and 'bps' in fragment and isinstance(value, (int, float)):
+        return f'{numeric} = {float(value) * 10_000:g} bps'
+    if 'bps' in fragment:
+        return f'{numeric} bps'
+    if fragment.endswith('x'):
+        return f'{numeric}x'
+    return numeric
+
+
+def _sync_parser_help_defaults(parser: argparse.ArgumentParser):
+    for action in parser._actions:
+        help_text = getattr(action, 'help', None)
+        if not help_text or '(default:' not in help_text:
+            continue
+
+        match = _HELP_DEFAULT_PATTERN.search(help_text)
+        if not match:
+            continue
+
+        default_text = _format_action_default_for_help(action, match.group(1))
+        action.help = _HELP_DEFAULT_PATTERN.sub(f'(default: {default_text})', help_text, count=1)
+
+
+def _same_value(lhs, rhs) -> bool:
+    if lhs is None or rhs is None:
+        return lhs is rhs
+    if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+        return math.isclose(float(lhs), float(rhs), rel_tol=0.0, abs_tol=1e-9)
+    return lhs == rhs
+
+
+def _primary_model_overrides(args: argparse.Namespace) -> list[dict]:
+    defaults = load_primary_model_defaults()
+    overrides = []
+    for key, expected in defaults.items():
+        if not hasattr(args, key):
+            continue
+        actual = getattr(args, key)
+        if not _same_value(actual, expected):
+            overrides.append({
+                'field': key,
+                'primary_value': expected,
+                'run_value': actual,
+            })
+    return overrides
+
+
+def _primary_run_label(args: argparse.Namespace) -> str:
+    overrides = _primary_model_overrides(args)
+    if not overrides:
+        return 'primary'
+    short = ', '.join(item['field'] for item in overrides[:4])
+    if len(overrides) > 4:
+        short += f', +{len(overrides) - 4} more'
+    return f'ablation(primary - {short})'
+
+
+def save_primary_model_artifacts(args: argparse.Namespace, out_dir: str,
+                                 acceptance_report: Optional[dict] = None):
+    os.makedirs(out_dir, exist_ok=True)
+    spec = load_primary_model_spec()
+    targets = load_primary_model_targets()
+    overrides = _primary_model_overrides(args)
+    run_manifest = {
+        'run_label': _primary_run_label(args),
+        'generated_at_utc': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'primary_model_version': spec.get('version'),
+        'primary_model_name': spec.get('model_name'),
+        'pair_class': spec.get('pair_class'),
+        'session_scope': spec.get('session_scope'),
+        'calibration_spec_file': PRIMARY_TARGETS_PATH.name if targets else None,
+        'overrides_from_primary': overrides,
+        'acceptance_summary': acceptance_report.get('summary') if acceptance_report else None,
+    }
+    (Path(out_dir) / 'primary_model_manifest.json').write_text(
+        json.dumps(spec, indent=2, ensure_ascii=False) + '\n',
+        encoding='utf-8',
+    )
+    if targets:
+        (Path(out_dir) / 'primary_model_targets.json').write_text(
+            json.dumps(targets, indent=2, ensure_ascii=False) + '\n',
+            encoding='utf-8',
+        )
+    if acceptance_report:
+        (Path(out_dir) / 'primary_acceptance_report.json').write_text(
+            json.dumps(acceptance_report, indent=2, ensure_ascii=False) + '\n',
+            encoding='utf-8',
+        )
+    (Path(out_dir) / 'run_manifest.json').write_text(
+        json.dumps(run_manifest, indent=2, ensure_ascii=False) + '\n',
+        encoding='utf-8',
+    )
 
 
 # ── Reproducibility: seed BOTH RNGs ─────────────────────────────
@@ -147,6 +317,7 @@ REALISM_PRESETS = {
     "flash_crash": dict(
         shock_iter=350,
         shock_mode="realism",
+        clob_amm_interaction="none",
         # Pure microstructure dislocation: aggressive sell sweep + sudden
         # quote withdrawal, but without a large permanent fair-value shift.
         fundamental_shock_pct=0.0,
@@ -173,7 +344,7 @@ REALISM_PRESETS = {
         order_flow_shock_qty=250.0,
         order_flow_shock_side="sell",
         # Deep cancellation wave: dealers pull quotes (Mancini et al.)
-        liquidity_shock_frac=0.80,
+        liquidity_shock_frac=0.60,
         # Volatility & funding spike (Bollerslev & Melvin)
         funding_vol_shock_intensity=0.80,
         # Restrict arbitrageur capacity during stress
@@ -193,7 +364,7 @@ REALISM_PRESETS = {
         fundamental_shock_pct=0.0,
         order_flow_shock_qty=140.0,
         order_flow_shock_side="sell",
-        liquidity_shock_frac=0.52,
+        liquidity_shock_frac=0.35,
         funding_vol_shock_intensity=1.00,
         arb_trade_fraction_cap=0.06,
         # Slower than a flash crash, faster than a dealer balance-sheet crisis.
@@ -205,12 +376,13 @@ REALISM_PRESETS = {
     ),
     "high_vol_stress": dict(
         shock_mode="realism",
+        clob_amm_interaction="none",
         stress_start=300,
         stress_end=500,
         sigma_low=0.01,
-        sigma_high=0.08,
+        sigma_high=0.06,
         c_low=0.002,
-        c_high=0.020,
+        c_high=0.015,
     ),
 }
 
@@ -662,6 +834,29 @@ def build_parser(default_venue_choice_rule: str = "liquidity_aware") -> argparse
                    help="Number of sequential seeds used in robustness check (default: 5)")
     g.add_argument("--robustness-base-seed", type=int, default=None,
                    help="First seed for robustness check (default: --seed or 42)")
+    g.add_argument("--spillover-artifacts", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Save spillover diagnostics (CSV + PNG) after each main run (default: on)")
+    g.add_argument("--spillover-lag", type=int, default=1,
+                   help="Lag used in directional spillover regressions (default: 1)")
+    g.add_argument("--spillover-roll-window", type=int, default=30,
+                   help="Rolling window for liquidity-change correlation in spillover chart (default: 30)")
+
+    g = p.add_argument_group(
+        "Balance sheets / solvency",
+        "Shared feasibility and financing layer applied to CLOB and AMM execution.\n"
+        "  Negative cash pays funding carry.\n"
+        "  Short inventory pays an additional borrow carry.\n"
+        "  Maintenance breaches trigger forced deleveraging or default."
+    )
+    g.add_argument("--maintenance-margin-ratio", type=float, default=0.06,
+                   help="Maintenance margin requirement as a share of gross exposure (default: 0.06)")
+    g.add_argument("--liquidation-fraction", type=float, default=0.75,
+                   help="Fraction of position targeted in one forced deleveraging step (default: 0.75)")
+    g.add_argument("--borrow-spread-multiplier", type=float, default=0.6,
+                   help="Multiplier on funding cost applied to negative cash balances (default: 0.6)")
+    g.add_argument("--short-borrow-spread-multiplier", type=float, default=0.8,
+                   help="Multiplier on funding cost applied to short inventory notional (default: 0.8)")
 
     g = p.add_argument_group(
         "CLOB agents",
@@ -698,11 +893,13 @@ def build_parser(default_venue_choice_rule: str = "liquidity_aware") -> argparse
                    help="Fraction of the fair-price gap closed by the CLOB per tick (default: 0.35)")
     g.add_argument("--clob-anchor-threshold-bps", type=float, default=5.0,
                    help="Ignore tiny fair-price gaps below this level when anchoring the CLOB (default: 5 bps)")
-    g.add_argument("--clob-near-mid-target-ratio", type=float, default=1.5,
+    g.add_argument("--clob-near-mid-target-ratio", type=float, default=1.0,
                    help="Multiplier for seeded near-mid background liquidity on the CLOB (default: 1.5x)")
+    g.add_argument("--clob-support-max-share", type=float, default=0.45,
+                   help="Max anonymous support-layer depth near mid as a share of trader-owned near-mid depth (default: 1.0)")
     g.add_argument("--clob-amm-interaction", choices=["none", "competition", "toxicity"],
                    default="competition",
-                   help="How AMM conditions affect CLOB MM risk-taking: none, competition, or toxicity (default: competition)")
+                   help="How AMM conditions affect CLOB MM risk-taking: none, competition, or toxicity (default comes from primary model)")
     g.add_argument("--clob-amm-spread-impact-bps", type=float, default=3.0,
                    help="Sensitivity of MM spread-risk relief/penalty from AMM conditions (default: 3.0)")
     g.add_argument("--clob-amm-depth-impact", type=float, default=60.0,
@@ -717,6 +914,26 @@ def build_parser(default_venue_choice_rule: str = "liquidity_aware") -> argparse
                    help="Minimum time endogenous MM stays withdrawn once it retreats (default: 4)")
     g.add_argument("--mm-reentry-ticks", type=int, default=3,
                    help="Ticks spent in the reentering state before returning to normal quoting (default: 3)")
+    g.add_argument("--mm-alpha0-base", type=float, default=2.1,
+                   help="Base MM quoted-spread intercept in bps (default: 2.1)")
+    g.add_argument("--mm-alpha0-step", type=float, default=0.3,
+                   help="Increment added to alpha0 for each additional MM (default: 0.3)")
+    g.add_argument("--mm-alpha1", type=float, default=320.0,
+                   help="MM spread sensitivity to volatility sigma (default: 320)")
+    g.add_argument("--mm-alpha2", type=float, default=700.0,
+                   help="MM spread sensitivity to funding cost c (default: 560)")
+    g.add_argument("--mm-alpha3", type=float, default=35.0,
+                   help="MM spread sensitivity to order-flow imbalance (default: 35)")
+    g.add_argument("--mm-d0-base", type=float, default=138.0,
+                   help="Base MM depth intercept before clob-liq scaling (default: 90)")
+    g.add_argument("--mm-d0-step", type=float, default=5.0,
+                   help="Depth intercept decrement for each additional MM (default: 5)")
+    g.add_argument("--mm-d1", type=float, default=560.0,
+                   help="MM depth sensitivity to volatility sigma (default: 620)")
+    g.add_argument("--mm-d2", type=float, default=360.0,
+                   help="MM depth sensitivity to funding cost c (default: 420)")
+    g.add_argument("--mm-d3", type=float, default=12.0,
+                   help="MM depth sensitivity to order-flow imbalance (default: 18)")
 
     g = p.add_argument_group(
         "FX liquidity takers",
@@ -734,6 +951,12 @@ def build_parser(default_venue_choice_rule: str = "liquidity_aware") -> argparse
                    help="Retail noise traders (default: 10)")
     g.add_argument("--n-institutional", type=int, default=3,
                    help="Institutional traders (default: 3)")
+    g.add_argument("--hedger-flow-persistence", type=float, default=0.24,
+                   help="Directional persistence for hedger/noise takers (default: 0.10)")
+    g.add_argument("--retail-flow-persistence", type=float, default=0.42,
+                   help="Directional persistence for retail-toxic takers (default: 0.28)")
+    g.add_argument("--institutional-flow-persistence", type=float, default=0.24,
+                   help="Directional persistence for real-money takers (default: 0.18)")
 
     g = p.add_argument_group(
         "Flow allocation  (CLOB ↔ AMM split)",
@@ -753,7 +976,7 @@ def build_parser(default_venue_choice_rule: str = "liquidity_aware") -> argparse
                    help="Use deterministic argmin venue choice (overrides any stochastic routing rule)")
     g.add_argument("--beta-amm", type=float, default=0.05,
                    help="Logit sensitivity for CPMM vs HFMM (default: 0.05)")
-    g.add_argument("--cpmm-bias", type=float, default=5.0,
+    g.add_argument("--cpmm-bias", type=float, default=0.0,
                    dest="cpmm_bias_bps",
                    help="CPMM non-monetary cost discount in bps (default: 5)")
     g.add_argument("--cost-noise", type=float, default=1.5,
@@ -782,18 +1005,30 @@ def build_parser(default_venue_choice_rule: str = "liquidity_aware") -> argparse
         "  CPMM: x·y = k,  fee = cpmm-fee.\n"
         "  HFMM: StableSwap invariant,  fee = hfmm-fee, amplification = A."
     )
-    g.add_argument("--cpmm-reserves", type=float, default=1000.0,
+    g.add_argument("--cpmm-reserves", type=float, default=3600.0,
                    help="CPMM base-currency reserves (default: 1000)")
-    g.add_argument("--hfmm-reserves", type=float, default=1000.0,
+    g.add_argument("--hfmm-reserves", type=float, default=3400.0,
                    help="HFMM base-currency reserves (default: 1000)")
-    g.add_argument("--cpmm-fee", type=float, default=0.003,
+    g.add_argument("--cpmm-fee", type=float, default=0.002,
                    help="CPMM swap fee as fraction (default: 0.003 = 30 bps)")
-    g.add_argument("--hfmm-fee", type=float, default=0.001,
+    g.add_argument("--hfmm-fee", type=float, default=0.0005,
                    help="HFMM swap fee as fraction (default: 0.001 = 10 bps)")
-    g.add_argument("--hfmm-A", type=float, default=10.0,
+    g.add_argument("--hfmm-A", type=float, default=18.0,
                    help="HFMM amplification coefficient A (default: 10)")
     g.add_argument("--dynamic-fee", action="store_true",
                    help="Enable dynamic AMM fees that scale with volatility")
+    g.add_argument("--amm-lp-wallet-cash-buffer", type=float, default=0.20,
+                   dest="amm_lp_wallet_cash_buffer_ratio",
+                   help="LP external quote-wallet buffer as a fraction of deployed AMM quote inventory (default: 0.20)")
+    g.add_argument("--amm-lp-wallet-base-buffer", type=float, default=0.20,
+                   dest="amm_lp_wallet_base_buffer_ratio",
+                   help="LP external base-wallet buffer as a fraction of deployed AMM base inventory (default: 0.20)")
+    g.add_argument("--amm-arb-cash-buffer", type=float, default=0.15,
+                   dest="amm_arb_cash_buffer_ratio",
+                   help="Arbitrageur quote-wallet buffer as a fraction of aggregate AMM quote reserves (default: 0.15)")
+    g.add_argument("--amm-arb-base-buffer", type=float, default=0.15,
+                   dest="amm_arb_base_buffer_ratio",
+                   help="Arbitrageur base inventory buffer as a fraction of aggregate AMM base reserves (default: 0.15)")
 
     g = p.add_argument_group(
         "Stress regime",
@@ -828,7 +1063,7 @@ def build_parser(default_venue_choice_rule: str = "liquidity_aware") -> argparse
     )
     g.add_argument("--shock-iter", type=int, default=None,
                    help="Iteration of exogenous price shock (default: off)")
-    g.add_argument("--shock-mode", choices=["research", "realism"], default="research",
+    g.add_argument("--shock-mode", choices=["research", "realism"], default="realism",
                    help="Shock implementation: research keeps unified shock_pct; realism uses decomposed event shocks")
     g.add_argument("--shock-pct", type=float, default=-20.0,
                    help="Shock magnitude in %% (default: -20)")
@@ -857,9 +1092,11 @@ def build_parser(default_venue_choice_rule: str = "liquidity_aware") -> argparse
                    help="Intensity of sigma/funding jump in realism mode (1.0 ~= normal stress jump)")
     g.add_argument("--arb-max-correction-pct", type=float, default=10.0,
                    help="Max AMM price correction per arbitrage step in %% (default: 10)")
-    g.add_argument("--arb-trade-fraction-cap", type=float, default=0.20,
+    g.add_argument("--arb-trade-fraction-cap", type=float, default=0.45,
                    help="Max fraction of AMM base reserves the arbitrageur can trade per step (default: 0.20)")
 
+    _apply_primary_model_parser_defaults(p)
+    _sync_parser_help_defaults(p)
     return p
 
 
@@ -885,14 +1122,32 @@ def build_sim(args: argparse.Namespace) -> Simulator:
         clob_anchor_strength=args.clob_anchor_strength,
         clob_anchor_threshold_bps=args.clob_anchor_threshold_bps,
         clob_background_target_ratio=args.clob_near_mid_target_ratio,
+        clob_support_max_share=args.clob_support_max_share,
         clob_amm_interaction=args.clob_amm_interaction,
         clob_amm_spread_impact_bps=args.clob_amm_spread_impact_bps,
         clob_amm_depth_impact=args.clob_amm_depth_impact,
+        mm_alpha0_base=args.mm_alpha0_base,
+        mm_alpha0_step=args.mm_alpha0_step,
+        mm_alpha1=args.mm_alpha1,
+        mm_alpha2=args.mm_alpha2,
+        mm_alpha3=args.mm_alpha3,
+        mm_d0_base=args.mm_d0_base,
+        mm_d0_step=args.mm_d0_step,
+        mm_d1=args.mm_d1,
+        mm_d2=args.mm_d2,
+        mm_d3=args.mm_d3,
+        hedger_flow_persistence=args.hedger_flow_persistence,
+        retail_flow_persistence=args.retail_flow_persistence,
+        institutional_flow_persistence=args.institutional_flow_persistence,
         mm_withdraw_threshold=args.mm_withdraw_threshold,
         mm_reentry_threshold=args.mm_reentry_threshold,
         mm_loss_threshold_bps=args.mm_loss_threshold_bps,
         mm_min_withdraw_ticks=args.mm_min_withdraw_ticks,
         mm_reentry_ticks=args.mm_reentry_ticks,
+        maintenance_margin_ratio=args.maintenance_margin_ratio,
+        liquidation_fraction=args.liquidation_fraction,
+        borrow_spread_multiplier=args.borrow_spread_multiplier,
+        short_borrow_spread_multiplier=args.short_borrow_spread_multiplier,
         enable_amm=bool(args.enable_amm),
         amm_liq=args.amm_liq,
         match_initial_depth=args.match_initial_depth,
@@ -924,6 +1179,10 @@ def build_sim(args: argparse.Namespace) -> Simulator:
         funding_vol_shock_intensity=args.funding_vol_shock_intensity,
         arb_max_correction_pct=args.arb_max_correction_pct,
         arb_trade_fraction_cap=args.arb_trade_fraction_cap,
+        amm_lp_wallet_cash_buffer_ratio=args.amm_lp_wallet_cash_buffer_ratio,
+        amm_lp_wallet_base_buffer_ratio=args.amm_lp_wallet_base_buffer_ratio,
+        amm_arb_cash_buffer_ratio=args.amm_arb_cash_buffer_ratio,
+        amm_arb_base_buffer_ratio=args.amm_arb_base_buffer_ratio,
         dynamic_fee=args.dynamic_fee,
         reprice_prob_recovery=getattr(args, 'reprice_prob_recovery', None),
         anchor_strength_recovery=getattr(args, 'anchor_strength_recovery', None),
@@ -954,6 +1213,8 @@ def print_config(args: argparse.Namespace):
     if args.preset:
         row("Preset applied", args.preset)
         row("Preset family", _preset_family(args.preset))
+    row("Primary config", PRIMARY_MODEL_PATH.name if PRIMARY_MODEL_PATH.exists() else "none")
+    row("Run label", getattr(args, 'run_label', 'primary'))
 
     eff_mm = args.n_mm if args.enable_clob_mm else 0
     shadow = bool(args.enable_amm) and eff_mm == 0
@@ -972,9 +1233,21 @@ def print_config(args: argparse.Namespace):
     row("CLOB anchor strength", f"{args.clob_anchor_strength:.2f}")
     row("CLOB anchor threshold", f"{args.clob_anchor_threshold_bps:.1f}", "bps")
     row("Near-mid target", f"{args.clob_near_mid_target_ratio:.1f}", "×")
+    row("Support max share", f"{args.clob_support_max_share:.2f}", "×")
     row("AMM interaction", args.clob_amm_interaction)
     row("AMM spread impact", f"{args.clob_amm_spread_impact_bps:.1f}", "bps")
     row("AMM depth impact", f"{args.clob_amm_depth_impact:.1f}")
+    row("MM alpha0 base", f"{args.mm_alpha0_base:.2f}", "bps")
+    row("MM alpha1 / alpha2", f"{args.mm_alpha1:.0f}/{args.mm_alpha2:.0f}")
+    row("MM alpha3", f"{args.mm_alpha3:.0f}")
+    row("MM d0 base", f"{args.mm_d0_base:.1f}")
+    row("MM d1 / d2 / d3", f"{args.mm_d1:.0f}/{args.mm_d2:.0f}/{args.mm_d3:.0f}")
+
+    print("\n  Balance sheets / solvency")
+    row("Maint. margin ratio", f"{args.maintenance_margin_ratio:.3f}")
+    row("Liquidation fraction", f"{args.liquidation_fraction:.2f}")
+    row("Borrow carry multiplier", f"{args.borrow_spread_multiplier:.2f}")
+    row("Short carry multiplier", f"{args.short_borrow_spread_multiplier:.2f}")
 
     print("\n  FX liquidity takers")
     row("Noise takers", str(args.n_fx_takers))
@@ -983,6 +1256,9 @@ def print_config(args: argparse.Namespace):
     row("Institutional", str(args.n_institutional))
     total = args.n_fx_takers + args.n_fx_fund + args.n_retail + args.n_institutional
     row("Total takers", str(total))
+    row("Hedger persistence", f"{args.hedger_flow_persistence:.2f}")
+    row("Retail persistence", f"{args.retail_flow_persistence:.2f}")
+    row("Institutional persistence", f"{args.institutional_flow_persistence:.2f}")
 
     print("\n  Flow allocation")
     row("AMM share target", f"{args.amm_share_pct:.0f}", "%")
@@ -1004,6 +1280,10 @@ def print_config(args: argparse.Namespace):
         row("HFMM amplification A", f"{args.hfmm_A:.0f}")
         row("Dynamic fees", "ON" if args.dynamic_fee else "OFF")
         row("AMM liquidity multiplier", f"{args.amm_liq:.1f}", "×")
+        row("LP wallet cash buffer", f"{args.amm_lp_wallet_cash_buffer_ratio:.2f}", "×")
+        row("LP wallet base buffer", f"{args.amm_lp_wallet_base_buffer_ratio:.2f}", "×")
+        row("Arb wallet cash buffer", f"{args.amm_arb_cash_buffer_ratio:.2f}", "×")
+        row("Arb wallet base buffer", f"{args.amm_arb_base_buffer_ratio:.2f}", "×")
 
     print("\n  Stress regime")
     if args.stress_start >= 0:
@@ -1046,7 +1326,7 @@ def print_config(args: argparse.Namespace):
     print("=" * W + "\n")
 
 
-def print_summary(sim: Simulator):
+def print_summary(sim: Simulator, acceptance_report: Optional[dict] = None):
     logger = sim.logger
     summary = logger.summary()
 
@@ -1429,6 +1709,31 @@ def print_summary(sim: Simulator):
             system_recovery = float('inf') if any(rt == float('inf') for rt in recovery_times) else max(recovery_times)
             print(f"\n  {'System-wide max':<24s}  {'—':>10s}  {'—':>10s}  {_fmt(system_recovery):>10s}")
 
+    if acceptance_report and acceptance_report.get('summary'):
+        acc = acceptance_report['summary']
+
+        def _fmt_acceptance_value(value):
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                return f"{float(value):.3g}"
+            return "N/A"
+
+        print("\n" + "-" * W)
+        print("  PRIMARY MODEL ACCEPTANCE")
+        print("-" * W)
+        print(f"  Status:       {acc.get('status', 'fail').upper()}")
+        print(f"  Passed:       {acc.get('passed_targets', 0)}/{acc.get('evaluated_targets', 0)}")
+        print(f"  Objective:    {_fmt_acceptance_value(acc.get('objective_score', float('nan')))}")
+        for item in acceptance_report.get('targets', []):
+            if item.get('status') == 'not_evaluable':
+                continue
+            print(
+                f"    {item['observable']:<32s} {item['status'].upper():>4s}  "
+                f"realized={_fmt_acceptance_value(item.get('realized_value'))}  "
+                f"target={_fmt_acceptance_value(item.get('target'))}"
+            )
+
     print("=" * W + "\n")
 
 
@@ -1464,6 +1769,211 @@ def generate_all_plots(sim: Simulator, logger_no_amm=None,
     )
 
 
+def _spillover_safe_series(values):
+    out = []
+    for value in values:
+        out.append(float(value) if (value is not None and math.isfinite(value)) else float('nan'))
+    return out
+
+
+def _spillover_rolling_corr(x, y, window: int):
+    sx = pd.Series(x, dtype='float64')
+    sy = pd.Series(y, dtype='float64')
+    return sx.rolling(window=window, min_periods=window).corr(sy).tolist()
+
+
+def _spillover_standardized_beta(y, x, beta: float, lag: int):
+    """Standardized lagged-beta: beta * std(x_{t-lag}) / std(y_t)."""
+    if not math.isfinite(beta):
+        return float('nan')
+    lag = max(1, int(lag))
+    if len(y) <= lag or len(x) <= lag:
+        return float('nan')
+
+    ys = y[lag:]
+    xs = x[:-lag]
+    pairs = [(xi, yi) for xi, yi in zip(xs, ys) if math.isfinite(xi) and math.isfinite(yi)]
+    if len(pairs) < 3:
+        return float('nan')
+
+    xs_f, ys_f = zip(*pairs)
+    sx = float(np.std(xs_f))
+    sy = float(np.std(ys_f))
+    if not (math.isfinite(sx) and math.isfinite(sy) and sy > 0):
+        return float('nan')
+    return float(beta) * (sx / sy)
+
+
+def save_spillover_artifacts(sim: Simulator,
+                             out_dir: str,
+                             lag: int = 1,
+                             rolling_window: int = 30,
+                             prefix: str = 'spillover_main'):
+    """Save spillover diagnostics for every main-model run."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    logger = sim.logger
+    if len(logger.iterations) < 3:
+        print('Spillover artifacts: skipped (too few observations).')
+        return
+
+    if not hasattr(logger, 'liquidity_spillover_metrics'):
+        print('Spillover artifacts: skipped (logger has no spillover metrics API).')
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    lag = max(1, int(lag))
+    rolling_window = max(5, int(rolling_window))
+    split_at = _shock_iter_from_sim(sim)
+
+    if hasattr(logger, 'clob_total_depth_series'):
+        clob_depth = logger.clob_total_depth_series()
+    else:
+        clob_depth = [d.get('total', float('nan')) for d in logger.clob_depth]
+
+    if hasattr(logger, 'amm_total_depth_series'):
+        amm_depth = logger.amm_total_depth_series()
+    else:
+        amm_depth = [0.0 for _ in range(len(logger.iterations))]
+
+    d_clob = logger._log_diff(clob_depth)
+    d_amm = logger._log_diff(amm_depth)
+    roll_corr = _spillover_rolling_corr(d_clob, d_amm, rolling_window)
+    spill = logger.liquidity_spillover_metrics(lag=lag, split_at=split_at)
+
+    split_idx = None
+    if split_at is not None:
+        split_idx = max(0, min(int(split_at) - 1, min(len(d_clob), len(d_amm))))
+
+    beta_std = {
+        'full': {
+            'amm_to_clob': _spillover_standardized_beta(
+                d_clob, d_amm, spill['amm_to_clob'].get('beta', float('nan')), lag,
+            ),
+            'clob_to_amm': _spillover_standardized_beta(
+                d_amm, d_clob, spill['clob_to_amm'].get('beta', float('nan')), lag,
+            ),
+        },
+        'before': {'amm_to_clob': float('nan'), 'clob_to_amm': float('nan')},
+        'after': {'amm_to_clob': float('nan'), 'clob_to_amm': float('nan')},
+    }
+
+    if split_idx is not None:
+        before = spill.get('before_after', {}).get('before', {})
+        after = spill.get('before_after', {}).get('after', {})
+        beta_std['before']['amm_to_clob'] = _spillover_standardized_beta(
+            d_clob[:split_idx], d_amm[:split_idx],
+            before.get('amm_to_clob', {}).get('beta', float('nan')), lag,
+        )
+        beta_std['before']['clob_to_amm'] = _spillover_standardized_beta(
+            d_amm[:split_idx], d_clob[:split_idx],
+            before.get('clob_to_amm', {}).get('beta', float('nan')), lag,
+        )
+        beta_std['after']['amm_to_clob'] = _spillover_standardized_beta(
+            d_clob[split_idx:], d_amm[split_idx:],
+            after.get('amm_to_clob', {}).get('beta', float('nan')), lag,
+        )
+        beta_std['after']['clob_to_amm'] = _spillover_standardized_beta(
+            d_amm[split_idx:], d_clob[split_idx:],
+            after.get('clob_to_amm', {}).get('beta', float('nan')), lag,
+        )
+
+    pre_end = min(len(clob_depth), split_at) if split_at is not None else len(clob_depth)
+    pre_clob = [x for x in clob_depth[:pre_end] if math.isfinite(x)]
+    pre_amm = [x for x in amm_depth[:pre_end] if math.isfinite(x)]
+    base_clob = (sum(pre_clob) / len(pre_clob)) if pre_clob else 1.0
+    base_amm = (sum(pre_amm) / len(pre_amm)) if pre_amm else 1.0
+    clob_idx = [x / base_clob if math.isfinite(x) and base_clob > 0 else float('nan') for x in clob_depth]
+    amm_idx = [x / base_amm if math.isfinite(x) and base_amm > 0 else float('nan') for x in amm_depth]
+
+    df = pd.DataFrame({
+        't': list(range(len(clob_depth))),
+        'clob_depth_total': _spillover_safe_series(clob_depth),
+        'amm_depth_total': _spillover_safe_series(amm_depth),
+        'clob_depth_index': _spillover_safe_series(clob_idx),
+        'amm_depth_index': _spillover_safe_series(amm_idx),
+    })
+    if len(d_clob):
+        df_d = pd.DataFrame({
+            't': list(range(1, len(clob_depth))),
+            'dlog_clob_depth': _spillover_safe_series(d_clob),
+            'dlog_amm_depth': _spillover_safe_series(d_amm),
+            f'rolling_corr_w{rolling_window}': _spillover_safe_series(roll_corr),
+        })
+        df = df.merge(df_d, on='t', how='left')
+
+    csv_path = os.path.join(out_dir, f'{prefix}.csv')
+    df.to_csv(csv_path, index=False)
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=False)
+
+    x0 = np.arange(len(clob_idx))
+    axes[0].plot(x0, clob_idx, label='CLOB depth index', color='#1f77b4', lw=2)
+    axes[0].plot(x0, amm_idx, label='AMM depth index', color='#2ca02c', lw=2)
+    if split_at is not None:
+        axes[0].axvline(split_at, color='#d62728', ls='--', lw=1.5, label='shock')
+    axes[0].set_title('Liquidity Levels: CLOB vs AMM (indexed to pre-shock mean)')
+    axes[0].set_ylabel('Index')
+    axes[0].grid(alpha=0.3)
+    axes[0].legend(loc='upper right', fontsize=9)
+
+    x1 = np.arange(1, len(clob_depth))
+    axes[1].plot(x1, _spillover_safe_series(roll_corr), color='#9467bd', lw=2)
+    axes[1].axhline(0.0, color='#333333', ls=':', lw=1.0)
+    if split_at is not None:
+        axes[1].axvline(split_at, color='#d62728', ls='--', lw=1.5)
+    axes[1].set_title(f'Rolling correlation of liquidity changes (window={rolling_window})')
+    axes[1].set_ylabel('corr')
+    axes[1].grid(alpha=0.3)
+
+    labels = ['AMM->CLOB', 'CLOB->AMM']
+    full_betas = [beta_std['full']['amm_to_clob'], beta_std['full']['clob_to_amm']]
+    before_betas = [beta_std['before']['amm_to_clob'], beta_std['before']['clob_to_amm']]
+    after_betas = [beta_std['after']['amm_to_clob'], beta_std['after']['clob_to_amm']]
+
+    pos = np.arange(len(labels))
+    wbar = 0.25
+    axes[2].bar(pos - wbar, full_betas, width=wbar, color='#1f77b4', label='full sample')
+    axes[2].bar(pos, before_betas, width=wbar, color='#ff7f0e', label='before')
+    axes[2].bar(pos + wbar, after_betas, width=wbar, color='#2ca02c', label='after')
+    axes[2].axhline(0.0, color='#333333', ls=':', lw=1.0)
+    axes[2].set_xticks(pos)
+    axes[2].set_xticklabels(labels)
+    axes[2].set_ylabel('standardized beta')
+    axes[2].set_title(f'Directional spillovers (standardized, lag={lag})')
+    axes[2].grid(alpha=0.3)
+    axes[2].legend(loc='upper right', fontsize=9)
+
+    fig.suptitle('Spillover diagnostics (main run)', fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    png_path = os.path.join(out_dir, f'{prefix}.png')
+    fig.savefig(png_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+
+    print('\nSpillover artifacts saved:')
+    print(f'  CSV -> {csv_path}')
+    print(f'  PNG -> {png_path}')
+    print(f'  Flow shares: CLOB={spill.get("avg_flow_share_clob", float("nan")):.3f} '
+          f'AMM={spill.get("avg_flow_share_amm", float("nan")):.3f}')
+    print('  Raw beta full: '
+          f'AMM->CLOB={spill["amm_to_clob"].get("beta", float("nan")):.6g}, '
+          f'CLOB->AMM={spill["clob_to_amm"].get("beta", float("nan")):.6g}')
+    print('  Std beta full: '
+          f'AMM->CLOB={beta_std["full"]["amm_to_clob"]:.6g}, '
+          f'CLOB->AMM={beta_std["full"]["clob_to_amm"]:.6g}')
+    print('  Bootstrap full (95% CI, p_boot): '
+        f'AMM->CLOB=[{spill["amm_to_clob"].get("beta_boot_lo", float("nan")):.6g}, '
+        f'{spill["amm_to_clob"].get("beta_boot_hi", float("nan")):.6g}], '
+        f'p={spill["amm_to_clob"].get("p_boot", float("nan")):.4f}; '
+        f'CLOB->AMM=[{spill["clob_to_amm"].get("beta_boot_lo", float("nan")):.6g}, '
+        f'{spill["clob_to_amm"].get("beta_boot_hi", float("nan")):.6g}], '
+        f'p={spill["clob_to_amm"].get("p_boot", float("nan")):.4f}')
+
+
 def _cli_flag_present(flag: str, argv: list[str]) -> bool:
     return any(arg == flag or arg.startswith(f'{flag}=') for arg in argv)
 
@@ -1497,6 +2007,7 @@ def _run_main(argv: Optional[list[str]] = None):
 
     # 2. Auto-generate stress around shock (AFTER preset applied)
     _auto_stress_around_shock(args)
+    args.run_label = _primary_run_label(args)
 
     # 3. Seed both RNGs
     if args.seed is not None:
@@ -1507,8 +2018,19 @@ def _run_main(argv: Optional[list[str]] = None):
     sim = build_sim(args)
     sim.simulate(args.n_iter, silent=args.silent)
 
+    target_payload = load_primary_model_targets()
+    acceptance_report = None
+    acceptance_scenario = _infer_acceptance_scenario(args)
+    if target_payload.get('targets'):
+        acceptance_report = build_acceptance_report(
+            sim,
+            target_payload=target_payload,
+            run_label=args.run_label,
+            scenario_name=acceptance_scenario,
+        )
+
     if not args.no_summary:
-        print_summary(sim)
+        print_summary(sim, acceptance_report=acceptance_report)
 
     if args.robustness_check:
         print_robustness_summary(args)
@@ -1533,6 +2055,16 @@ def _run_main(argv: Optional[list[str]] = None):
     if not args.no_plots:
         generate_all_plots(sim, logger_no_amm=logger_no_amm,
                            out_dir=plot_out_dir)
+
+    if args.spillover_artifacts:
+        save_spillover_artifacts(
+            sim,
+            out_dir=plot_out_dir,
+            lag=args.spillover_lag,
+            rolling_window=args.spillover_roll_window,
+        )
+
+    save_primary_model_artifacts(args, plot_out_dir, acceptance_report=acceptance_report)
 
 
 def main():

@@ -61,7 +61,8 @@ class MarketEnvironment:
                  price_reversion: float = 0.12,
                  price_vol_scale: float = 0.35,
                  shock_anchor_weight: float = 0.75,
-                 shock_price_freeze_ticks: int = 1):
+                 shock_price_freeze_ticks: int = 1,
+                 session_cycle: int = 24):
         """
         Parameters
         ----------
@@ -120,6 +121,9 @@ class MarketEnvironment:
         self.background_target_ratio_override: Optional[float] = None
         self.toxic_flow_bias: float = 0.0         # directional bias for takers
         self._order_flow_imbalance: float = 0.0   # signed taker flow pressure
+        self._logged_order_flow_imbalance: float = 0.0
+        self._clob_order_flow_imbalance: float = 0.0
+        self._logged_clob_order_flow_imbalance: float = 0.0
         self._liquidity_shock: float = 0.0        # systemic liquidity damage
         self._liquidity_shock_decay: float = 0.90
 
@@ -130,6 +134,13 @@ class MarketEnvironment:
         self._toxic_flow_decay: float = 0.85            # multiplicative per tick
         self._systemic_liquidity: float = 1.0
         self._recovery_support: float = 1.0
+        self._amm_order_flow_imbalance: float = 0.0
+        self._logged_amm_order_flow_imbalance: float = 0.0
+        self._amm_slippage_signal: float = 0.0
+        self._amm_reserve_imbalance: float = 0.0
+        self._venue_basis_bps: float = 0.0
+        self._pool_dispersion_bps: float = 0.0
+        self._arbitrage_capacity: float = 0.0
 
         # ── Fair price (latent-anchor mean reversion) ───────────────
         self._price: Optional[float] = float(price) if price is not None else None
@@ -140,11 +151,17 @@ class MarketEnvironment:
         self._shock_anchor_weight = max(0.0, min(1.0, shock_anchor_weight))
         self._shock_price_freeze_default = max(0, int(shock_price_freeze_ticks))
         self._price_freeze_ticks = 0
+        self._session_cycle = max(4, int(session_cycle))
+        self._session_name = 'Asia'
+        self._session_flow_multiplier = 0.85
+        self._session_liquidity_multiplier = 0.90
+        self._session_vol_multiplier = 0.92
 
         # History
         self.sigma_history: List[float] = []
         self.c_history: List[float] = []
         self.regime_history: List[str] = []
+        self.session_history: List[str] = []
         self.price_history: List[float] = []  # S_t series
         self.flow_imbalance_history: List[float] = []
         self.systemic_liquidity_history: List[float] = []
@@ -170,9 +187,75 @@ class MarketEnvironment:
         return self._order_flow_imbalance
 
     @property
+    def logged_order_flow_imbalance(self) -> float:
+        """Raw period signed flow imbalance used for diagnostics."""
+        return self._logged_order_flow_imbalance
+
+    @property
+    def clob_order_flow_imbalance(self) -> float:
+        """EWMA of signed CLOB taker flow, positive for buy pressure."""
+        return self._clob_order_flow_imbalance
+
+    @property
+    def logged_clob_order_flow_imbalance(self) -> float:
+        """Raw period signed CLOB flow imbalance used for diagnostics."""
+        return self._logged_clob_order_flow_imbalance
+
+    @property
+    def amm_order_flow_imbalance(self) -> float:
+        """EWMA of signed AMM taker flow, positive for buy pressure."""
+        return self._amm_order_flow_imbalance
+
+    @property
+    def logged_amm_order_flow_imbalance(self) -> float:
+        """Raw period AMM signed flow imbalance used for diagnostics."""
+        return self._logged_amm_order_flow_imbalance
+
+    @property
     def systemic_liquidity(self) -> float:
         """Common liquidity factor shared across venues in [0.2, 1.0]."""
         return self._systemic_liquidity
+
+    @property
+    def liquidity_shock(self) -> float:
+        """Residual liquidity-crisis intensity carried across the shock aftermath."""
+        return self._liquidity_shock
+
+    @property
+    def amm_slippage_signal(self) -> float:
+        return self._amm_slippage_signal
+
+    @property
+    def amm_reserve_imbalance(self) -> float:
+        return self._amm_reserve_imbalance
+
+    @property
+    def venue_basis_bps(self) -> float:
+        return self._venue_basis_bps
+
+    @property
+    def pool_dispersion_bps(self) -> float:
+        return self._pool_dispersion_bps
+
+    @property
+    def arbitrage_capacity(self) -> float:
+        return self._arbitrage_capacity
+
+    @property
+    def session_name(self) -> str:
+        return self._session_name
+
+    @property
+    def session_flow_multiplier(self) -> float:
+        return self._session_flow_multiplier
+
+    @property
+    def session_liquidity_multiplier(self) -> float:
+        return self._session_liquidity_multiplier
+
+    @property
+    def session_vol_multiplier(self) -> float:
+        return self._session_vol_multiplier
 
     def is_stress(self) -> bool:
         if self.stress_start is None:
@@ -196,6 +279,10 @@ class MarketEnvironment:
             self._step_piecewise()
         else:
             self._step_stochastic()
+
+        self._update_session_state()
+        self._sigma *= self._session_vol_multiplier
+        self._c *= 1.0 + 0.20 * (self._session_vol_multiplier - 1.0)
 
         # Add shock-induced stress overlay (decays each step)
         if self._shock_sigma_overlay > 1e-8:
@@ -242,6 +329,16 @@ class MarketEnvironment:
         else:
             self._order_flow_imbalance = 0.0
 
+        if abs(self._clob_order_flow_imbalance) > 0.01:
+            self._clob_order_flow_imbalance *= 0.90
+        else:
+            self._clob_order_flow_imbalance = 0.0
+
+        if abs(self._amm_order_flow_imbalance) > 0.01:
+            self._amm_order_flow_imbalance *= 0.90
+        else:
+            self._amm_order_flow_imbalance = 0.0
+
         if self._liquidity_shock > 1e-8:
             self._liquidity_shock *= liquidity_shock_decay
 
@@ -257,6 +354,7 @@ class MarketEnvironment:
         self.sigma_history.append(self._sigma)
         self.c_history.append(self._c)
         self.regime_history.append('stress' if self.is_stress() else 'normal')
+        self.session_history.append(self._session_name)
         if self._price is not None:
             self.price_history.append(self._price)
         self.flow_imbalance_history.append(self._order_flow_imbalance)
@@ -409,7 +507,42 @@ class MarketEnvironment:
         )
         gross = buy_vol + sell_vol
         imbalance = (buy_vol - sell_vol) / gross if gross > 0 else 0.0
+        self._logged_order_flow_imbalance = imbalance
         self._order_flow_imbalance = 0.65 * self._order_flow_imbalance + 0.35 * imbalance
+
+        clob_buy_vol = sum(
+            tr.get('quantity', 0.0)
+            for tr in period_trades
+            if tr.get('side') == 'buy' and tr.get('venue') == 'clob'
+        )
+        clob_sell_vol = sum(
+            tr.get('quantity', 0.0)
+            for tr in period_trades
+            if tr.get('side') == 'sell' and tr.get('venue') == 'clob'
+        )
+        clob_gross = clob_buy_vol + clob_sell_vol
+        clob_imbalance = (clob_buy_vol - clob_sell_vol) / clob_gross if clob_gross > 0 else 0.0
+        self._logged_clob_order_flow_imbalance = clob_imbalance
+        self._clob_order_flow_imbalance = (
+            0.65 * self._clob_order_flow_imbalance + 0.35 * clob_imbalance
+        )
+
+        amm_buy_vol = sum(
+            tr.get('quantity', 0.0)
+            for tr in period_trades
+            if tr.get('side') == 'buy' and tr.get('venue') != 'clob'
+        )
+        amm_sell_vol = sum(
+            tr.get('quantity', 0.0)
+            for tr in period_trades
+            if tr.get('side') == 'sell' and tr.get('venue') != 'clob'
+        )
+        amm_gross = amm_buy_vol + amm_sell_vol
+        amm_imbalance = (amm_buy_vol - amm_sell_vol) / amm_gross if amm_gross > 0 else 0.0
+        self._logged_amm_order_flow_imbalance = amm_imbalance
+        self._amm_order_flow_imbalance = (
+            0.70 * self._amm_order_flow_imbalance + 0.30 * amm_imbalance
+        )
 
         sigma_base = max(self.sigma_low, 1e-9)
         stress_scale = max(1.0, self._sigma / sigma_base)
@@ -417,6 +550,111 @@ class MarketEnvironment:
         flow_damage = 0.08 * abs(self._order_flow_imbalance) * (stress_excess + self._liquidity_shock)
         self._liquidity_shock = min(0.85, self._liquidity_shock + flow_damage)
         self._update_systemic_liquidity()
+
+    def observe_venue_conditions(self, clob, amm_pools: dict, arbitrageur=None):
+        """Update AMM-specific venue stress signals from live cross-venue state."""
+        if not amm_pools:
+            self._amm_slippage_signal = 0.0
+            self._amm_reserve_imbalance = 0.0
+            self._venue_basis_bps = 0.0
+            self._pool_dispersion_bps = 0.0
+            self._arbitrage_capacity = 0.0
+            return
+
+        clob_mid = None
+        try:
+            clob_mid = clob.mid_price()
+        except Exception:
+            clob_mid = None
+        if clob_mid is not None and (not math.isfinite(clob_mid) or clob_mid <= 0):
+            clob_mid = None
+
+        pool_states = []
+        reserve_imbalances = []
+        depths = []
+        for pool in amm_pools.values():
+            try:
+                mid = pool.mid_price()
+            except Exception:
+                continue
+            if not math.isfinite(mid) or mid <= 0:
+                continue
+            pool_state = {
+                'pool': pool,
+                'mid': float(mid),
+            }
+            try:
+                depth = pool.effective_depth(clob_mid if clob_mid is not None else mid)
+            except Exception:
+                depth = float('nan')
+            pool_state['depth'] = depth
+            if math.isfinite(depth) and depth > 0:
+                depths.append(float(depth))
+            try:
+                reserve_ratio = pool.y / max(pool.x * mid, 1e-9)
+                reserve_imbalances.append(min(1.0, abs(reserve_ratio - 1.0)))
+            except Exception:
+                pass
+            pool_states.append(pool_state)
+
+        if not pool_states:
+            self._amm_slippage_signal = 0.0
+            self._amm_reserve_imbalance = 0.0
+            self._venue_basis_bps = 0.0
+            self._pool_dispersion_bps = 0.0
+            self._arbitrage_capacity = 0.0
+            return
+
+        pool_mids = [state['mid'] for state in pool_states]
+        amm_mid = sum(pool_mids) / len(pool_mids)
+        ref_mid = clob_mid if clob_mid is not None else amm_mid
+
+        basis_vals = []
+        dispersion_vals = []
+        slippage_vals = []
+        probe_qty = 5.0
+        if depths:
+            probe_qty = max(1.0, min(10.0, 0.01 * (sum(depths) / len(depths))))
+
+        for state in pool_states:
+            pool = state['pool']
+            pool_mid = state['mid']
+            if ref_mid > 0:
+                basis_vals.append(abs(pool_mid - ref_mid) / ref_mid * 10_000.0)
+            if amm_mid > 0:
+                dispersion_vals.append(abs(pool_mid - amm_mid) / amm_mid * 10_000.0)
+            try:
+                buy_quote = pool.quote_buy(probe_qty, S_t=ref_mid)
+                sell_quote = pool.quote_sell(probe_qty, S_t=ref_mid)
+                buy_slip = max(0.0, float(buy_quote.get('slippage_bps', 0.0)))
+                sell_slip = max(0.0, float(sell_quote.get('slippage_bps', 0.0)))
+                slippage_vals.append(0.5 * (buy_slip + sell_slip))
+            except Exception:
+                pass
+
+        self._amm_slippage_signal = (
+            sum(slippage_vals) / len(slippage_vals) if slippage_vals else 0.0
+        )
+        self._amm_reserve_imbalance = (
+            sum(reserve_imbalances) / len(reserve_imbalances) if reserve_imbalances else 0.0
+        )
+        self._venue_basis_bps = sum(basis_vals) / len(basis_vals) if basis_vals else 0.0
+        self._pool_dispersion_bps = (
+            sum(dispersion_vals) / len(dispersion_vals) if dispersion_vals else 0.0
+        )
+
+        trade_cap = getattr(arbitrageur, 'trade_fraction_cap', 0.0) if arbitrageur is not None else 0.0
+        correction_cap = getattr(arbitrageur, 'max_correction_pct', 0.0) if arbitrageur is not None else 0.0
+        depth_scale = min(1.0, (sum(depths) / len(depths)) / max(10.0 * probe_qty, 1.0)) if depths else 0.0
+        basis_penalty = 1.0 / (1.0 + self._venue_basis_bps / 40.0)
+        self._arbitrage_capacity = max(
+            0.0,
+            min(
+                1.0,
+                self._systemic_liquidity * depth_scale * basis_penalty
+                * (trade_cap + correction_cap),
+            ),
+        )
 
     def set_recovery_support(self, support: float):
         """Set resiliency support from active book-side liquidity providers."""
@@ -481,4 +719,30 @@ class MarketEnvironment:
             + 0.35 * flow_pressure
             + self._liquidity_shock
         )
-        self._systemic_liquidity = max(0.2, min(1.0, 1.0 / (1.0 + friction)))
+        liquidity = 1.0 / (1.0 + friction)
+        liquidity *= self._session_liquidity_multiplier
+        self._systemic_liquidity = max(0.2, min(1.0, liquidity))
+
+    def _update_session_state(self):
+        """Simple intraday FX session cycle for flow and liquidity timing."""
+        bucket = self._t % self._session_cycle
+        if bucket < 6:
+            self._session_name = 'Asia'
+            self._session_flow_multiplier = 0.85
+            self._session_liquidity_multiplier = 0.90
+            self._session_vol_multiplier = 0.92
+        elif bucket < 12:
+            self._session_name = 'London'
+            self._session_flow_multiplier = 1.10
+            self._session_liquidity_multiplier = 1.05
+            self._session_vol_multiplier = 1.05
+        elif bucket < 17:
+            self._session_name = 'Overlap'
+            self._session_flow_multiplier = 1.25
+            self._session_liquidity_multiplier = 1.10
+            self._session_vol_multiplier = 1.12
+        else:
+            self._session_name = 'NewYork'
+            self._session_flow_multiplier = 1.00
+            self._session_liquidity_multiplier = 0.98
+            self._session_vol_multiplier = 1.00

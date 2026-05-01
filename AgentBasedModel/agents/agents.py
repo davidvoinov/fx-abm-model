@@ -22,8 +22,10 @@ class ExchangeAgent:
 
     def __init__(self, price: Union[float, int] = 100, std: Union[float, int] = 25, volume: int = 1000,
                  rf: float = 5e-4, transaction_cost: float = 0,
+                 price_tick: float = 0.005,
                  background_corridor_bps: float = 25.0,
                  background_target_ratio: float = 1.0,
+                 background_max_share_of_trader_depth: float = 1.0,
                  anchor_strength: float = 1.0,
                  anchor_threshold_bps: float = 0.0):
         """
@@ -44,12 +46,17 @@ class ExchangeAgent:
         self._seed_price = float(price)
         self._seed_std = float(std)
         self._seed_volume = int(volume)
+        self._price_tick = max(1e-4, float(price_tick))
         self._seed_qty_lo = max(1, volume // 500)
         self._seed_qty_hi = max(5, volume // 100)
         self._background_corridor_bps = max(5.0, float(background_corridor_bps))
         self._background_target_ratio = max(1.0, float(background_target_ratio))
+        # Keep calm near-mid background support from collapsing with transient trader-depth decay.
+        self._background_floor_ratio = 0.71
+        self._background_max_share_of_trader_depth = max(0.0, float(background_max_share_of_trader_depth))
         self._anchor_strength = max(0.0, min(1.0, float(anchor_strength)))
         self._anchor_threshold_bps = max(0.0, float(anchor_threshold_bps))
+        self._last_book_mid_price = float(price)
         self._fill_book(price, std, volume, rf * price)
         background_qty = self._background_qty_near_mid(
             float(price), self._background_corridor_bps
@@ -92,6 +99,8 @@ class ExchangeAgent:
                         order.trader.orders.remove(order)
                     except ValueError:
                         pass
+                    if hasattr(order.trader, 'release_order_reservation'):
+                        order.trader.release_order_reservation(order)
                 self.order_book[side].remove(order)
 
     def rebuild_order_book(self):
@@ -112,16 +121,32 @@ class ExchangeAgent:
             best_ask = self.order_book['ask'].first.price
 
             if best_bid >= best_ask:
+                tick = self._tick_size()
                 mid = 0.5 * (best_bid + best_ask)
-                target_bid = _math.floor((mid - 0.005) * 100.0) / 100.0
-                target_ask = _math.ceil((mid + 0.005) * 100.0) / 100.0
+                target_bid = self.floor_price(mid - 0.5 * tick)
+                target_ask = self.ceil_price(mid + 0.5 * tick)
                 bid_shift = best_bid - target_bid
                 ask_shift = target_ask - best_ask
 
                 for order in self.order_book['bid']:
-                    order.price = round(order.price - bid_shift, 2)
+                    order.price = self.round_price(order.price - bid_shift)
                 for order in self.order_book['ask']:
-                    order.price = round(order.price + ask_shift, 2)
+                    order.price = self.round_price(order.price + ask_shift)
+
+    def _tick_size(self) -> float:
+        return max(1e-4, float(getattr(self, '_price_tick', 0.01)))
+
+    def round_price(self, price: float) -> float:
+        tick = self._tick_size()
+        return round(round(float(price) / tick) * tick, 3)
+
+    def floor_price(self, price: float) -> float:
+        tick = self._tick_size()
+        return round(_math.floor(float(price) / tick + 1e-12) * tick, 3)
+
+    def ceil_price(self, price: float) -> float:
+        tick = self._tick_size()
+        return round(_math.ceil(float(price) / tick - 1e-12) * tick, 3)
 
     def _background_qty_near_mid(self, reference_price: float, corridor_bps: float) -> dict:
         if reference_price <= 0:
@@ -140,33 +165,58 @@ class ExchangeAgent:
             ),
         }
 
+    def _trader_qty_near_mid(self, reference_price: float, corridor_bps: float) -> dict:
+        if reference_price <= 0:
+            return {'bid': 0.0, 'ask': 0.0}
+
+        bid_lo = reference_price * (1.0 - corridor_bps / 10_000.0)
+        ask_hi = reference_price * (1.0 + corridor_bps / 10_000.0)
+        return {
+            'bid': sum(
+                order.qty for order in self.order_book['bid']
+                if order.trader is not None and order.price >= bid_lo
+            ),
+            'ask': sum(
+                order.qty for order in self.order_book['ask']
+                if order.trader is not None and order.price <= ask_hi
+            ),
+        }
+
     def _draw_background_price(self, side: str, reference_price: float,
-                               corridor_bps: float) -> float:
-        tick = 0.01
+                               corridor_bps: float,
+                               aggressiveness: float = 1.0) -> float:
+        tick = self._tick_size()
         max_offset = max(tick, reference_price * corridor_bps / 10_000.0)
-        scale = max(tick, max_offset / 3.0)
-        offset = min(max_offset, tick + random.expovariate(1.0 / scale))
+        aggressiveness = max(0.25, min(1.0, float(aggressiveness)))
+        widen_mult = 1.0 + 2.5 * (1.0 - aggressiveness)
+        min_offset = tick * widen_mult
+        scale = max(tick, max_offset / (3.0 * aggressiveness))
+        offset = min(max_offset, min_offset + random.expovariate(1.0 / scale))
 
         if side == 'bid':
-            return round(reference_price - offset, 2)
-        return round(reference_price + offset, 2)
+            return self.round_price(reference_price - offset)
+        return self.round_price(reference_price + offset)
 
     def _draw_background_price_outside_corridor(self, side: str,
                                                 reference_price: float,
-                                                corridor_bps: float) -> float:
-        tick = 0.01
-        min_offset = max(tick, reference_price * corridor_bps / 10_000.0 + tick)
-        scale = max(tick, min_offset / 2.0)
+                                                corridor_bps: float,
+                                                aggressiveness: float = 1.0) -> float:
+        tick = self._tick_size()
+        aggressiveness = max(0.25, min(1.0, float(aggressiveness)))
+        widen_mult = 1.0 + 1.5 * (1.0 - aggressiveness)
+        min_offset = max(tick, reference_price * corridor_bps / 10_000.0 + tick * widen_mult)
+        scale = max(tick, min_offset / (2.0 * aggressiveness))
         offset = min_offset + random.expovariate(1.0 / scale)
 
         if side == 'bid':
-            return round(reference_price - offset, 2)
-        return round(reference_price + offset, 2)
+            return self.round_price(reference_price - offset)
+        return self.round_price(reference_price + offset)
 
     def set_background_depth_target(self, reference_price: float,
                                     total_target_qty: float,
                                     corridor_bps: float = None,
-                                    rebalance: bool = True):
+                                    rebalance: bool = True,
+                                    respect_trader_cap: bool = True):
         if reference_price is None or reference_price <= 0:
             return
 
@@ -179,19 +229,29 @@ class ExchangeAgent:
                 reference_price,
                 corridor_bps=corridor_bps,
                 target_ratio=1.0,
+                respect_trader_cap=respect_trader_cap,
             )
 
     def rebalance_background_liquidity(self, reference_price: float,
                                        corridor_bps: float = None,
-                                       target_ratio: float = 1.0):
+                                       target_ratio: float = 1.0,
+                                       respect_trader_cap: bool = True):
         if reference_price is None or reference_price <= 0:
             return
 
         corridor_bps = corridor_bps or self._background_corridor_bps
-        targets = {
-            side: max(1.0, self._background_target_qty.get(side, 0.0) * target_ratio)
-            for side in ('bid', 'ask')
-        }
+        effective_aggressiveness = max(0.25, min(1.0, float(target_ratio)))
+        trader_near_qty = self._trader_qty_near_mid(reference_price, corridor_bps)
+        targets = {}
+        for side in ('bid', 'ask'):
+            scaled_target = max(1.0, self._background_target_qty.get(side, 0.0) * target_ratio)
+            if respect_trader_cap:
+                scaled_target = min(
+                    scaled_target,
+                    scaled_target * self._background_floor_ratio
+                    + self._background_max_share_of_trader_depth * max(0.0, trader_near_qty.get(side, 0.0))
+                )
+            targets[side] = scaled_target
         changed = False
 
         bid_lo = reference_price * (1.0 - corridor_bps / 10_000.0)
@@ -218,23 +278,75 @@ class ExchangeAgent:
 
             while near_qty > targets[side] and near_orders:
                 order = near_orders.pop(0)
-                order.price = self._draw_background_price_outside_corridor(
-                    side,
-                    reference_price,
-                    corridor_bps,
-                )
-                near_qty -= order.qty
+                excess = near_qty - targets[side]
+                move_qty = min(order.qty, excess)
+                if move_qty <= 0:
+                    break
+                if move_qty + 1e-9 < order.qty:
+                    order.qty -= move_qty
+                    moved = Order(
+                        self._draw_background_price_outside_corridor(
+                            side,
+                            reference_price,
+                            corridor_bps,
+                            aggressiveness=effective_aggressiveness,
+                        ),
+                        move_qty,
+                        side,
+                        None,
+                    )
+                    self.order_book[side].append(moved)
+                else:
+                    order.price = self._draw_background_price_outside_corridor(
+                        side,
+                        reference_price,
+                        corridor_bps,
+                        aggressiveness=effective_aggressiveness,
+                    )
+                near_qty -= move_qty
                 changed = True
 
             while near_qty < targets[side] and far_orders:
                 order = far_orders.pop(0)
-                order.price = self._draw_background_price(side, reference_price, corridor_bps)
-                near_qty += order.qty
+                gap = targets[side] - near_qty
+                move_qty = min(order.qty, gap)
+                if move_qty <= 0:
+                    break
+                if move_qty + 1e-9 < order.qty:
+                    order.qty -= move_qty
+                    moved = Order(
+                        self._draw_background_price(
+                            side,
+                            reference_price,
+                            corridor_bps,
+                            aggressiveness=effective_aggressiveness,
+                        ),
+                        move_qty,
+                        side,
+                        None,
+                    )
+                    self.order_book[side].append(moved)
+                else:
+                    order.price = self._draw_background_price(
+                        side,
+                        reference_price,
+                        corridor_bps,
+                        aggressiveness=effective_aggressiveness,
+                    )
+                near_qty += move_qty
                 changed = True
 
             while near_qty < targets[side]:
-                qty = random.randint(self._seed_qty_lo, self._seed_qty_hi)
-                price = self._draw_background_price(side, reference_price, corridor_bps)
+                gap = targets[side] - near_qty
+                qty = min(random.randint(self._seed_qty_lo, self._seed_qty_hi), gap)
+                if qty <= 0:
+                    break
+                price = self._draw_background_price(
+                    side,
+                    reference_price,
+                    corridor_bps,
+                    aggressiveness=effective_aggressiveness,
+                )
                 self.order_book[side].append(Order(price, qty, side, None))
                 near_qty += qty
                 changed = True
@@ -275,8 +387,13 @@ class ExchangeAgent:
             Ignore tiny deviations below this threshold.  If None,
             uses the exchange default.
         """
+        if fair_price is None or fair_price <= 0:
+            return
         sp = self.spread()
-        if sp is None or fair_price is None or fair_price <= 0:
+        if sp is None:
+            # After a shock cancel-wave one side can be empty. Re-seed the
+            # anonymous background around fair value so the book can recover.
+            self.rebalance_background_liquidity(fair_price, target_ratio=background_target_ratio)
             return
         book_mid = (sp['bid'] + sp['ask']) / 2.0
         anchor_strength = self._anchor_strength if anchor_strength is None else max(0.0, min(1.0, anchor_strength))
@@ -298,11 +415,16 @@ class ExchangeAgent:
         for side in ('bid', 'ask'):
             for order in self.order_book[side]:
                 if order.trader is None:
-                    order.price = round(order.price + dp, 2)
+                    order.price = self.round_price(order.price + dp)
                     repriced = True
                 elif random.random() < reprice_prob:
                     noise = random.gauss(0, noise_std) if noise_std > 0 else 0.0
-                    order.price = round(order.price + dp + noise, 2)
+                    new_price = self.round_price(order.price + dp + noise)
+                    if hasattr(order.trader, 'adjust_order_price'):
+                        if not order.trader.adjust_order_price(order, new_price, self.transaction_cost):
+                            continue
+                    else:
+                        order.price = new_price
                     repriced = True
 
         if repriced:
@@ -337,6 +459,8 @@ class ExchangeAgent:
                         order.trader.orders.remove(order)
                     except ValueError:
                         pass
+                    if hasattr(order.trader, 'release_order_reservation'):
+                        order.trader.release_order_reservation(order)
                 self.order_book[side].remove(order)
 
     def _fill_book(self, price, std, volume, div: float = 0.05):
@@ -346,16 +470,16 @@ class ExchangeAgent:
         # Order book — qty range scales with volume for deeper books
         qty_lo = max(1, volume // 500)
         qty_hi = max(5, volume // 100)
-        prices1 = [round(random.normalvariate(price - std, std), 2) for _ in range(volume // 2)]
-        prices2 = [round(random.normalvariate(price + std, std), 2) for _ in range(volume // 2)]
+        prices1 = [self.round_price(random.normalvariate(price - std, std)) for _ in range(volume // 2)]
+        prices2 = [self.round_price(random.normalvariate(price + std, std)) for _ in range(volume // 2)]
         quantities = [random.randint(qty_lo, qty_hi) for _ in range(volume)]
 
         for (p, q) in zip(sorted(prices1 + prices2), quantities):
             if p > price:
-                order = Order(round(p, 2), q, 'ask', None)
+                order = Order(self.round_price(p), q, 'ask', None)
                 self.order_book['ask'].append(order)
             else:
-                order = Order(p, q, 'bid', None)
+                order = Order(self.round_price(p), q, 'bid', None)
                 self.order_book['bid'].push(order)
 
         # Dividend book
@@ -379,7 +503,10 @@ class ExchangeAgent:
         :return: {'bid': float, 'ask': float}
         """
         if self.order_book['bid'] and self.order_book['ask']:
-            return {'bid': self.order_book['bid'].first.price, 'ask': self.order_book['ask'].first.price}
+            bid = self.order_book['bid'].first.price
+            ask = self.order_book['ask'].first.price
+            self._last_book_mid_price = 0.5 * (bid + ask)
+            return {'bid': bid, 'ask': ask}
         return None
 
     def spread_volume(self) -> Optional[dict]:
@@ -415,6 +542,10 @@ class ExchangeAgent:
 
         :return: void
         """
+        if order.trader is not None and hasattr(order.trader, 'prepare_limit_order'):
+            if not order.trader.prepare_limit_order(order, self.transaction_cost):
+                return False
+
         sp = self.spread()
         if sp is None:
             # Book empty — insert directly (no matching possible)
@@ -422,25 +553,27 @@ class ExchangeAgent:
                 self.order_book['bid'].insert(order)
             elif order.order_type == 'ask':
                 self.order_book['ask'].insert(order)
-            return
+            return True
 
         bid, ask = sp.values()
         t_cost = self.transaction_cost
         if not bid or not ask:
-            return
+            return False
 
         if order.order_type == 'bid':
             if order.price >= ask:
                 order = self.order_book['ask'].fulfill(order, t_cost)
             if order.qty > 0:
                 self.order_book['bid'].insert(order)
-            return
+            return True
 
         elif order.order_type == 'ask':
             if order.price <= bid:
                 order = self.order_book['bid'].fulfill(order, t_cost)
             if order.qty > 0:
                 self.order_book['ask'].insert(order)
+            return True
+        return False
 
     def market_order(self, order: Order) -> Order:
         """
@@ -465,6 +598,8 @@ class ExchangeAgent:
             self.order_book['bid'].remove(order)
         elif order.order_type == 'ask':
             self.order_book['ask'].remove(order)
+        if order.trader is not None and hasattr(order.trader, 'release_order_reservation'):
+            order.trader.release_order_reservation(order)
 
 
 class Trader:
@@ -479,7 +614,9 @@ class Trader:
                  deterministic_venue: bool = False,
                  beta_amm: float = 0.05,
                  cpmm_bias_bps: float = 5.0,
-                 cost_noise_std: float = 1.5):
+                 cost_noise_std: float = 1.5,
+                 max_cash_borrow: float = 0.0,
+                 max_short_assets: float = 0.0):
         """
         Trader that is activated on call to perform action.
 
@@ -506,6 +643,18 @@ class Trader:
 
         self.cash = cash
         self.assets = assets
+        self.max_cash_borrow = max(0.0, float(max_cash_borrow))
+        self.max_short_assets = max(0.0, float(max_short_assets))
+        self.reserved_cash = 0.0
+        self.reserved_assets = 0.0
+        self.maintenance_margin_ratio = 0.0
+        self.liquidation_fraction = 0.5
+        self.borrow_spread_multiplier = 1.0
+        self.short_borrow_spread_multiplier = 1.25
+        self.defaulted = False
+        self.default_reason: Optional[str] = None
+        self.last_financing_charge = 0.0
+        self.cumulative_financing_charge = 0.0
 
         # Multi-venue (optional)
         self.clob = clob
@@ -530,26 +679,293 @@ class Trader:
     def __str__(self) -> str:
         return f'{self.name} ({self.type})'
 
-    def equity(self):
-        price = self.market.price() if self.market.price() is not None else 0
+    def equity(self, reference_price: Optional[float] = None):
+        price = reference_price
+        if price is None:
+            price = self.market.price() if self.market.price() is not None else 0
         return self.cash + self.assets * price
 
+    def gross_exposure(self, reference_price: Optional[float] = None) -> float:
+        price = reference_price
+        if price is None:
+            price = self.market.price() if self.market.price() is not None else 0.0
+        price = max(0.0, float(price))
+        borrowed_cash = max(0.0, -self.cash)
+        return borrowed_cash + abs(self.assets) * price
+
+    def maintenance_margin_required(self, reference_price: Optional[float] = None) -> float:
+        return max(0.0, self.maintenance_margin_ratio) * self.gross_exposure(reference_price)
+
+    def has_margin_breach(self, reference_price: Optional[float] = None) -> bool:
+        return self.equity(reference_price) + 1e-9 < self.maintenance_margin_required(reference_price)
+
+    def cancel_all_resting_orders(self):
+        for order in self.orders.copy():
+            try:
+                self._cancel_order(order)
+            except Exception:
+                pass
+
+    def apply_financing_charge(self, reference_price: Optional[float], funding_cost: float) -> float:
+        if self.defaulted:
+            self.last_financing_charge = 0.0
+            return 0.0
+
+        ref_price = max(0.0, float(reference_price or 0.0))
+        base_rate = max(0.0, float(funding_cost))
+        borrowed_cash = max(0.0, -self.cash)
+        short_notional = max(0.0, -self.assets) * ref_price
+        charge = borrowed_cash * base_rate * max(0.0, self.borrow_spread_multiplier)
+        charge += short_notional * base_rate * max(0.0, self.short_borrow_spread_multiplier)
+        if charge > 0.0:
+            self.cash -= charge
+            self.cumulative_financing_charge += charge
+        self.last_financing_charge = charge
+        return charge
+
+    def _mark_default(self, reason: str):
+        self.cancel_all_resting_orders()
+        self.defaulted = True
+        self.default_reason = reason
+
+    def enforce_balance_sheet_discipline(self, reference_price: Optional[float] = None) -> dict:
+        if self.defaulted:
+            return {'status': 'defaulted', 'reason': self.default_reason}
+
+        ref_price = reference_price
+        if ref_price is None:
+            ref_price = self.market.price() if self.market.price() is not None else 0.0
+        ref_price = max(0.0, float(ref_price))
+
+        hard_cash_breach = self.cash < -self.max_cash_borrow - 1e-9
+        hard_short_breach = self.assets < -self.max_short_assets - 1e-9
+        margin_breach = self.has_margin_breach(ref_price)
+        if not (hard_cash_breach or hard_short_breach or margin_breach):
+            return {'status': 'ok'}
+
+        self.cancel_all_resting_orders()
+
+        best_bid = None
+        best_ask = None
+        try:
+            if self.market.order_book['bid']:
+                best_bid = self.market.order_book['bid'].first.price
+            if self.market.order_book['ask']:
+                best_ask = self.market.order_book['ask'].first.price
+        except Exception:
+            pass
+
+        if self.assets > 0.0 and (hard_cash_breach or margin_breach):
+            cash_target = -0.8 * self.max_cash_borrow
+            cash_gap = max(0.0, cash_target - self.cash)
+            bid_ref = max(1e-9, float(best_bid if best_bid is not None else ref_price or 1.0))
+            qty_for_cash = int(_math.ceil(cash_gap / bid_ref)) if cash_gap > 0 else 0
+            qty_for_margin = int(_math.ceil(max(0.0, self.assets) * max(0.0, self.liquidation_fraction))) if margin_breach else 0
+            qty_to_sell = max(qty_for_cash, qty_for_margin)
+            if qty_to_sell > 0:
+                self._execute_clob(qty_to_sell, 'sell')
+
+        if self.assets < 0.0 and (hard_short_breach or margin_breach):
+            short_excess = max(0.0, abs(self.assets) - 0.8 * self.max_short_assets)
+            qty_for_short = int(_math.ceil(short_excess)) if short_excess > 0 else 0
+            qty_for_margin = int(_math.ceil(abs(self.assets) * max(0.0, self.liquidation_fraction))) if margin_breach else 0
+            qty_to_buy = max(qty_for_short, qty_for_margin)
+            if qty_to_buy > 0:
+                self._execute_clob(qty_to_buy, 'buy')
+
+        if self.cash < -self.max_cash_borrow - 1e-9:
+            self._mark_default('cash_limit_breach')
+        elif self.assets < -self.max_short_assets - 1e-9:
+            self._mark_default('short_limit_breach')
+        elif self.has_margin_breach(ref_price):
+            self._mark_default('maintenance_margin_breach')
+
+        return {
+            'status': 'defaulted' if self.defaulted else 'stabilized',
+            'reason': self.default_reason,
+            'cash': self.cash,
+            'assets': self.assets,
+        }
+
+    def available_cash(self) -> float:
+        return self.cash + self.max_cash_borrow - self.reserved_cash
+
+    def available_assets(self) -> float:
+        return self.assets + self.max_short_assets - self.reserved_assets
+
+    def prepare_limit_order(self, order: Order, t_cost: float) -> bool:
+        if order.trader is not self:
+            return False
+        if getattr(order, 'reserved_cash', 0.0) > 0.0 or getattr(order, 'reserved_assets', 0.0) > 0.0:
+            return True
+        if order.qty <= 0:
+            return False
+        if order.order_type == 'bid':
+            reserve = max(0.0, order.price * order.qty * (1.0 + t_cost))
+            if reserve > self.available_cash() + 1e-9:
+                return False
+            order.reserved_cash = reserve
+            self.reserved_cash += reserve
+            return True
+        reserve = float(order.qty)
+        if reserve > self.available_assets() + 1e-9:
+            return False
+        order.reserved_assets = reserve
+        self.reserved_assets += reserve
+        return True
+
+    def release_order_reservation(self, order: Order):
+        cash_release = min(getattr(order, 'reserved_cash', 0.0), self.reserved_cash)
+        asset_release = min(getattr(order, 'reserved_assets', 0.0), self.reserved_assets)
+        if cash_release > 0.0:
+            self.reserved_cash -= cash_release
+        if asset_release > 0.0:
+            self.reserved_assets -= asset_release
+        order.reserved_cash = 0.0
+        order.reserved_assets = 0.0
+
+    def adjust_order_price(self, order: Order, new_price: float, t_cost: float) -> bool:
+        if order.trader is not self:
+            return False
+        if order.order_type != 'bid':
+            order.price = new_price
+            return True
+        new_reserve = max(0.0, new_price * order.qty * (1.0 + t_cost))
+        delta = new_reserve - getattr(order, 'reserved_cash', 0.0)
+        if delta > self.available_cash() + 1e-9:
+            return False
+        self.reserved_cash += delta
+        order.reserved_cash = new_reserve
+        order.price = new_price
+        return True
+
+    def apply_fill(self, order: Order, fill_qty: float, fill_price: float,
+                   t_cost: float, is_buy: bool, qty_before: float):
+        if qty_before > 0.0 and getattr(order, 'reserved_cash', 0.0) > 0.0:
+            release = min(order.reserved_cash, order.reserved_cash * fill_qty / qty_before)
+            order.reserved_cash -= release
+            self.reserved_cash = max(0.0, self.reserved_cash - release)
+        if qty_before > 0.0 and getattr(order, 'reserved_assets', 0.0) > 0.0:
+            release = min(order.reserved_assets, order.reserved_assets * fill_qty / qty_before)
+            order.reserved_assets -= release
+            self.reserved_assets = max(0.0, self.reserved_assets - release)
+
+        gross = fill_price * fill_qty
+        if is_buy:
+            self.cash -= gross * (1.0 + t_cost)
+            self.assets += fill_qty
+        else:
+            self.cash += gross * (1.0 - t_cost)
+            self.assets -= fill_qty
+
+    def _clob_venue(self):
+        if self.clob is not None:
+            return self.clob
+        from AgentBasedModel.venues.clob import CLOBVenue
+        return CLOBVenue(self.market)
+
+    def _affordable_limit_buy_qty(self, quantity: float, price: float) -> int:
+        unit_cost = price * (1.0 + self.market.transaction_cost)
+        if unit_cost <= 0:
+            return 0
+        return max(0, min(int(round(quantity)), int(self.available_cash() // unit_cost)))
+
+    def _sellable_limit_qty(self, quantity: float) -> int:
+        return max(0, min(int(round(quantity)), int(self.available_assets())))
+
+    def _affordable_market_buy_qty(self, quantity: float) -> int:
+        target = max(0, int(round(quantity)))
+        if target <= 0:
+            return 0
+        venue = self._clob_venue()
+        lo, hi, best = 0, target, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if mid <= 0:
+                lo = 1
+                continue
+            quote = venue.quote_buy(mid)
+            cost = quote.get('exec_price', float('inf')) * mid * (1.0 + self.market.transaction_cost)
+            feasible = quote.get('cost_bps', float('inf')) != float('inf') and cost <= self.available_cash() + 1e-9
+            if feasible:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    def _sellable_market_qty(self, quantity: float) -> int:
+        target = max(0, int(round(quantity)))
+        return max(0, min(target, int(self.available_assets())))
+
+    def _clip_amm_buy_qty(self, pool, quantity: float) -> float:
+        target = max(0.0, float(quantity))
+        if target <= 0.0:
+            return 0.0
+        available_cash = self.available_cash()
+        if available_cash <= 0.0:
+            return 0.0
+        hi = min(target, max(0.0, pool.x * 0.949))
+        if hi <= 0.0:
+            return 0.0
+        hi_quote = pool.quote_buy(hi)
+        if hi_quote.get('cost_bps', float('inf')) != float('inf') and hi_quote.get('delta_y', float('inf')) <= available_cash:
+            return hi
+        lo = 0.0
+        best = 0.0
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            if mid <= 0.0:
+                break
+            quote = pool.quote_buy(mid)
+            feasible = quote.get('cost_bps', float('inf')) != float('inf') and quote.get('delta_y', float('inf')) <= available_cash
+            if feasible:
+                best = mid
+                lo = mid
+            else:
+                hi = mid
+        return best
+
+    def _clip_amm_sell_qty(self, quantity: float) -> float:
+        return max(0.0, min(float(quantity), self.available_assets()))
+
     def _buy_limit(self, quantity, price):
-        order = Order(round(price, 2), round(quantity), 'bid', self)
-        self.orders.append(order)
-        self.market.limit_order(order)
+        if self.defaulted:
+            return 0
+        quote_price = self.market.round_price(price) if hasattr(self.market, 'round_price') else round(price, 2)
+        quantity = self._affordable_limit_buy_qty(quantity, quote_price)
+        if quantity <= 0:
+            return 0
+        order = Order(quote_price, quantity, 'bid', self)
+        accepted = self.market.limit_order(order)
+        if accepted and order.qty > 0:
+            self.orders.append(order)
+        return order.qty
 
     def _sell_limit(self, quantity, price):
-        order = Order(round(price, 2), round(quantity), 'ask', self)
-        self.orders.append(order)
-        self.market.limit_order(order)
+        if self.defaulted:
+            return 0
+        quantity = self._sellable_limit_qty(quantity)
+        if quantity <= 0:
+            return 0
+        quote_price = self.market.round_price(price) if hasattr(self.market, 'round_price') else round(price, 2)
+        order = Order(quote_price, quantity, 'ask', self)
+        accepted = self.market.limit_order(order)
+        if accepted and order.qty > 0:
+            self.orders.append(order)
+        return order.qty
 
     def _buy_market(self, quantity) -> int:
         """
         :return: quantity unfulfilled
         """
+        if self.defaulted:
+            return 0
+        quantity = self._affordable_market_buy_qty(quantity)
+        if quantity <= 0:
+            return 0
         if not self.market.order_book['ask']:
-            return quantity
+            return 0
         order = Order(self.market.order_book['ask'].last.price, round(quantity), 'bid', self)
         return self.market.market_order(order).qty
 
@@ -557,8 +973,13 @@ class Trader:
         """
         :return: quantity unfulfilled
         """
+        if self.defaulted:
+            return 0
+        quantity = self._sellable_market_qty(quantity)
+        if quantity <= 0:
+            return 0
         if not self.market.order_book['bid']:
-            return quantity
+            return 0
         order = Order(self.market.order_book['bid'].last.price, round(quantity), 'ask', self)
         return self.market.market_order(order).qty
 
@@ -597,7 +1018,7 @@ class Trader:
         return perceived
 
     def _liquidity_aware_pick(self, costs: Dict[str, float], Q: float) -> str:
-        """Route across all venues using cost, executable depth, and AMM price alignment."""
+        """Route via an endogenous CLOB-vs-AMM group choice, then pick an AMM pool."""
         amm_names = [name for name in costs if name != 'clob']
         if not amm_names:
             return 'clob'
@@ -608,44 +1029,113 @@ class Trader:
         except Exception:
             ref_mid = float('nan')
 
-        amm_prior = max(0.0, min(1.0, self.amm_share_pct / 100.0))
-        clob_prior = max(0.05, 1.0 - amm_prior)
-        amm_prior_each = max(0.05, amm_prior / max(len(amm_names), 1))
+        try:
+            depth_row = self.clob.total_depth(25)
+            clob_depth = min(depth_row['bid'], depth_row['ask'])
+        except Exception:
+            clob_depth = 0.0
 
-        scores: Dict[str, float] = {}
-        for name, cost in perceived.items():
-            if cost == float('inf') or not _math.isfinite(cost):
-                scores[name] = 0.0
-                continue
+        pool_depths: Dict[str, float] = {}
+        pool_alignment: Dict[str, float] = {}
+        for name in amm_names:
+            pool = self.amm_pools[name]
+            try:
+                depth = pool.effective_depth(ref_mid) if _math.isfinite(ref_mid) else pool.effective_depth()
+            except Exception:
+                depth = 0.0
+            pool_depths[name] = max(0.0, depth)
 
-            cost_score = 1.0 / (1.0 + max(cost, 0.0) / 25.0)
             alignment_score = 1.0
-            prior_score = 0.5 + (clob_prior if name == 'clob' else amm_prior_each)
+            try:
+                pool_mid = pool.mid_price()
+                if _math.isfinite(ref_mid) and ref_mid > 0 and _math.isfinite(pool_mid):
+                    basis_bps = abs(pool_mid - ref_mid) / ref_mid * 10_000.0
+                    alignment_score = 1.0 / (1.0 + basis_bps / 20.0)
+            except Exception:
+                alignment_score = 1.0
+            pool_alignment[name] = alignment_score
 
-            if name == 'clob':
-                try:
-                    depth = self.clob.total_depth(25)['total']
-                except Exception:
-                    depth = 0.0
-            else:
-                pool = self.amm_pools[name]
-                try:
-                    depth = pool.effective_depth(ref_mid) if _math.isfinite(ref_mid) else pool.effective_depth()
-                except Exception:
-                    depth = 0.0
-                try:
-                    pool_mid = pool.mid_price()
-                    if _math.isfinite(ref_mid) and ref_mid > 0 and _math.isfinite(pool_mid):
-                        basis_bps = abs(pool_mid - ref_mid) / ref_mid * 10_000.0
-                        alignment_score = 1.0 / (1.0 + basis_bps / 20.0)
-                except Exception:
-                    alignment_score = 1.0
+        finite_amm = [name for name in amm_names if _math.isfinite(perceived[name]) and perceived[name] != float('inf')]
+        best_amm_name = min(finite_amm, key=lambda name: perceived[name]) if finite_amm else amm_names[0]
 
+        group_costs = {
+            'clob': perceived.get('clob', float('inf')),
+            'amm': perceived.get(best_amm_name, float('inf')),
+        }
+        finite_group_costs = [cost for cost in group_costs.values() if _math.isfinite(cost) and cost != float('inf')]
+        best_group_cost = min(finite_group_costs) if finite_group_costs else 0.0
+
+        amm_target = max(0.0, min(1.0, self.amm_share_pct / 100.0))
+        cost_span = (
+            max(finite_group_costs) - min(finite_group_costs)
+            if len(finite_group_costs) >= 2 else 0.0
+        )
+        liquidity_factor = getattr(self.env, 'systemic_liquidity', 1.0) if self.env is not None else 1.0
+        venue_basis_bps = getattr(self.env, 'venue_basis_bps', 0.0) if self.env is not None else 0.0
+        arbitrage_capacity = getattr(self.env, 'arbitrage_capacity', 1.0) if self.env is not None else 1.0
+        prior_mix = 0.08 / (1.0 + cost_span / 10.0)
+        prior_mix *= 0.75 + 0.25 * max(0.0, min(1.0, liquidity_factor))
+        prior_mix /= 1.0 + max(0.0, venue_basis_bps) / 25.0
+        prior_mix = max(0.0, min(0.08, prior_mix))
+
+        neutral_priors = {'clob': 0.5, 'amm': 0.5}
+        target_priors = {'clob': 1.0 - amm_target, 'amm': amm_target}
+        prior_scores = {}
+        for name in ('clob', 'amm'):
+            eff_prior = (1.0 - prior_mix) * neutral_priors[name] + prior_mix * target_priors[name]
+            prior_scores[name] = eff_prior / neutral_priors[name]
+
+        amm_depth = sum(pool_depths.values())
+        amm_alignment = pool_alignment.get(best_amm_name, 1.0)
+        group_depths = {'clob': clob_depth, 'amm': amm_depth}
+        group_alignment = {'clob': 1.0, 'amm': amm_alignment}
+        amm_state_score = 1.0
+        if self.env is not None:
+            liquidity_component = 0.80 + 0.20 * max(0.0, min(1.0, liquidity_factor))
+            arbitrage_component = 0.65 + 0.35 * max(0.0, min(1.0, arbitrage_capacity))
+            basis_component = 1.0 / (1.0 + max(0.0, venue_basis_bps) / 30.0)
+            amm_state_score = liquidity_component * arbitrage_component * basis_component
+            amm_state_score = max(0.20, min(1.0, amm_state_score))
+        group_state_scores = {'clob': 1.0, 'amm': amm_state_score}
+
+        group_scores: Dict[str, float] = {}
+        for name, cost in group_costs.items():
+            if cost == float('inf') or not _math.isfinite(cost):
+                group_scores[name] = 0.0
+                continue
+            rel_cost = max(0.0, cost - best_group_cost)
+            cost_score = _math.exp(-rel_cost / 10.0)
+            depth = group_depths[name]
             depth_score = min(max(depth, 0.0) / max(10.0 * Q, 1.0), 2.0)
             liquidity_score = 0.4 + 0.6 * min(depth_score, 1.0)
-            scores[name] = prior_score * cost_score * liquidity_score * alignment_score
+            group_scores[name] = (
+                prior_scores[name]
+                * cost_score
+                * liquidity_score
+                * group_alignment[name]
+                * group_state_scores[name]
+            )
 
-        return self._weighted_pick(scores)
+        if self._weighted_pick(group_scores) == 'clob':
+            return 'clob'
+
+        amm_scores: Dict[str, float] = {}
+        best_amm_cost = min(
+            perceived[name] for name in amm_names
+            if _math.isfinite(perceived[name]) and perceived[name] != float('inf')
+        ) if finite_amm else 0.0
+        for name in amm_names:
+            cost = perceived[name]
+            if cost == float('inf') or not _math.isfinite(cost):
+                amm_scores[name] = 0.0
+                continue
+            rel_cost = max(0.0, cost - best_amm_cost)
+            cost_score = _math.exp(-rel_cost / 10.0)
+            depth_score = min(pool_depths.get(name, 0.0) / max(8.0 * Q, 1.0), 2.0)
+            liquidity_score = 0.4 + 0.6 * min(depth_score, 1.0)
+            amm_scores[name] = cost_score * liquidity_score * pool_alignment.get(name, 1.0)
+
+        return self._weighted_pick(amm_scores)
 
     def choose_venue(self, Q: float, side: str = 'buy') -> str:
         """Venue selection under a fixed-share or liquidity-aware routing rule.
@@ -754,28 +1244,85 @@ class Trader:
 
     def _execute_on_venue(self, venue: str, Q: float, side: str) -> dict:
         """Execute trade on chosen venue. Returns cost dict."""
+        if self.defaulted:
+            venue_obj = self._clob_venue() if venue == 'clob' else self.amm_pools.get(venue)
+            result = venue_obj._inf_quote() if venue_obj is not None and hasattr(venue_obj, '_inf_quote') else {'cost_bps': float('inf')}
+            result['executed_qty'] = 0.0
+            result['requested_qty'] = Q
+            return result
         if venue == 'clob':
             return self._execute_clob(Q, side)
         pool = self.amm_pools[venue]
-        return pool.execute_buy(Q) if side == 'buy' else pool.execute_sell(Q)
+        if side == 'buy':
+            exec_q = self._clip_amm_buy_qty(pool, Q)
+            if exec_q <= 0.0:
+                result = pool._inf_quote()
+                result['executed_qty'] = 0.0
+                result['requested_qty'] = Q
+                return result
+            result = pool.execute_buy(exec_q)
+            self.cash -= result.get('delta_y', 0.0)
+            self.assets += exec_q
+        else:
+            exec_q = self._clip_amm_sell_qty(Q)
+            if exec_q <= 0.0:
+                result = pool._inf_quote()
+                result['executed_qty'] = 0.0
+                result['requested_qty'] = Q
+                return result
+            result = pool.execute_sell(exec_q)
+            self.cash += result.get('delta_y', 0.0)
+            self.assets -= exec_q
+        result['executed_qty'] = exec_q
+        result['requested_qty'] = Q
+        return result
 
     def _execute_clob(self, Q: float, side: str) -> dict:
         """Market order on CLOB with cost quoting."""
+        venue = self._clob_venue()
         try:
+            if self.defaulted:
+                quote_info = venue._inf_quote()
+                quote_info['executed_qty'] = 0
+                quote_info['requested_qty'] = Q
+                return quote_info
             if side == 'buy':
-                quote_info = self.clob.quote_buy(Q)
-                if quote_info['cost_bps'] == float('inf'):
+                exec_q = self._affordable_market_buy_qty(Q)
+                if exec_q <= 0:
+                    quote_info = venue._inf_quote()
+                    quote_info['executed_qty'] = 0
+                    quote_info['requested_qty'] = Q
                     return quote_info
-                self._buy_market(round(Q))
+                quote_info = venue.quote_buy(exec_q)
+                if quote_info['cost_bps'] == float('inf'):
+                    quote_info['executed_qty'] = 0
+                    quote_info['requested_qty'] = Q
+                    return quote_info
+                unfilled = self._buy_market(exec_q)
+                quote_info['executed_qty'] = max(0, exec_q - unfilled)
+                quote_info['requested_qty'] = Q
                 return quote_info
             else:
-                quote_info = self.clob.quote_sell(Q)
-                if quote_info['cost_bps'] == float('inf'):
+                exec_q = self._sellable_market_qty(Q)
+                if exec_q <= 0:
+                    quote_info = venue._inf_quote()
+                    quote_info['executed_qty'] = 0
+                    quote_info['requested_qty'] = Q
                     return quote_info
-                self._sell_market(round(Q))
+                quote_info = venue.quote_sell(exec_q)
+                if quote_info['cost_bps'] == float('inf'):
+                    quote_info['executed_qty'] = 0
+                    quote_info['requested_qty'] = Q
+                    return quote_info
+                unfilled = self._sell_market(exec_q)
+                quote_info['executed_qty'] = max(0, exec_q - unfilled)
+                quote_info['requested_qty'] = Q
                 return quote_info
         except Exception:
-            return self.clob._inf_quote()
+            quote_info = venue._inf_quote()
+            quote_info['executed_qty'] = 0
+            quote_info['requested_qty'] = Q
+            return quote_info
 
     def _make_trade_record(self, venue: str, side: str, Q: float,
                            result: dict, cls_info: dict) -> dict:
@@ -783,6 +1330,7 @@ class Trader:
         return dict(
             trader_id=self.id, trader_type=self.type,
             venue=venue, side=side, quantity=Q,
+            requested_quantity=result.get('requested_qty', Q),
             cost_bps=result.get('cost_bps', 0),
             theta=cls_info.get('theta', 0),
             size_bucket=cls_info.get('size_bucket', 'medium'),
@@ -813,7 +1361,10 @@ class Random(Trader):
                  trade_prob: float = 0.3,
                  q_min: int = 1,
                  q_max: int = 5,
-                 label: str = 'Random'):
+                 label: str = 'Random',
+                 flow_role: Optional[str] = None,
+                 flow_persistence: float = 0.25,
+                 session_sensitivity: float = 1.0):
         super().__init__(market, cash, assets,
                          clob=clob, amm_pools=amm_pools, env=env,
                          amm_share_pct=amm_share_pct, venue_choice_rule=venue_choice_rule,
@@ -824,6 +1375,148 @@ class Random(Trader):
         self.trade_prob = trade_prob
         self.q_min = q_min
         self.q_max = q_max
+        self.flow_role = flow_role or (label if self.multi_venue else 'Random')
+        self.flow_persistence = max(0.0, min(1.0, float(flow_persistence)))
+        self.session_sensitivity = max(0.0, float(session_sensitivity))
+        self._last_fx_side: Optional[str] = None
+        self._flow_program_side: Optional[str] = None
+        self._flow_program_remaining: int = 0
+        self._flow_program_qty_scale: float = 1.0
+        self._flow_program_trade_prob_mult: float = 1.0
+        self._flow_slice_qty_scale: float = 1.0
+
+    def _clear_flow_program(self):
+        self._flow_program_side = None
+        self._flow_program_remaining = 0
+        self._flow_program_qty_scale = 1.0
+        self._flow_program_trade_prob_mult = 1.0
+
+    def _flow_program_profile(self) -> Optional[dict]:
+        profile = None
+        if self.flow_role == 'RetailToxic':
+            profile = dict(start_prob=0.02 + 0.10 * self.flow_persistence,
+                           run_lo=1, run_hi=3,
+                           qty_scale=0.95,
+                           trade_prob_mult=1.08)
+        elif self.flow_role == 'RealMoney':
+            profile = dict(start_prob=0.03 + 0.12 * self.flow_persistence,
+                           run_lo=2, run_hi=4,
+                           qty_scale=0.72,
+                           trade_prob_mult=1.15)
+        elif self.flow_role == 'Hedger':
+            profile = dict(start_prob=0.01 + 0.04 * self.flow_persistence,
+                           run_lo=1, run_hi=2,
+                           qty_scale=0.92,
+                           trade_prob_mult=1.04)
+
+        if profile is None or self.env is None:
+            return profile
+
+        session_name = getattr(self.env, 'session_name', '')
+        if self.flow_role == 'RealMoney' and session_name in {'London', 'Overlap', 'NewYork'}:
+            profile['start_prob'] *= 1.10
+        elif self.flow_role == 'RetailToxic' and session_name == 'Overlap':
+            profile['start_prob'] *= 1.08
+        elif self.flow_role == 'Hedger' and session_name == 'Asia':
+            profile['start_prob'] *= 1.05
+
+        profile['start_prob'] = max(0.0, min(0.45, profile['start_prob']))
+        return profile
+
+    def _continue_flow_program(self) -> Optional[tuple[str, float]]:
+        if self._flow_program_side is None or self._flow_program_remaining <= 0:
+            self._clear_flow_program()
+            return None
+
+        side = self._flow_program_side
+        qty_scale = self._flow_program_qty_scale
+        self._flow_program_remaining -= 1
+        self._last_fx_side = side
+        if self._flow_program_remaining <= 0:
+            self._clear_flow_program()
+        return side, qty_scale
+
+    def _maybe_start_flow_program(self, side: str) -> float:
+        profile = self._flow_program_profile()
+        if profile is None or random.random() >= profile['start_prob']:
+            return 1.0
+
+        total_slices = random.randint(profile['run_lo'], profile['run_hi'])
+        if total_slices > 1:
+            self._flow_program_side = side
+            self._flow_program_remaining = total_slices - 1
+            self._flow_program_qty_scale = profile['qty_scale']
+            self._flow_program_trade_prob_mult = profile['trade_prob_mult']
+        else:
+            self._clear_flow_program()
+        return profile['qty_scale']
+
+    def _session_trade_probability(self) -> float:
+        prob = self.trade_prob
+        if self._flow_program_side is not None and self._flow_program_remaining > 0:
+            prob *= self._flow_program_trade_prob_mult
+        if self.env is not None:
+            session_mult = getattr(self.env, 'session_flow_multiplier', 1.0)
+            prob *= max(0.5, 1.0 + self.session_sensitivity * (session_mult - 1.0))
+            session_name = getattr(self.env, 'session_name', '')
+            if self.flow_role == 'RetailToxic' and session_name == 'Overlap':
+                prob *= 1.10
+            elif self.flow_role == 'RealMoney' and session_name in {'London', 'Overlap', 'NewYork'}:
+                prob *= 1.12
+            elif self.flow_role == 'Hedger' and session_name == 'Asia':
+                prob *= 0.95
+        return max(0.0, min(0.98, prob))
+
+    def _session_quantity_bounds(self) -> tuple[int, int]:
+        lo = self.q_min
+        hi = self.q_max
+        if self.env is not None:
+            session_mult = getattr(self.env, 'session_flow_multiplier', 1.0)
+            hi = max(lo, int(round(hi * max(0.75, session_mult))))
+            if self.flow_role == 'RealMoney':
+                hi = max(lo, int(round(hi * 1.15)))
+            elif self.flow_role == 'RetailToxic':
+                hi = max(lo, int(round(hi * 0.9)))
+        slice_scale = max(0.60, min(1.25, float(getattr(self, '_flow_slice_qty_scale', 1.0))))
+        lo = max(1, int(round(lo * max(0.70, slice_scale))))
+        hi = max(lo, int(round(hi * slice_scale)))
+        return max(1, lo), max(max(1, lo), hi)
+
+    def _draw_flow_side(self) -> str:
+        self._flow_slice_qty_scale = 1.0
+        program_side = self._continue_flow_program()
+        if program_side is not None:
+            side, qty_scale = program_side
+            self._flow_slice_qty_scale = qty_scale
+            return side
+
+        bias = self.env.toxic_flow_bias if self.env else 0.0
+        p_buy = 0.5 + bias
+        persist_shift = 0.0
+        if self._last_fx_side is not None:
+            role_scale = 1.0
+            if self.flow_role == 'Hedger':
+                role_scale = 0.35
+            elif self.flow_role == 'RetailToxic':
+                role_scale = 1.15
+            elif self.flow_role == 'RealMoney':
+                role_scale = 0.90
+            persist_shift = 0.18 * self.flow_persistence * role_scale
+            if self._last_fx_side == 'buy':
+                p_buy += persist_shift
+            else:
+                p_buy -= persist_shift
+        if self.flow_role == 'Hedger' and self._last_fx_side is not None:
+            mean_reversion_shift = 0.35 * persist_shift
+            if self._last_fx_side == 'buy':
+                p_buy -= mean_reversion_shift
+            else:
+                p_buy += mean_reversion_shift
+        p_buy = max(0.05, min(0.95, p_buy))
+        side = 'buy' if random.random() < p_buy else 'sell'
+        self._last_fx_side = side
+        self._flow_slice_qty_scale = self._maybe_start_flow_program(side)
+        return side
 
     @staticmethod
     def draw_delta(std: Union[float, int] = 2.5):
@@ -880,18 +1573,18 @@ class Random(Trader):
     def call(self):
         # ---------- multi-venue mode (FX noise taker) ---------------------
         if self.multi_venue:
-            if random.random() > self.trade_prob:
+            if self.defaulted or random.random() > self._session_trade_probability():
                 return None
-            # Toxic flow bias: during shock aftermath, trades skew
-            # in the shock direction (herding / stop-loss cascades)
-            bias = self.env.toxic_flow_bias if self.env else 0.0
-            p_buy = 0.5 + bias  # bias > 0 → more buys, bias < 0 → more sells
-            side = 'buy' if random.random() < p_buy else 'sell'
-            Q = random.randint(self.q_min, self.q_max)
+            side = self._draw_flow_side()
+            q_lo, q_hi = self._session_quantity_bounds()
+            Q = random.randint(q_lo, q_hi)
             venue = self.choose_venue(Q, side)
-            cls_info = self._classify(Q)
             result = self._execute_on_venue(venue, Q, side)
-            rec = self._make_trade_record(venue, side, Q, result, cls_info)
+            exec_q = result.get('executed_qty', 0)
+            if exec_q <= 0:
+                return None
+            cls_info = self._classify(exec_q)
+            rec = self._make_trade_record(venue, side, exec_q, result, cls_info)
             self.trades.append(rec)
             return rec
 
@@ -926,9 +1619,11 @@ class Random(Trader):
             _sig_lo = self.env.sigma_low if self.env else None
             price = self.draw_price(side, spread, sigma=_sig, sigma_low=_sig_lo)
             quantity = self.draw_quantity()
-            order = Order(round(price, 2), round(quantity), side, self)
-            self.orders.append(order)
-            self.market.limit_order(order)
+            quote_price = self.market.round_price(price) if hasattr(self.market, 'round_price') else round(price, 2)
+            order = Order(quote_price, round(quantity), side, self)
+            accepted = self.market.limit_order(order)
+            if accepted and order.qty > 0:
+                self.orders.append(order)
             return  # one re-center per tick is enough
 
         # ── Normal action selection (Fennell distribution) ──────────
@@ -1027,7 +1722,7 @@ class FastRecyclerLP(Random):
         total_spread_bps = 2.0 + 140.0 * sigma + 120.0 * funding
         total_spread_bps *= 1.0 + 0.60 * toxic_bias + 0.35 * (1.0 - liquidity)
         half_spread = max(0.01, mid * total_spread_bps / 20_000.0)
-        tick = 0.01
+        tick = self.market._tick_size() if hasattr(self.market, '_tick_size') else 0.01
 
         for level in range(self.levels):
             level_mult = 1.0 + 0.45 * level
@@ -1035,22 +1730,24 @@ class FastRecyclerLP(Random):
             qty_scale = max(0.5, liquidity) * (1.0 - 0.25 * level)
             qty = max(1, min(self.max_qty, int(round(self.base_qty * qty_scale + random.random()))))
 
-            bid_price = round(mid - offset, 2)
-            ask_price = round(mid + offset, 2)
+            bid_price = self.market.round_price(mid - offset) if hasattr(self.market, 'round_price') else round(mid - offset, 2)
+            ask_price = self.market.round_price(mid + offset) if hasattr(self.market, 'round_price') else round(mid + offset, 2)
 
             if bid_price >= spread['ask']:
-                bid_price = round(spread['ask'] - tick, 2)
+                bid_price = self.market.round_price(spread['ask'] - tick) if hasattr(self.market, 'round_price') else round(spread['ask'] - tick, 2)
             if ask_price <= spread['bid']:
-                ask_price = round(spread['bid'] + tick, 2)
+                ask_price = self.market.round_price(spread['bid'] + tick) if hasattr(self.market, 'round_price') else round(spread['bid'] + tick, 2)
             if bid_price >= ask_price:
                 continue
 
             bid_order = Order(bid_price, qty, 'bid', self, ttl=self.ttl)
             ask_order = Order(ask_price, qty, 'ask', self, ttl=self.ttl)
-            self.orders.append(bid_order)
-            self.orders.append(ask_order)
-            self.market.limit_order(bid_order)
-            self.market.limit_order(ask_order)
+            bid_ok = self.market.limit_order(bid_order)
+            ask_ok = self.market.limit_order(ask_order)
+            if bid_ok and bid_order.qty > 0:
+                self.orders.append(bid_order)
+            if ask_ok and ask_order.qty > 0:
+                self.orders.append(ask_order)
 
         self.last_quoted = bool(self.orders)
 
@@ -1127,29 +1824,31 @@ class LatentLP(Random):
 
         half_spread_bps = max(2.0, min(12.0, 0.35 * spread_bps))
         half_spread = max(0.01, mid * half_spread_bps / 10_000.0)
-        tick = 0.01
+        tick = self.market._tick_size() if hasattr(self.market, '_tick_size') else 0.01
         depth_gap = max(0.0, self.top_depth_threshold - near_touch_depth)
         qty = max(self.base_qty, int(round(self.base_qty + 0.75 * depth_gap)))
         qty = min(self.max_qty, qty)
 
         for level in range(2):
             offset = half_spread * (1.0 + 0.75 * level)
-            bid_price = round(mid - offset, 2)
-            ask_price = round(mid + offset, 2)
+            bid_price = self.market.round_price(mid - offset) if hasattr(self.market, 'round_price') else round(mid - offset, 2)
+            ask_price = self.market.round_price(mid + offset) if hasattr(self.market, 'round_price') else round(mid + offset, 2)
 
             if bid_price >= spread['ask']:
-                bid_price = round(spread['ask'] - tick, 2)
+                bid_price = self.market.round_price(spread['ask'] - tick) if hasattr(self.market, 'round_price') else round(spread['ask'] - tick, 2)
             if ask_price <= spread['bid']:
-                ask_price = round(spread['bid'] + tick, 2)
+                ask_price = self.market.round_price(spread['bid'] + tick) if hasattr(self.market, 'round_price') else round(spread['bid'] + tick, 2)
             if bid_price >= ask_price:
                 continue
 
             bid_order = Order(bid_price, qty, 'bid', self, ttl=self.ttl)
             ask_order = Order(ask_price, qty, 'ask', self, ttl=self.ttl)
-            self.orders.append(bid_order)
-            self.orders.append(ask_order)
-            self.market.limit_order(bid_order)
-            self.market.limit_order(ask_order)
+            bid_ok = self.market.limit_order(bid_order)
+            ask_ok = self.market.limit_order(ask_order)
+            if bid_ok and bid_order.qty > 0:
+                self.orders.append(bid_order)
+            if ask_ok and ask_order.qty > 0:
+                self.orders.append(ask_order)
 
         self.last_quoted = bool(self.orders)
 
@@ -1178,7 +1877,8 @@ class Fundamentalist(Trader):
                  # FX-fundamentalist params (used only in multi-venue mode)
                  fundamental_rate: float = 100.0,
                  fx_gamma: float = 5e-3,
-                 fx_q_max: int = 10):
+                 fx_q_max: int = 10,
+                 flow_role: str = 'LeveragedDirectional'):
         """
         :param market: exchange agent link
         :param cash: number of cash
@@ -1199,6 +1899,7 @@ class Fundamentalist(Trader):
         self.fundamental_rate = fundamental_rate
         self.fx_gamma = fx_gamma
         self.fx_q_max = fx_q_max
+        self.flow_role = flow_role
 
     @staticmethod
     def evaluate(dividends: list, risk_free: float):
@@ -1220,22 +1921,31 @@ class Fundamentalist(Trader):
     def call(self):
         # ---------- multi-venue mode (FX fundamentalist) ------------------
         if self.multi_venue:
+            if self.defaulted:
+                return None
             try:
                 mid = self.clob.mid_price()
             except Exception:
                 return None
             fair = self.env.fair_price if (self.env is not None and hasattr(self.env, 'fair_price')) else self.fundamental_rate
+            session_mult = getattr(self.env, 'session_flow_multiplier', 1.0) if self.env is not None else 1.0
+            gamma = self.fx_gamma / max(0.75, session_mult)
             mispricing = (fair - mid) / mid
-            if abs(mispricing) < self.fx_gamma:
+            if abs(mispricing) < gamma:
                 return None
             side = 'buy' if mispricing > 0 else 'sell'
-            Q = min(round(abs(mispricing) / self.fx_gamma), self.fx_q_max)
+            Q = min(round(abs(mispricing) / gamma), self.fx_q_max)
+            if self.flow_role == 'LeveragedDirectional':
+                Q = min(self.fx_q_max, max(1, int(round(Q * max(1.0, session_mult)))))
             if Q <= 0:
                 return None
             venue = self.choose_venue(Q, side)
-            cls_info = self._classify(Q)
             result = self._execute_on_venue(venue, Q, side)
-            rec = self._make_trade_record(venue, side, Q, result, cls_info)
+            exec_q = result.get('executed_qty', 0)
+            if exec_q <= 0:
+                return None
+            cls_info = self._classify(exec_q)
+            rec = self._make_trade_record(venue, side, exec_q, result, cls_info)
             self.trades.append(rec)
             return rec
 
@@ -1545,7 +2255,13 @@ class MarketMaker(Trader):
             book_ofi = (sv['bid'] - sv['ask']) / max(1, sv['bid'] + sv['ask'])
         else:
             book_ofi = 0.0
-        flow_ofi = getattr(self.env, 'order_flow_imbalance', 0.0) if self.env is not None else 0.0
+        flow_ofi = 0.0
+        if self.env is not None:
+            flow_ofi = getattr(
+                self.env,
+                'clob_order_flow_imbalance',
+                getattr(self.env, 'order_flow_imbalance', 0.0),
+            )
         ofi = 0.4 * book_ofi + 0.6 * flow_ofi
         self._ofi_window.append(ofi)
         if len(self._ofi_window) > self._ofi_maxlen:
@@ -1719,6 +2435,10 @@ class MarketMaker(Trader):
         liquidity_damage = min(1.5, max(0.0, 1.0 - liquidity_factor))
         outside_option_score = min(1.5, self._amm_support_score(mid))
         loss_score = min(3.0, self._loss_bps_ewma / self.loss_threshold_bps)
+        shock_window = min(1.0, float(getattr(self.env, 'shock_ticks_remaining', 0)) / 12.0)
+        liquidity_shock = max(0.0, float(getattr(self.env, 'liquidity_shock', 0.0)))
+        toxic_flow = abs(float(getattr(self.env, 'toxic_flow_bias', 0.0)))
+        acute_shock_score = 0.85 * liquidity_shock + 0.30 * toxic_flow + 0.25 * shock_window
 
         score = (
             0.40 * loss_score
@@ -1729,6 +2449,7 @@ class MarketMaker(Trader):
             + 0.32 * liquidity_damage
             + 0.10 * outside_option_score
         )
+        score += acute_shock_score
         return {
             'score': score,
             'loss_score': loss_score,
@@ -1738,6 +2459,7 @@ class MarketMaker(Trader):
             'ofi_score': ofi_score,
             'liquidity_factor': liquidity_factor,
             'outside_option_score': outside_option_score,
+            'acute_shock_score': acute_shock_score,
             'loss_bps_ewma': self._loss_bps_ewma,
             'mtm_pnl_bps_ewma': self._mtm_pnl_bps_ewma,
         }
@@ -1925,7 +2647,11 @@ class AMMProvider:
                  phi3: float = 1.0,
                  max_adj: float = 0.05,
                  core_liquidity_ratio: float = 0.65,
-                 stabilizing_bias: float = 0.02):
+                 stabilizing_bias: float = 0.02,
+                 wallet_cash: Optional[float] = None,
+                 wallet_base: Optional[float] = None,
+                 wallet_cash_buffer_ratio: float = 0.20,
+                 wallet_base_buffer_ratio: float = 0.20):
         self.type = 'AMMProvider'
         self.pool = pool
         self.env = env
@@ -1936,24 +2662,103 @@ class AMMProvider:
         self.core_liquidity_ratio = max(0.0, min(1.0, core_liquidity_ratio))
         self.stabilizing_bias = max(0.0, stabilizing_bias)
         self._initial_liquidity = max(self.pool.liquidity_measure(), 1e-9)
+        self.deployed_cash = max(0.0, float(self.pool.y))
+        self.deployed_base = max(0.0, float(self.pool.x))
+        self.wallet_cash = (
+            max(0.0, float(wallet_cash))
+            if wallet_cash is not None
+            else self.deployed_cash * max(0.0, float(wallet_cash_buffer_ratio))
+        )
+        self.wallet_base = (
+            max(0.0, float(wallet_base))
+            if wallet_base is not None
+            else self.deployed_base * max(0.0, float(wallet_base_buffer_ratio))
+        )
+        ref_price = self._reference_price()
+        self._prev_pool_value = self._pool_mark_to_market(ref_price)
+        self._pnl_bps_ewma = 0.0
+        self._adverse_selection_ewma = 0.0
+
+    def _reference_price(self) -> float:
+        ref_price = getattr(self.env, 'fair_price', None)
+        if ref_price is None or not _math.isfinite(ref_price) or ref_price <= 0:
+            ref_price = self.pool.mid_price()
+        return max(float(ref_price), 1e-9)
+
+    def _pool_mark_to_market(self, reference_price: float) -> float:
+        return max(1e-9, self.pool.x * reference_price + self.pool.y)
+
+    def _adverse_selection_score(self, reference_price: float) -> float:
+        pool_mid = self.pool.mid_price()
+        basis_bps = 0.0
+        if _math.isfinite(pool_mid) and pool_mid > 0 and reference_price > 0:
+            basis_bps = abs(pool_mid - reference_price) / reference_price * 10_000.0
+        reserve_imbalance = max(0.0, min(1.0, getattr(self.env, 'amm_reserve_imbalance', 0.0)))
+        slippage_bps = max(0.0, getattr(self.env, 'amm_slippage_signal', 0.0))
+        flow_pressure = abs(getattr(self.env, 'amm_order_flow_imbalance', 0.0))
+        return min(3.0, basis_bps / 20.0 + reserve_imbalance + 0.5 * flow_pressure + slippage_bps / 50.0)
+
+    def _max_affordable_add_fraction(self) -> float:
+        base_capacity = self.wallet_base / max(self.pool.x, 1e-9)
+        cash_capacity = self.wallet_cash / max(self.pool.y, 1e-9)
+        return max(0.0, min(base_capacity, cash_capacity))
+
+    def _deploy_liquidity(self, fraction: float) -> float:
+        fraction = max(0.0, min(float(fraction), self._max_affordable_add_fraction()))
+        if fraction <= 0:
+            return 0.0
+        base_added = self.pool.x * fraction
+        cash_added = self.pool.y * fraction
+        self.wallet_base -= base_added
+        self.wallet_cash -= cash_added
+        self.deployed_base += base_added
+        self.deployed_cash += cash_added
+        self.pool.add_liquidity(fraction)
+        return fraction
+
+    def _withdraw_liquidity(self, fraction: float) -> float:
+        fraction = max(0.0, min(float(fraction), 0.5))
+        if fraction <= 0:
+            return 0.0
+        base_removed = self.pool.x * fraction
+        cash_removed = self.pool.y * fraction
+        self.pool.remove_liquidity(fraction)
+        self.deployed_base = max(0.0, self.deployed_base - base_removed)
+        self.deployed_cash = max(0.0, self.deployed_cash - cash_removed)
+        self.wallet_base += base_removed
+        self.wallet_cash += cash_removed
+        return fraction
 
     def update_liquidity(self):
         """Adjust pool liquidity according to LP rule.  Called once per period."""
         L = self.pool.liquidity_measure()
         if L <= 0:
             return
+
+        ref_price = self._reference_price()
+        pool_value = self._pool_mark_to_market(ref_price)
+        prev_value = max(self._prev_pool_value, 1e-9)
+        pnl_bps = 10_000.0 * (pool_value - prev_value) / prev_value
+        self._prev_pool_value = pool_value
+        self._pnl_bps_ewma = 0.80 * self._pnl_bps_ewma + 0.20 * pnl_bps
+        self._adverse_selection_ewma = 0.75 * self._adverse_selection_ewma + 0.25 * self._adverse_selection_score(ref_price)
+
         fee_income = self.pool.period_fee_revenue
         sigma = self.env.sigma
         c = self.env.funding_cost
         liquidity_factor = getattr(self.env, 'systemic_liquidity', 1.0)
-        flow_pressure = abs(getattr(self.env, 'order_flow_imbalance', 0.0))
+        flow_pressure = abs(getattr(self.env, 'amm_order_flow_imbalance', 0.0))
         sigma_base = max(getattr(self.env, 'sigma_low', sigma), 1e-9)
         stress_excess = max(0.0, sigma / sigma_base - 1.0)
         stressed_flow_pressure = flow_pressure * (stress_excess + (1.0 - liquidity_factor))
+        loss_score = min(3.0, max(0.0, -self._pnl_bps_ewma) / 15.0)
+        adverse_selection_score = min(3.0, self._adverse_selection_ewma)
         delta_L = self.phi1 * fee_income - self.phi2 * sigma - self.phi3 * c
         frac = delta_L / L
         frac -= 0.03 * (1.0 - liquidity_factor)
         frac -= 0.02 * stressed_flow_pressure
+        frac -= 0.014 * loss_score
+        frac -= 0.018 * adverse_selection_score
         frac += self.stabilizing_bias * max(0.0, 0.85 - liquidity_factor)
 
         core_floor = self._initial_liquidity * self.core_liquidity_ratio
@@ -1965,9 +2770,9 @@ class AMMProvider:
 
         frac = max(-self.max_adj, min(self.max_adj, frac))
         if frac > 0:
-            self.pool.add_liquidity(frac)
+            self._deploy_liquidity(frac)
         elif frac < 0:
-            self.pool.remove_liquidity(abs(frac))
+            self._withdraw_liquidity(abs(frac))
 
 
 class AMMArbitrageur:
@@ -2008,7 +2813,11 @@ class AMMArbitrageur:
                  max_spread_bps: float = 500.0,
                  max_correction_pct: float = 10.0,
                  routing: str = 'all',
-                 trade_fraction_cap: float = 0.20):
+                 trade_fraction_cap: float = 0.20,
+                 cash: Optional[float] = None,
+                 assets: Optional[float] = None,
+                 cash_buffer_ratio: float = 0.15,
+                 asset_buffer_ratio: float = 0.15):
         self.clob = clob
         self.amm_pools = amm_pools
         self.env = env
@@ -2017,18 +2826,48 @@ class AMMArbitrageur:
         self.max_correction_pct = max_correction_pct / 100.0
         self.routing = routing
         self.trade_fraction_cap = max(0.0, min(1.0, trade_fraction_cap))
+        aggregate_base = sum(max(0.0, float(pool.x)) for pool in amm_pools.values())
+        aggregate_cash = sum(max(0.0, float(pool.y)) for pool in amm_pools.values())
+        self.cash = (
+            max(0.0, float(cash))
+            if cash is not None
+            else aggregate_cash * max(0.0, float(cash_buffer_ratio))
+        )
+        self.assets = (
+            max(0.0, float(assets))
+            if assets is not None
+            else aggregate_base * max(0.0, float(asset_buffer_ratio))
+        )
+        self.cumulative_traded_base = 0.0
+        self.cumulative_pnl_quote = 0.0
 
     # ---- helpers ---------------------------------------------------------
 
     def _amm_consensus(self) -> Optional[float]:
-        """Average mid-price across all AMM pools."""
+        """Average AMM mid-price only when pools are internally consistent."""
         mids = []
         for p in self.amm_pools.values():
             try:
-                mids.append(p.mid_price())
+                mid = p.mid_price()
+                if _math.isfinite(mid) and mid > 0:
+                    mids.append(mid)
             except Exception:
                 pass
-        return sum(mids) / len(mids) if mids else None
+        if not mids:
+            return None
+        if len(mids) == 1:
+            return mids[0]
+
+        mids = sorted(mids)
+        mid_idx = len(mids) // 2
+        if len(mids) % 2 == 0:
+            center = 0.5 * (mids[mid_idx - 1] + mids[mid_idx])
+        else:
+            center = mids[mid_idx]
+        dispersion_bps = 10_000.0 * (mids[-1] - mids[0]) / max(center, 1e-9)
+        if dispersion_bps > 250.0:
+            return None
+        return sum(mids) / len(mids)
 
     def _blend_with_fair(self, observed: Optional[float]) -> Optional[float]:
         """Treat env.fair_price as a latent anchor rather than a command."""
@@ -2113,6 +2952,36 @@ class AMMArbitrageur:
         except Exception:
             return False
 
+    def _max_affordable_buy_qty(self, pool, max_trade_qty: float) -> float:
+        if max_trade_qty <= 0 or self.cash <= 0:
+            return 0.0
+
+        lo = 0.0
+        hi = max_trade_qty
+        for _ in range(60):
+            mid = (lo + hi) / 2.0
+            quote = pool.quote_buy(mid)
+            if quote['cost_bps'] == float('inf') or quote['delta_y'] > self.cash:
+                hi = mid
+            else:
+                lo = mid
+        return lo
+
+    def _settle_trade(self, pool, traded_qty: float, before_y: float, reference_price: float):
+        if traded_qty > 0:
+            cash_spent = max(0.0, (pool.y - before_y) / max(1.0 - pool.fee, 1e-9))
+            self.assets += traded_qty
+            self.cash = max(0.0, self.cash - cash_spent)
+            self.cumulative_pnl_quote += traded_qty * reference_price - cash_spent
+            self.cumulative_traded_base += traded_qty
+        elif traded_qty < 0:
+            sell_qty = abs(traded_qty)
+            cash_received = max(0.0, before_y - pool.y)
+            self.assets = max(0.0, self.assets - sell_qty)
+            self.cash += cash_received
+            self.cumulative_pnl_quote += cash_received - sell_qty * reference_price
+            self.cumulative_traded_base += sell_qty
+
     # ---- main entry point ------------------------------------------------
 
     def arbitrage(self):
@@ -2176,7 +3045,19 @@ class AMMArbitrageur:
                 S_capped = S_t
 
             max_trade_qty = max(0.0, pool.x * self.trade_fraction_cap)
-            pool.arbitrage_to_target(S_capped, max_trade_qty=max_trade_qty)
+            if current < S_capped:
+                max_trade_qty = self._max_affordable_buy_qty(pool, max_trade_qty)
+            else:
+                max_trade_qty = min(max_trade_qty, max(0.0, self.assets))
+
+            if max_trade_qty <= 1e-9:
+                return
+
+            before_y = pool.y
+            traded_qty = pool.arbitrage_to_target(S_capped, max_trade_qty=max_trade_qty)
+            if abs(traded_qty) <= 1e-9:
+                return
+            self._settle_trade(pool, traded_qty, before_y, S_capped)
 
             if hasattr(pool, 'update_rate'):
                 pool.update_rate()

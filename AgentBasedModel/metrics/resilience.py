@@ -111,6 +111,87 @@ def recovery_steps_pct(dev_series: List[float], shock_iter: int,
     return float(end - shock_iter)
 
 
+def recovery_steps_target_band(series: Sequence[float], shock_iter: int,
+                               stable_window: int = 10,
+                               horizon: Optional[int] = None,
+                               target_series: Optional[Sequence[float]] = None,
+                               lower_ratio: float = 0.5,
+                               upper_ratio: float = 1.5) -> dict:
+    """Recovery time until a series re-enters a target band and stays there.
+
+    The target band is defined as ``[lower_ratio * target, upper_ratio * target]``.
+    When ``target_series`` is omitted, the pre-shock baseline is used as a
+    constant target.
+    """
+    if shock_iter >= len(series):
+        return {
+            'recovery_steps': float('nan'),
+            'time_observed_steps': float('nan'),
+            'recovered': False,
+            'is_censored': True,
+            'target_lower_ratio': float(lower_ratio),
+            'target_upper_ratio': float(upper_ratio),
+            'target_abs_deviation_pct': float('nan'),
+        }
+
+    lower_ratio = float(lower_ratio)
+    upper_ratio = float(upper_ratio)
+    if lower_ratio > upper_ratio:
+        lower_ratio, upper_ratio = upper_ratio, lower_ratio
+
+    end = len(series) if horizon is None else min(len(series), shock_iter + horizon)
+    observed_steps = max(0, end - shock_iter)
+    if observed_steps < stable_window:
+        return {
+            'recovery_steps': float('nan'),
+            'time_observed_steps': float(observed_steps),
+            'recovered': False,
+            'is_censored': True,
+            'target_lower_ratio': lower_ratio,
+            'target_upper_ratio': upper_ratio,
+            'target_abs_deviation_pct': 100.0 * max(abs(1.0 - lower_ratio), abs(upper_ratio - 1.0)),
+        }
+
+    scalar_target = None
+    if target_series is None:
+        scalar_target = baseline_level(list(series), shock_iter, lookback=50)
+
+    for idx in range(shock_iter, end - stable_window + 1):
+        window_ok = True
+        for win_idx in range(idx, idx + stable_window):
+            value = series[win_idx]
+            target = scalar_target if target_series is None else target_series[win_idx]
+            if not (math.isfinite(value) and math.isfinite(target) and target > 0):
+                window_ok = False
+                break
+            lower_bound = lower_ratio * target
+            upper_bound = upper_ratio * target
+            if value < lower_bound or value > upper_bound:
+                window_ok = False
+                break
+        if window_ok:
+            steps = float(idx - shock_iter)
+            return {
+                'recovery_steps': steps,
+                'time_observed_steps': steps,
+                'recovered': True,
+                'is_censored': False,
+                'target_lower_ratio': lower_ratio,
+                'target_upper_ratio': upper_ratio,
+                'target_abs_deviation_pct': 100.0 * max(abs(1.0 - lower_ratio), abs(upper_ratio - 1.0)),
+            }
+
+    return {
+        'recovery_steps': float('nan'),
+        'time_observed_steps': float(observed_steps),
+        'recovered': False,
+        'is_censored': True,
+        'target_lower_ratio': lower_ratio,
+        'target_upper_ratio': upper_ratio,
+        'target_abs_deviation_pct': 100.0 * max(abs(1.0 - lower_ratio), abs(upper_ratio - 1.0)),
+    }
+
+
 def recovery_steps_retracement(dev_series: List[float], shock_iter: int,
                                retracement_fraction: float = 0.8,
                                stable_window: int = 10,
@@ -279,7 +360,7 @@ def normalized_auc_abs(dev_series: List[float], shock_iter: int,
 def series_resilience_metrics(series: Sequence[float], shock_iter: int,
                               baseline_window: int = 50,
                               avg_window: int = 20,
-                              tolerance_pct: float = 1.0,
+                              tolerance_pct: float = 50.0,
                               stable_window: int = 10,
                               horizon: Optional[int] = None,
                               retracement_fraction: float = 0.8,
@@ -291,7 +372,15 @@ def series_resilience_metrics(series: Sequence[float], shock_iter: int,
 
     dislocation = initial_dislocation_pct(dev_series, shock_iter, impact_window=impact_window)
     initial_dislocation = dislocation['dislocation_pct']
-    relative_recovery = recovery_steps_retracement(
+    band_recovery = recovery_steps_target_band(
+        series,
+        shock_iter,
+        stable_window=stable_window,
+        horizon=horizon,
+        lower_ratio=0.5,
+        upper_ratio=1.5,
+    )
+    retracement_recovery = recovery_steps_retracement(
         dev_series,
         shock_iter,
         retracement_fraction=retracement_fraction,
@@ -323,15 +412,22 @@ def series_resilience_metrics(series: Sequence[float], shock_iter: int,
         'half_life_steps': half_life_steps_pct(
             dev_series, shock_iter, stable_window=max(3, stable_window // 3), horizon=horizon,
         ),
-        'legacy_recovery_steps': recovery_steps_pct(
+        'legacy_recovery_steps': band_recovery['recovery_steps'],
+        'recovery_steps_retracement': retracement_recovery['recovery_steps'],
+        'time_observed_steps_retracement': retracement_recovery['time_observed_steps'],
+        'recovered_retracement': retracement_recovery['recovered'],
+        'is_censored_retracement': retracement_recovery['is_censored'],
+        'recovery_steps_fixed_band_pct': recovery_steps_pct(
             dev_series, shock_iter, tolerance_pct=tolerance_pct,
             stable_window=stable_window, horizon=horizon,
         ),
-        'recovery_steps': relative_recovery['recovery_steps'],
-        'time_observed_steps': relative_recovery['time_observed_steps'],
-        'recovered': relative_recovery['recovered'],
-        'is_censored': relative_recovery['is_censored'],
-        'target_abs_deviation_pct': relative_recovery['target_abs_deviation_pct'],
+        'recovery_steps': band_recovery['recovery_steps'],
+        'time_observed_steps': band_recovery['time_observed_steps'],
+        'recovered': band_recovery['recovered'],
+        'is_censored': band_recovery['is_censored'],
+        'target_abs_deviation_pct': band_recovery['target_abs_deviation_pct'],
+        'target_lower_ratio': band_recovery['target_lower_ratio'],
+        'target_upper_ratio': band_recovery['target_upper_ratio'],
         'deviation_series': dev_series,
     }
 
@@ -440,38 +536,49 @@ def kaplan_meier_curve(observed_steps: Sequence[float], recovered_flags: Sequenc
 def price_resilience_metrics(series: List[float], shock_iter: int,
                              baseline_window: int = 50,
                              avg_window: int = 20,
-                             tolerance_pct: float = 1.0,
+                             tolerance_pct: float = 50.0,
                              stable_window: int = 10,
                              horizon: Optional[int] = None,
                              retracement_fraction: float = 0.8,
                              impact_window: int = 10,
                              target_series: Optional[Sequence[float]] = None,
                              target_mode: str = 'pre_shock_baseline') -> dict:
-    """Price-centric resilience metrics for post-shock recovery studies."""
+    """Price-centric resilience metrics for post-shock recovery studies.
+
+    Price recovery remains anchored to relative-dislocation closure rather than a
+    very wide level band. The manuscript-style 0.5x–1.5x norm band is used for
+    liquidity metrics, while price keeps a stricter event-study notion of
+    recovery to avoid trivial immediate recovery after large price shocks.
+    """
     resolved_target_mode = target_mode
     if target_mode == 'fair_value_gap' and target_series is not None:
         baseline = baseline_level(series, shock_iter, lookback=baseline_window)
         dev_series = pct_gap_to_target_series(series, target_series)
-    else:
-        resolved_target_mode = 'pre_shock_baseline'
-        metrics = series_resilience_metrics(
+        band_recovery = recovery_steps_target_band(
             series,
             shock_iter,
-            baseline_window=baseline_window,
-            avg_window=avg_window,
-            tolerance_pct=tolerance_pct,
             stable_window=stable_window,
             horizon=horizon,
-            retracement_fraction=retracement_fraction,
-            impact_window=impact_window,
-            analysis_target_mode=resolved_target_mode,
+            target_series=target_series,
+            lower_ratio=0.5,
+            upper_ratio=1.5,
         )
-        metrics['baseline_price'] = metrics.pop('baseline_level')
-        return metrics
+    else:
+        resolved_target_mode = 'pre_shock_baseline'
+        baseline = baseline_level(series, shock_iter, lookback=baseline_window)
+        dev_series = pct_deviation_series(series, baseline)
+        band_recovery = recovery_steps_target_band(
+            series,
+            shock_iter,
+            stable_window=stable_window,
+            horizon=horizon,
+            lower_ratio=0.5,
+            upper_ratio=1.5,
+        )
 
     dislocation = initial_dislocation_pct(dev_series, shock_iter, impact_window=impact_window)
     initial_dislocation = dislocation['dislocation_pct']
-    relative_recovery = recovery_steps_retracement(
+    retracement_recovery = recovery_steps_retracement(
         dev_series,
         shock_iter,
         retracement_fraction=retracement_fraction,
@@ -503,14 +610,21 @@ def price_resilience_metrics(series: List[float], shock_iter: int,
         'half_life_steps': half_life_steps_pct(
             dev_series, shock_iter, stable_window=max(3, stable_window // 3), horizon=horizon,
         ),
-        'legacy_recovery_steps': recovery_steps_pct(
+        'legacy_recovery_steps': band_recovery['recovery_steps'],
+        'recovery_steps_retracement': retracement_recovery['recovery_steps'],
+        'time_observed_steps_retracement': retracement_recovery['time_observed_steps'],
+        'recovered_retracement': retracement_recovery['recovered'],
+        'is_censored_retracement': retracement_recovery['is_censored'],
+        'recovery_steps_fixed_band_pct': recovery_steps_pct(
             dev_series, shock_iter, tolerance_pct=tolerance_pct,
             stable_window=stable_window, horizon=horizon,
         ),
-        'recovery_steps': relative_recovery['recovery_steps'],
-        'time_observed_steps': relative_recovery['time_observed_steps'],
-        'recovered': relative_recovery['recovered'],
-        'is_censored': relative_recovery['is_censored'],
-        'target_abs_deviation_pct': relative_recovery['target_abs_deviation_pct'],
+        'recovery_steps': retracement_recovery['recovery_steps'],
+        'time_observed_steps': retracement_recovery['time_observed_steps'],
+        'recovered': retracement_recovery['recovered'],
+        'is_censored': retracement_recovery['is_censored'],
+        'target_abs_deviation_pct': retracement_recovery['target_abs_deviation_pct'],
+        'target_lower_ratio': band_recovery['target_lower_ratio'],
+        'target_upper_ratio': band_recovery['target_upper_ratio'],
         'deviation_series': dev_series,
     }

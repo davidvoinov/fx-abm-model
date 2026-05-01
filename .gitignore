@@ -1,4 +1,10 @@
-output/
+output/*
+!output/resilience_aware_300/
+!output/resilience_aware_300/**
+!output/scenario_stats_300/
+!output/scenario_stats_300/**
 .obsidian-vault/
+.vscode/
+.venv/
 .DS_Store
 .pytest_cache/

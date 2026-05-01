@@ -15,6 +15,8 @@ class Order:
         self.trader = trader_link
         self.order_id = Order.order_id
         self.ttl = ttl  # ticks until expiry (None = GTC)
+        self.reserved_cash = 0.0
+        self.reserved_assets = 0.0
 
         # Connections
         self.left = None
@@ -229,6 +231,8 @@ class OrderList:
                 break
 
             # Solve orders
+            order_qty_before = order.qty
+            val_qty_before = val.qty
             tmp_qty = min(order.qty, val.qty)  # Quantity traded currently
             tmp_price = val.price  # Price traded
             val.qty -= tmp_qty
@@ -237,25 +241,44 @@ class OrderList:
             # Solve cash and assets
             if order.order_type == 'bid':
                 if order.trader is not None:
-                    order.trader.cash -= tmp_price * tmp_qty * (1 + t_cost)
-                    order.trader.assets += tmp_qty
+                    self._settle_trader_fill(order, tmp_qty, tmp_price, t_cost,
+                                             is_buy=True, qty_before=order_qty_before)
                 if val.trader is not None:
-                    val.trader.cash += tmp_price * tmp_qty * (1 - t_cost)
-                    val.trader.assets -= tmp_qty
+                    self._settle_trader_fill(val, tmp_qty, tmp_price, t_cost,
+                                             is_buy=False, qty_before=val_qty_before)
 
             if order.order_type == 'ask':
                 if order.trader is not None:
-                    order.trader.cash += tmp_price * tmp_qty * (1 - t_cost)
-                    order.trader.assets -= tmp_qty
+                    self._settle_trader_fill(order, tmp_qty, tmp_price, t_cost,
+                                             is_buy=False, qty_before=order_qty_before)
                 if val.trader is not None:
-                    val.trader.cash -= tmp_price * tmp_qty * (1 + t_cost)
-                    val.trader.assets += tmp_qty
+                    self._settle_trader_fill(val, tmp_qty, tmp_price, t_cost,
+                                             is_buy=True, qty_before=val_qty_before)
 
             # Clear remaining
             if val.qty == 0:
                 self.remove(val)
 
         return order
+
+    @staticmethod
+    def _settle_trader_fill(order: Order, fill_qty: float, fill_price: float,
+                            t_cost: float, is_buy: bool, qty_before: float):
+        trader = order.trader
+        if trader is None:
+            return
+
+        if hasattr(trader, 'apply_fill'):
+            trader.apply_fill(order, fill_qty, fill_price, t_cost, is_buy, qty_before)
+            return
+
+        gross = fill_price * fill_qty
+        if is_buy:
+            trader.cash -= gross * (1 + t_cost)
+            trader.assets += fill_qty
+        else:
+            trader.cash += gross * (1 - t_cost)
+            trader.assets -= fill_qty
 
     @classmethod
     def from_list(cls, order_list, sort=False):
