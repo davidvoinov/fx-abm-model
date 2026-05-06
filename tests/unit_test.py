@@ -988,6 +988,45 @@ def test_endogenous_mm_withdrawal():
                f"spread_mult={defensive_adj['spread_mult']:.3f}, depth_mult={defensive_adj['depth_mult']:.3f}")
 
 
+def test_mm_withdrawal_mode_isolation():
+    """venue_interaction_mode='none' should remove direct AMM influence from MM withdrawal."""
+    section("MM WITHDRAWAL MODE ISOLATION — Unit Tests")
+
+    env = MarketEnvironment(price=100.0,
+                            sigma_low=0.01, sigma_high=0.05,
+                            c_low=0.001, c_high=0.01)
+    ex = _make_exchange(BIDS, ASKS)
+    pool = HFMMPool(x=3000.0, y=300000.0, A=18.0, fee=0.0005, rate=100.0)
+
+    mm_none = MarketMaker(
+        ex,
+        cash=1e4,
+        env=env,
+        amm_pools={'hfmm': pool},
+        venue_interaction_mode='none',
+    )
+    mm_comp = MarketMaker(
+        ex,
+        cash=1e4,
+        env=env,
+        amm_pools={'hfmm': pool},
+        venue_interaction_mode='competition',
+    )
+
+    none_details = mm_none._withdrawal_components(100.0)
+    comp_details = mm_comp._withdrawal_components(100.0)
+
+    check_bool("Interaction none removes AMM outside option from withdrawal score",
+               none_details['outside_option_score'] == 0.0,
+               f"outside_option_score={none_details['outside_option_score']:.3f}")
+    check_bool("Competition mode preserves AMM outside option in withdrawal score",
+               comp_details['outside_option_score'] > 0.0,
+               f"outside_option_score={comp_details['outside_option_score']:.3f}")
+    check_bool("Competition mode raises withdrawal score relative to isolated mode",
+               comp_details['score'] > none_details['score'],
+               f"competition={comp_details['score']:.3f}, none={none_details['score']:.3f}")
+
+
 def test_market_maker_uses_clob_only_flow_imbalance():
     """CLOB MM should react to CLOB taker flow, not AMM-only prints."""
     section("MARKET MAKER CLOB-ONLY FLOW IMBALANCE — Unit Tests")
@@ -1615,7 +1654,7 @@ def test_flash_crash_preset():
 
 
 def test_mm_withdrawal_preset():
-    """MM withdrawal should stay persistent but recover faster via secondary liquidity support."""
+    """MM withdrawal should isolate dealer retreat from direct AMM->MM feedback."""
     section("MM WITHDRAWAL PRESET — Unit Tests")
 
     parser = main_module.build_parser()
@@ -1628,6 +1667,9 @@ def test_mm_withdrawal_preset():
     check_bool("MM withdrawal keeps no permanent fair-value shift",
                args.fundamental_shock_pct == 0.0,
                f"fundamental_shock_pct={args.fundamental_shock_pct}")
+    check_bool("MM withdrawal disables direct CLOB-AMM competition feedback",
+               args.clob_amm_interaction == 'none',
+               f"clob_amm_interaction={args.clob_amm_interaction}")
     check_bool("MM withdrawal stays harsher than funding-liquidity shock on quote loss",
                args.liquidity_shock_frac > main_module.REALISM_PRESETS['funding_liquidity_shock']['liquidity_shock_frac'],
                f"mm={args.liquidity_shock_frac}, funding={main_module.REALISM_PRESETS['funding_liquidity_shock']['liquidity_shock_frac']}")
@@ -1642,6 +1684,50 @@ def test_mm_withdrawal_preset():
     check_bool("MM withdrawal accelerates near-mid background replenishment",
                args.bg_target_ratio_recovery > main_module.REALISM_PRESETS['funding_liquidity_shock']['bg_target_ratio_recovery'],
                f"mm={args.bg_target_ratio_recovery}, funding={main_module.REALISM_PRESETS['funding_liquidity_shock']['bg_target_ratio_recovery']}")
+
+
+def test_mm_withdrawal_feedback_preset():
+    """Feedback preset should preserve the coupled AMM-vs-MM competition channel."""
+    section("MM WITHDRAWAL FEEDBACK PRESET — Unit Tests")
+
+    parser = main_module.build_parser()
+    args = parser.parse_args(['--preset', 'mm_withdrawal_feedback'])
+    main_module._apply_preset_defaults(parser, args)
+
+    check_bool("Feedback preset remains a realism preset",
+               main_module._preset_family(args.preset) == 'realism',
+               f"preset_family={main_module._preset_family(args.preset)}")
+    check_bool("Feedback preset keeps the competition channel on",
+               args.clob_amm_interaction == 'competition',
+               f"clob_amm_interaction={args.clob_amm_interaction}")
+    check_bool("Feedback preset preserves the same withdrawal shock core",
+               args.order_flow_shock_qty == main_module.REALISM_PRESETS['mm_withdrawal']['order_flow_shock_qty']
+               and args.liquidity_shock_frac == main_module.REALISM_PRESETS['mm_withdrawal']['liquidity_shock_frac']
+               and args.mm_withdraw_threshold == main_module.REALISM_PRESETS['mm_withdrawal']['mm_withdraw_threshold'],
+               f"qty={args.order_flow_shock_qty}, liq={args.liquidity_shock_frac}, threshold={args.mm_withdraw_threshold}")
+
+
+def test_realism_preset_interaction_modes():
+    """Every realism preset should resolve to an explicit, stable MM-AMM interaction mode."""
+    section("REALISM PRESET INTERACTION MODES — Unit Tests")
+
+    expected_modes = {
+        'baseline': 'competition',
+        'mm_withdrawal': 'none',
+        'mm_withdrawal_feedback': 'competition',
+        'flash_crash': 'none',
+        'dealer_liquidity_crisis': 'competition',
+        'funding_liquidity_shock': 'competition',
+        'high_vol_stress': 'none',
+    }
+
+    parser = main_module.build_parser()
+    for preset, expected_mode in expected_modes.items():
+        args = parser.parse_args(['--preset', preset])
+        main_module._apply_preset_defaults(parser, args)
+        check_bool(f"{preset} resolves to {expected_mode}",
+                   args.clob_amm_interaction == expected_mode,
+                   f"clob_amm_interaction={args.clob_amm_interaction}")
 
 
 def test_funding_liquidity_shock_preset():

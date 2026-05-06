@@ -6,6 +6,7 @@ Base scenario (without any shocks):
 
 Event simulations presets (with different shock types/mechanics):                                 
     python3 main.py --seed 42 --preset mm_withdrawal            
+    python3 main.py --seed 42 --preset mm_withdrawal_feedback   
     python3 main.py --seed 42 --preset flash_crash              
     python3 main.py --seed 42 --preset dealer_liquidity_crisis  
     python3 main.py --seed 42 --preset funding_liquidity_shock   
@@ -287,14 +288,16 @@ LEGACY_PRESETS = {
 REALISM_PRESETS = {
     "baseline": dict(
         shock_mode="realism",
+        clob_amm_interaction="competition",
     ),
     "mm_withdrawal": dict(
         shock_iter=350,
         shock_mode="realism",
-        # Narrow microstructure event: dealers pull quotes under one-sided flow,
-        # but latent fair value does not fully re-anchor.
-        # Keep the CLOB build identical to the default so cross-scenario
-        # statistical tests differ by shock mechanics, not book composition.
+        clob_amm_interaction="none",
+        # Isolated dealer-withdrawal event: dealers pull quotes under one-sided
+        # flow, but AMM presence does not directly change CLOB MM risk-taking.
+        # This keeps the withdrawal trigger exogenous to AMM presence so the
+        # scenario can study whether AMMs stabilize the market after MM retreat.
         fundamental_shock_pct=0.0,
         order_flow_shock_qty=135.0,
         order_flow_shock_side="sell",
@@ -303,6 +306,31 @@ REALISM_PRESETS = {
         arb_trade_fraction_cap=0.08,
         # Recovery is slower than the original soft preset, but materially
         # faster than the full dealer-liquidity-crisis scenario.
+        reprice_prob_recovery=0.045,
+        anchor_strength_recovery=0.022,
+        bg_target_ratio_recovery=0.085,
+        toxic_flow_decay=0.83,
+        liquidity_shock_decay=0.87,
+        mm_withdraw_threshold=1.70,
+        mm_reentry_threshold=1.00,
+        mm_loss_threshold_bps=19.0,
+        mm_min_withdraw_ticks=4,
+        mm_reentry_ticks=2,
+    ),
+    "mm_withdrawal_feedback": dict(
+        shock_iter=350,
+        shock_mode="realism",
+        clob_amm_interaction="competition",
+        # Coupled dealer-withdrawal event: same shock as mm_withdrawal, but
+        # AMM quality also affects CLOB MM quoting and retreat decisions.
+        # Use this when the research question explicitly includes dealer
+        # competition from AMMs as part of the shock transmission channel.
+        fundamental_shock_pct=0.0,
+        order_flow_shock_qty=135.0,
+        order_flow_shock_side="sell",
+        liquidity_shock_frac=0.54,
+        funding_vol_shock_intensity=0.35,
+        arb_trade_fraction_cap=0.08,
         reprice_prob_recovery=0.045,
         anchor_strength_recovery=0.022,
         bg_target_ratio_recovery=0.085,
@@ -337,6 +365,7 @@ REALISM_PRESETS = {
     "dealer_liquidity_crisis": dict(
         shock_iter=350,
         shock_mode="realism",
+        clob_amm_interaction="competition",
         # Fundamental dislocation: constrained dealers cannot absorb flow
         # → price discovery breaks (BIS WP 1073, Huang et al.)
         fundamental_shock_pct=-3.0,
@@ -359,6 +388,7 @@ REALISM_PRESETS = {
     "funding_liquidity_shock": dict(
         shock_iter=350,
         shock_mode="realism",
+        clob_amm_interaction="competition",
         # Macro funding squeeze without a permanent fair-value repricing:
         # spreads widen and liquidity thins, but the latent anchor stays put.
         fundamental_shock_pct=0.0,
@@ -1804,6 +1834,92 @@ def _spillover_standardized_beta(y, x, beta: float, lag: int):
     return float(beta) * (sx / sy)
 
 
+def _spillover_window_mean(series, start: int, end: int) -> float:
+    lo = max(0, int(start))
+    hi = max(lo, min(len(series), int(end)))
+    finite = [float(value) for value in series[lo:hi] if math.isfinite(value)]
+    return sum(finite) / len(finite) if finite else float('nan')
+
+
+def _spillover_phase_windows(sim: Simulator, n_obs: int) -> list[dict]:
+    event_iter = _shock_iter_from_sim(sim)
+    env = getattr(sim, 'env', None)
+    stress_end = getattr(env, 'stress_end', None) if env is not None else None
+
+    windows = [
+        {'phase': 'full', 'label': 'Full sample', 'start': 0, 'end': n_obs},
+    ]
+    if event_iter is None:
+        return windows
+
+    event_iter = max(0, min(int(event_iter), n_obs))
+    before_start = max(0, event_iter - 50)
+    if stress_end is not None and stress_end > event_iter:
+        during_end = max(event_iter, min(n_obs, int(stress_end)))
+        after_end = min(n_obs, during_end + 100)
+    else:
+        during_end = min(n_obs, event_iter + 20)
+        after_end = min(n_obs, event_iter + 100)
+
+    windows.extend([
+        {'phase': 'before', 'label': 'Before', 'start': before_start, 'end': event_iter},
+        {'phase': 'during', 'label': 'During', 'start': event_iter, 'end': during_end},
+        {'phase': 'after', 'label': 'After', 'start': during_end, 'end': after_end},
+    ])
+    return [window for window in windows if window['end'] > window['start']]
+
+
+def _spillover_flow_share_series(logger) -> tuple[list[float], list[float]]:
+    clob_share = logger.flow_share('clob')
+    n_obs = len(logger.iterations)
+    if not clob_share:
+        return [float('nan')] * n_obs, [float('nan')] * n_obs
+
+    amm_share = []
+    for idx, clob_value in enumerate(clob_share):
+        total_amm = 0.0
+        total_all = 0.0
+        for venue, volumes in logger.flow_volume.items():
+            if idx >= len(volumes):
+                continue
+            volume = float(volumes[idx])
+            total_all += volume
+            if venue != 'clob':
+                total_amm += volume
+        if total_all > 0:
+            amm_share.append(total_amm / total_all)
+        else:
+            amm_share.append(float('nan'))
+    return clob_share, amm_share
+
+
+def _spillover_slice_metrics(logger, d_clob, d_amm, lag: int, start: int, end: int) -> dict:
+    diff_start = max(0, int(start))
+    diff_end = max(diff_start, min(len(d_clob), max(int(start), int(end) - 1)))
+    slice_clob = d_clob[diff_start:diff_end]
+    slice_amm = d_amm[diff_start:diff_end]
+    corr = logger.series_correlation(slice_clob, slice_amm)
+    amm_to_clob = logger._lag_regression(slice_clob, slice_amm, lag=lag)
+    clob_to_amm = logger._lag_regression(slice_amm, slice_clob, lag=lag)
+    return {
+        'corr_dliq_clob_amm': corr,
+        'amm_to_clob_beta_std': _spillover_standardized_beta(
+            slice_clob,
+            slice_amm,
+            amm_to_clob.get('beta', float('nan')),
+            lag,
+        ),
+        'clob_to_amm_beta_std': _spillover_standardized_beta(
+            slice_amm,
+            slice_clob,
+            clob_to_amm.get('beta', float('nan')),
+            lag,
+        ),
+        'amm_to_clob_beta_raw': amm_to_clob.get('beta', float('nan')),
+        'clob_to_amm_beta_raw': clob_to_amm.get('beta', float('nan')),
+    }
+
+
 def save_spillover_artifacts(sim: Simulator,
                              out_dir: str,
                              lag: int = 1,
@@ -1843,6 +1959,8 @@ def save_spillover_artifacts(sim: Simulator,
     d_amm = logger._log_diff(amm_depth)
     roll_corr = _spillover_rolling_corr(d_clob, d_amm, rolling_window)
     spill = logger.liquidity_spillover_metrics(lag=lag, split_at=split_at)
+    clob_share, amm_share = _spillover_flow_share_series(logger)
+    phase_windows = _spillover_phase_windows(sim, len(clob_depth))
 
     split_idx = None
     if split_at is not None:
@@ -1889,12 +2007,29 @@ def save_spillover_artifacts(sim: Simulator,
     clob_idx = [x / base_clob if math.isfinite(x) and base_clob > 0 else float('nan') for x in clob_depth]
     amm_idx = [x / base_amm if math.isfinite(x) and base_amm > 0 else float('nan') for x in amm_depth]
 
+    summary_rows = []
+    for window in phase_windows:
+        row = {
+            'phase': window['phase'],
+            'phase_label': window['label'],
+            'start': window['start'],
+            'end': window['end'],
+            'avg_clob_share': _spillover_window_mean(clob_share, window['start'], window['end']),
+            'avg_amm_share': _spillover_window_mean(amm_share, window['start'], window['end']),
+            'avg_clob_depth_index': _spillover_window_mean(clob_idx, window['start'], window['end']),
+            'avg_amm_depth_index': _spillover_window_mean(amm_idx, window['start'], window['end']),
+        }
+        row.update(_spillover_slice_metrics(logger, d_clob, d_amm, lag, window['start'], window['end']))
+        summary_rows.append(row)
+
     df = pd.DataFrame({
         't': list(range(len(clob_depth))),
         'clob_depth_total': _spillover_safe_series(clob_depth),
         'amm_depth_total': _spillover_safe_series(amm_depth),
         'clob_depth_index': _spillover_safe_series(clob_idx),
         'amm_depth_index': _spillover_safe_series(amm_idx),
+        'clob_flow_share': _spillover_safe_series(clob_share),
+        'amm_flow_share': _spillover_safe_series(amm_share),
     })
     if len(d_clob):
         df_d = pd.DataFrame({
@@ -1908,7 +2043,11 @@ def save_spillover_artifacts(sim: Simulator,
     csv_path = os.path.join(out_dir, f'{prefix}.csv')
     df.to_csv(csv_path, index=False)
 
-    fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=False)
+    summary_path = os.path.join(out_dir, f'{prefix}_summary.csv')
+    pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10), constrained_layout=True)
+    axes = list(axes.flat)
 
     x0 = np.arange(len(clob_idx))
     axes[0].plot(x0, clob_idx, label='CLOB depth index', color='#1f77b4', lw=2)
@@ -1929,34 +2068,88 @@ def save_spillover_artifacts(sim: Simulator,
     axes[1].set_ylabel('corr')
     axes[1].grid(alpha=0.3)
 
-    labels = ['AMM->CLOB', 'CLOB->AMM']
-    full_betas = [beta_std['full']['amm_to_clob'], beta_std['full']['clob_to_amm']]
-    before_betas = [beta_std['before']['amm_to_clob'], beta_std['before']['clob_to_amm']]
-    after_betas = [beta_std['after']['amm_to_clob'], beta_std['after']['clob_to_amm']]
-
-    pos = np.arange(len(labels))
-    wbar = 0.25
-    axes[2].bar(pos - wbar, full_betas, width=wbar, color='#1f77b4', label='full sample')
-    axes[2].bar(pos, before_betas, width=wbar, color='#ff7f0e', label='before')
-    axes[2].bar(pos + wbar, after_betas, width=wbar, color='#2ca02c', label='after')
-    axes[2].axhline(0.0, color='#333333', ls=':', lw=1.0)
-    axes[2].set_xticks(pos)
-    axes[2].set_xticklabels(labels)
-    axes[2].set_ylabel('standardized beta')
-    axes[2].set_title(f'Directional spillovers (standardized, lag={lag})')
+    axes[2].plot(x0, _spillover_safe_series(clob_share), color='#1f77b4', lw=2, label='CLOB share')
+    axes[2].plot(x0, _spillover_safe_series(amm_share), color='#2ca02c', lw=2, label='AMM share')
+    if split_at is not None:
+        axes[2].axvline(split_at, color='#d62728', ls='--', lw=1.5)
+    axes[2].set_ylim(-0.02, 1.02)
+    axes[2].set_ylabel('share of volume')
+    axes[2].set_title('Venue flow shares')
     axes[2].grid(alpha=0.3)
     axes[2].legend(loc='upper right', fontsize=9)
 
+    phase_labels = [row['phase_label'] for row in summary_rows if row['phase'] != 'full']
+    phase_rows = [row for row in summary_rows if row['phase'] != 'full'] or summary_rows
+    pos = np.arange(len(phase_rows))
+    wbar = 0.35
+    axes[3].bar(
+        pos - 0.5 * wbar,
+        [row.get('amm_to_clob_beta_std', float('nan')) for row in phase_rows],
+        width=wbar,
+        color='#1f77b4',
+        label='AMM→CLOB',
+    )
+    axes[3].bar(
+        pos + 0.5 * wbar,
+        [row.get('clob_to_amm_beta_std', float('nan')) for row in phase_rows],
+        width=wbar,
+        color='#2ca02c',
+        label='CLOB→AMM',
+    )
+    axes[3].axhline(0.0, color='#333333', ls=':', lw=1.0)
+    axes[3].set_xticks(pos)
+    axes[3].set_xticklabels(phase_labels, rotation=15)
+    axes[3].set_ylabel('standardized beta')
+    axes[3].set_title(f'Directional spillovers by phase (lag={lag})')
+    axes[3].grid(alpha=0.3)
+    axes[3].legend(loc='upper right', fontsize=9)
+
     fig.suptitle('Spillover diagnostics (main run)', fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
 
     png_path = os.path.join(out_dir, f'{prefix}.png')
     fig.savefig(png_path, dpi=180, bbox_inches='tight')
     plt.close(fig)
 
+    table_fig, table_ax = plt.subplots(figsize=(11, max(2.8, 0.75 * len(summary_rows) + 1.8)))
+    table_ax.axis('off')
+    table_ax.set_title('Spillover summary by phase', fontsize=13, fontweight='bold', pad=12)
+    table_rows = []
+    for row in summary_rows:
+        window_label = f"[{row['start']},{row['end']})"
+        table_rows.append([
+            row['phase_label'],
+            window_label,
+            f"{100.0 * row['avg_amm_share']:.1f}%" if math.isfinite(row['avg_amm_share']) else 'N/A',
+            f"{100.0 * row['avg_clob_share']:.1f}%" if math.isfinite(row['avg_clob_share']) else 'N/A',
+            f"{row['corr_dliq_clob_amm']:.3f}" if math.isfinite(row['corr_dliq_clob_amm']) else 'N/A',
+            f"{row['amm_to_clob_beta_std']:.3f}" if math.isfinite(row['amm_to_clob_beta_std']) else 'N/A',
+            f"{row['clob_to_amm_beta_std']:.3f}" if math.isfinite(row['clob_to_amm_beta_std']) else 'N/A',
+        ])
+    table = table_ax.table(
+        cellText=table_rows,
+        colLabels=['Phase', 'Window', 'AMM share', 'CLOB share', 'dliq corr', 'AMM→CLOB β', 'CLOB→AMM β'],
+        loc='center',
+        cellLoc='center',
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.0, 1.5)
+    try:
+        table.auto_set_column_width(col=list(range(7)))
+    except AttributeError:
+        pass
+    for col_idx in range(7):
+        table[0, col_idx].set_facecolor('#4c72b0')
+        table[0, col_idx].set_text_props(color='white', fontweight='bold')
+    table_path = os.path.join(out_dir, f'{prefix}_table.png')
+    table_fig.savefig(table_path, dpi=180, bbox_inches='tight')
+    plt.close(table_fig)
+
     print('\nSpillover artifacts saved:')
     print(f'  CSV -> {csv_path}')
+    print(f'  Summary CSV -> {summary_path}')
     print(f'  PNG -> {png_path}')
+    print(f'  Table PNG -> {table_path}')
     print(f'  Flow shares: CLOB={spill.get("avg_flow_share_clob", float("nan")):.3f} '
           f'AMM={spill.get("avg_flow_share_amm", float("nan")):.3f}')
     print('  Raw beta full: '

@@ -11,6 +11,10 @@ import os
 import sys
 from pathlib import Path
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -36,12 +40,18 @@ from AgentBasedModel.visualization.resilience_plots import (
 
 
 DEFAULT_PANELS = [
-    ('mm_withdrawal', 'MM Withdrawal', '#1f77b4', 'pre_shock_baseline', 'Pre-shock baseline'),
+    ('mm_withdrawal', 'MM Withdrawal (Isolated)', '#1f77b4', 'pre_shock_baseline', 'Pre-shock baseline'),
     ('flash_crash', 'Flash Crash', '#2ca02c', 'pre_shock_baseline', 'Pre-shock baseline'),
     ('dealer_liquidity_crisis', 'Dealer Liquidity Crisis', '#ff7f0e', 'fair_value_gap', 'Fair-value gap'),
     ('funding_liquidity_shock', 'Funding Liquidity Shock', '#d62728', 'pre_shock_baseline', 'Pre-shock baseline'),
     ('high_vol_stress', 'High-Vol Stress', '#9467bd', 'pre_shock_baseline', 'Pre-stress baseline'),
 ]
+
+
+def _apply_research_preset(args, preset: str):
+    """Keep resilience panels pinned to the isolated MM-withdrawal scenario."""
+    if preset == 'mm_withdrawal':
+        args.clob_amm_interaction = 'none'
 
 COMPARISON_SERIES = [
     ('with_amm', 'With AMM', True, None),
@@ -78,6 +88,7 @@ def _base_args_for_preset(preset: str, n_iter: int, min_post_shock_window: int,
     args.preset = preset
     args.n_iter = n_iter
     _apply_preset_defaults(parser, args)
+    _apply_research_preset(args, preset)
     if forced_venue_choice_rule is not None:
         args.venue_choice_rule = forced_venue_choice_rule
     if args.shock_iter is not None:
@@ -720,6 +731,102 @@ def _save_with_without_amm_comparison_csv(panel_specs, out_dir: str,
     return path
 
 
+def _save_spread_recovery_survival_panels(panel_specs, out_dir: str) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    spread_panels = []
+    for spec in panel_specs:
+        spread_panels.append({
+            'label': spec['label'],
+            'target_label': spec.get('target_label', 'Pre-shock baseline'),
+            'series': [
+                {
+                    'label': series.get('label', 'Series'),
+                    'color': series.get('color', spec.get('color', '#1f77b4')),
+                    'points': [
+                        point for point in series.get('priority_metric_points', [])
+                        if point.get('metric_name') == 'spread_resilience'
+                    ],
+                }
+                for series in spec.get('series', [])
+            ],
+        })
+
+    ncols = 2
+    nrows = math.ceil(len(spread_panels) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(16, max(7, 4.3 * nrows)), sharex=False, sharey=True)
+    axes_flat = list(axes.flat) if hasattr(axes, 'flat') else [axes]
+
+    for ax, spec in zip(axes_flat, spread_panels):
+        stats_lines = []
+        plotted_any = False
+        for series in spec['series']:
+            points = list(series.get('points', []))
+            observed_steps = [point.get('time_observed_steps', float('nan')) for point in points]
+            recovered_flags = [bool(point.get('recovered', False)) for point in points]
+            km = kaplan_meier_curve(observed_steps, recovered_flags)
+            if not km.get('times'):
+                continue
+            ax.step(
+                km['times'],
+                km['survival'],
+                where='post',
+                color=series.get('color', '#1f77b4'),
+                lw=2.0,
+                label=series.get('label', 'Series'),
+            )
+            plotted_any = True
+            recovered_share = sum(recovered_flags) / max(len(recovered_flags), 1)
+            stats_lines.append(
+                f"{series.get('label', 'Series')}: rec={recovered_share:.0%}, KM med={km.get('median_time', float('nan')):.1f}"
+            )
+
+        ax.set_title(spec['label'], fontsize=12)
+        ax.set_xlabel('Observed Steps Since Shock', fontsize=11)
+        ax.set_ylabel('P(not yet spread-recovered)', fontsize=11)
+        ax.set_ylim(-0.02, 1.02)
+        ax.axhline(0.5, color='#777777', ls='--', lw=0.8, alpha=0.5)
+        ax.grid(True, alpha=0.2)
+        ax.text(
+            0.02,
+            0.96,
+            f"Target: {spec['target_label']}",
+            transform=ax.transAxes,
+            ha='left',
+            va='top',
+            fontsize=9,
+            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.65),
+        )
+        if stats_lines:
+            ax.text(
+                0.98,
+                0.96,
+                '\n'.join(stats_lines),
+                transform=ax.transAxes,
+                ha='right',
+                va='top',
+                fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.75),
+            )
+        if plotted_any:
+            ax.legend(fontsize=8, loc='upper right')
+
+    for ax in axes_flat[len(spread_panels):]:
+        ax.axis('off')
+
+    fig.suptitle(
+        'Quoted Spread Recovery: Kaplan-Meier by Market Structure',
+        fontsize=15,
+        fontweight='bold',
+        y=0.98,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    path = os.path.join(out_dir, 'spread_recovery_survival_panels.png')
+    fig.savefig(path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
+
 def _run_study(forced_venue_choice_rule: str | None = None,
                default_out_dir: str = 'output/resilience'):
     parser = argparse.ArgumentParser(
@@ -830,6 +937,7 @@ def _run_study(forced_venue_choice_rule: str | None = None,
         base_seed=args.base_seed,
         permutation_reps=args.permutation_reps,
     )
+    spread_survival_path = _save_spread_recovery_survival_panels(panel_specs, out_dir=args.out_dir)
 
     print(f'Saved resilience scatter panels to {png_path}')
     print(f'Saved recovery survival panels to {km_path}')
@@ -840,6 +948,7 @@ def _run_study(forced_venue_choice_rule: str | None = None,
     print(f'Saved statistical resilience summary to {stats_summary_path}')
     print(f'Saved pairwise statistical tests to {pairwise_path}')
     print(f'Saved with/without AMM comparison summary to {comparison_path}')
+    print(f'Saved spread recovery survival panels to {spread_survival_path}')
 
 
 def main():

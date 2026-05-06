@@ -162,6 +162,12 @@ CONSISTENT_HYBRID_WEIGHTS = {
 _CONSISTENT_MAIN_PARSER = main_build_parser(default_venue_choice_rule='liquidity_aware')
 
 
+def _apply_research_preset(args, preset: str):
+    """Keep research sweeps pinned to the isolated MM-withdrawal scenario."""
+    if preset == 'mm_withdrawal':
+        args.clob_amm_interaction = 'none'
+
+
 # ######################################################################
 #  PART 1 -- SIMULATION  (data generation)
 # ######################################################################
@@ -990,6 +996,7 @@ def _build_consistent_args(seed, *, preset, n_iter, overrides):
     args = _CONSISTENT_MAIN_PARSER.parse_args([])
     args.preset = preset
     main_apply_preset_defaults(_CONSISTENT_MAIN_PARSER, args)
+    _apply_research_preset(args, preset)
     args.seed = seed
     args.n_iter = n_iter
     args.silent = True
@@ -2222,8 +2229,8 @@ if __name__ == '__main__':
     parser.add_argument('--spillover-viz', action='store_true',
                         help='Run one simulation and save spillover visual diagnostics (PNG + CSV)')
     parser.add_argument('--spillover-preset', default='mm_withdrawal',
-                        choices=['baseline', 'mm_withdrawal', 'flash_crash', 'funding_liquidity_shock'],
-                        help='Scenario preset used for spillover visualization (default: mm_withdrawal)')
+                        choices=['baseline', 'mm_withdrawal', 'mm_withdrawal_feedback', 'flash_crash', 'funding_liquidity_shock'],
+                        help='Scenario preset used for spillover visualization (default: isolated mm_withdrawal)')
     parser.add_argument('--spillover-seed', type=int, default=42,
                         help='Seed for spillover visualization run (default: 42)')
     parser.add_argument('--spillover-n-iter', type=int, default=900,
@@ -2256,12 +2263,12 @@ if __name__ == '__main__':
     parser.add_argument('--consistent-stage1-limit', type=int, default=0,
                         help='Optional cap on Stage-1 CLOB configs, useful for smoke tests (default: 0 = full grid)')
     parser.add_argument('--consistent-clob-shock-preset', default='mm_withdrawal',
-                        choices=['baseline', 'mm_withdrawal', 'flash_crash', 'funding_liquidity_shock'],
-                        help='Shock preset used to rank shortlisted CLOB configs (default: mm_withdrawal)')
+                        choices=['baseline', 'mm_withdrawal', 'mm_withdrawal_feedback', 'flash_crash', 'funding_liquidity_shock'],
+                        help='Shock preset used to rank shortlisted CLOB configs (default: isolated mm_withdrawal)')
     parser.add_argument('--consistent-hybrid-presets', nargs='*',
                         default=list(CONSISTENT_DEFAULT_HYBRID_PRESETS),
-                        choices=['mm_withdrawal', 'flash_crash', 'funding_liquidity_shock'],
-                        help='Shock presets used for the CLOB+AMM sweep (default: mm_withdrawal flash_crash funding_liquidity_shock)')
+                        choices=['mm_withdrawal', 'mm_withdrawal_feedback', 'flash_crash', 'funding_liquidity_shock'],
+                        help='Shock presets used for the CLOB+AMM sweep (default: isolated mm_withdrawal flash_crash funding_liquidity_shock)')
     parser.add_argument('--consistent-hfmm-A-grid', nargs='*', type=float,
                         default=list(CONSISTENT_DEFAULT_HFMM_A_GRID),
                         dest='consistent_hfmm_A_grid',

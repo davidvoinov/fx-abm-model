@@ -13,6 +13,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use('Agg')
+import numpy as np
 import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -34,12 +35,18 @@ from AgentBasedModel.metrics.statistics import (
 
 DEFAULT_SCENARIOS = [
     ('default', 'Default'),
-    ('mm_withdrawal', 'MM Withdrawal'),
+    ('mm_withdrawal', 'MM Withdrawal (Isolated)'),
     ('flash_crash', 'Flash Crash'),
     ('dealer_liquidity_crisis', 'Dealer Liquidity Crisis'),
     ('funding_liquidity_shock', 'Funding Liquidity Shock'),
     ('high_vol_stress', 'High-Vol Stress'),
 ]
+
+
+def _apply_research_preset(args, preset: str):
+    """Keep research defaults pinned to the isolated MM-withdrawal scenario."""
+    if preset == 'mm_withdrawal':
+        args.clob_amm_interaction = 'none'
 
 MARKET_STRUCTURES = [
     ('with_amm', 'With AMM', True),
@@ -70,12 +77,35 @@ RQ_FIGURE_METRICS = {
         'post_shock_avg_clob_depth',
         'post_shock_avg_realized_volatility',
         'post_shock_avg_systemic_liquidity',
+        'post_shock_mm_share_active',
+        'post_shock_mm_share_defensive',
         'post_shock_mm_share_withdrawn',
         'post_shock_mm_withdrawal_score',
+        'avg_mm_share_active',
+        'avg_mm_share_defensive',
         'avg_mm_share_withdrawn',
         'avg_mm_withdrawal_score',
     ],
 }
+
+H2_PHASE_METRICS = [
+    ('amm_share', 'AMM Flow Share'),
+    ('clob_share', 'CLOB Flow Share'),
+    ('mm_share_active', 'MM Active Share'),
+    ('mm_share_defensive', 'MM Defensive Share'),
+    ('mm_share_withdrawn', 'MM Withdrawn Share'),
+    ('mm_withdrawal_score', 'MM Withdrawal Score'),
+    ('spill_corr', 'Liquidity Co-movement Corr'),
+    ('spill_beta_amm_to_clob_std', 'AMM→CLOB Spillover Beta'),
+    ('spill_beta_clob_to_amm_std', 'CLOB→AMM Spillover Beta'),
+]
+
+H2_PHASE_DASHBOARD_METRICS = [
+    ('amm_share', 'AMM Flow Share'),
+    ('mm_share_withdrawn', 'MM Withdrawn Share'),
+    ('spill_corr', 'Liquidity Co-movement Corr'),
+    ('spill_beta_amm_to_clob_std', 'AMM→CLOB Spillover Beta'),
+]
 
 
 def _metric_spec():
@@ -97,8 +127,12 @@ def _metric_spec():
         ('post_shock_avg_clob_depth', 'Post-shock CLOB Depth', 'RQ2', True),
         ('post_shock_avg_systemic_liquidity', 'Post-shock Systemic Liquidity', 'RQ2', True),
         ('post_shock_avg_realized_volatility', 'Post-shock Realized Volatility', 'RQ2', True),
+        ('post_shock_mm_share_active', 'Post-shock MM Active Share', 'RQ2', True),
+        ('post_shock_mm_share_defensive', 'Post-shock MM Defensive Share', 'RQ2', True),
         ('post_shock_mm_share_withdrawn', 'Post-shock MM Withdrawn Share', 'RQ2', True),
         ('post_shock_mm_withdrawal_score', 'Post-shock MM Withdrawal Score', 'RQ2', True),
+        ('avg_mm_share_active', 'Average MM Active Share', 'RQ2', False),
+        ('avg_mm_share_defensive', 'Average MM Defensive Share', 'RQ2', False),
         ('avg_mm_share_withdrawn', 'Average MM Withdrawn Share', 'RQ2', False),
         ('avg_mm_withdrawal_score', 'Average MM Withdrawal Score', 'RQ2', False),
     ]
@@ -118,6 +152,8 @@ def _metric_preference(metric_name: str) -> str | None:
         'liquidity_composite_recovered',
         'post_shock_avg_clob_depth',
         'post_shock_avg_systemic_liquidity',
+        'avg_mm_share_active',
+        'post_shock_mm_share_active',
     }
     lower_is_better = {
         'avg_clob_spread_bps',
@@ -130,8 +166,10 @@ def _metric_preference(metric_name: str) -> str | None:
         'liquidity_composite_recovery_steps',
         'post_shock_avg_clob_spread_bps',
         'post_shock_avg_realized_volatility',
+        'post_shock_mm_share_defensive',
         'post_shock_mm_share_withdrawn',
         'post_shock_mm_withdrawal_score',
+        'avg_mm_share_defensive',
         'avg_mm_share_withdrawn',
         'avg_mm_withdrawal_score',
     }
@@ -233,6 +271,106 @@ def _window_mean(series, start: int, end: int) -> float:
     return _mean_finite(series[lo:hi])
 
 
+def _phase_windows(sim, n_obs: int) -> dict[str, tuple[int, int]]:
+    event_iter = _event_iter_from_sim(sim)
+    if event_iter is None:
+        return {}
+
+    event_iter = max(0, min(int(event_iter), n_obs))
+    env = getattr(sim, 'env', None)
+    stress_end = getattr(env, 'stress_end', None) if env is not None else None
+    before_start = max(0, event_iter - 50)
+    if stress_end is not None and stress_end > event_iter:
+        during_end = max(event_iter, min(n_obs, int(stress_end)))
+        after_end = min(n_obs, during_end + 100)
+    else:
+        during_end = min(n_obs, event_iter + 20)
+        after_end = min(n_obs, event_iter + 100)
+
+    windows = {
+        'before': (before_start, event_iter),
+        'during': (event_iter, during_end),
+        'after': (during_end, after_end),
+    }
+    return {
+        phase: (start, end)
+        for phase, (start, end) in windows.items()
+        if end > start
+    }
+
+
+def _aggregate_amm_share_series(logger) -> list[float]:
+    n_obs = len(logger.iterations)
+    out = []
+    for idx in range(n_obs):
+        total_amm = 0.0
+        total_all = 0.0
+        for venue, volumes in logger.flow_volume.items():
+            if idx >= len(volumes):
+                continue
+            volume = float(volumes[idx])
+            total_all += volume
+            if venue != 'clob':
+                total_amm += volume
+        out.append(total_amm / total_all if total_all > 0 else float('nan'))
+    return out
+
+
+def _spillover_standardized_beta(y, x, beta: float, lag: int) -> float:
+    if not math.isfinite(beta):
+        return float('nan')
+    lag = max(1, int(lag))
+    if len(y) <= lag or len(x) <= lag:
+        return float('nan')
+    ys = y[lag:]
+    xs = x[:-lag]
+    pairs = [(xi, yi) for xi, yi in zip(xs, ys) if math.isfinite(xi) and math.isfinite(yi)]
+    if len(pairs) < 3:
+        return float('nan')
+    xs_f, ys_f = zip(*pairs)
+    sx = float(sum((value - sum(xs_f) / len(xs_f)) ** 2 for value in xs_f) / len(xs_f)) ** 0.5
+    sy = float(sum((value - sum(ys_f) / len(ys_f)) ** 2 for value in ys_f) / len(ys_f)) ** 0.5
+    if not (math.isfinite(sx) and math.isfinite(sy) and sy > 0):
+        return float('nan')
+    return float(beta) * (sx / sy)
+
+
+def _spillover_phase_metrics(logger, start: int, end: int, lag: int = 1) -> dict[str, float]:
+    if not getattr(logger, 'amm_depth_series', None):
+        return {
+            'spill_corr': float('nan'),
+            'spill_beta_amm_to_clob_std': float('nan'),
+            'spill_beta_clob_to_amm_std': float('nan'),
+        }
+
+    clob_depth = logger.clob_total_depth_series()
+    amm_depth = logger.amm_total_depth_series()
+    d_clob = logger._log_diff(clob_depth)
+    d_amm = logger._log_diff(amm_depth)
+    diff_start = max(0, int(start))
+    diff_end = max(diff_start, min(len(d_clob), max(int(start), int(end) - 1)))
+    slice_clob = d_clob[diff_start:diff_end]
+    slice_amm = d_amm[diff_start:diff_end]
+    corr = logger.series_correlation(slice_clob, slice_amm)
+    amm_to_clob = logger._lag_regression(slice_clob, slice_amm, lag=lag)
+    clob_to_amm = logger._lag_regression(slice_amm, slice_clob, lag=lag)
+    return {
+        'spill_corr': corr,
+        'spill_beta_amm_to_clob_std': _spillover_standardized_beta(
+            slice_clob,
+            slice_amm,
+            amm_to_clob.get('beta', float('nan')),
+            lag,
+        ),
+        'spill_beta_clob_to_amm_std': _spillover_standardized_beta(
+            slice_amm,
+            slice_clob,
+            clob_to_amm.get('beta', float('nan')),
+            lag,
+        ),
+    }
+
+
 def _rolling_return_vol(mid_series: list[float], window: int = 20) -> list[float]:
     returns = []
     for idx in range(1, len(mid_series)):
@@ -282,6 +420,7 @@ def _base_args_for_scenario(preset: str, n_iter: int,
     args.preset = preset
     args.n_iter = n_iter
     _apply_preset_defaults(parser, args)
+    _apply_research_preset(args, preset)
     args.venue_choice_rule = venue_choice_rule
     _auto_stress_around_shock(args)
     return args
@@ -311,6 +450,8 @@ def _scenario_metrics(sim, scenario_key: str,
         'tail_realized_volatility': _tail_mean(realized_vol),
         'avg_cost_clob_q5': float(summary.get('avg_cost_clob_Q5', float('nan'))),
         'avg_flow_share_amm_total': amm_flow_share,
+        'avg_mm_share_active': float(summary.get('avg_mm_share_active', float('nan'))),
+        'avg_mm_share_defensive': float(summary.get('avg_mm_share_defensive', float('nan'))),
         'avg_mm_share_withdrawn': float(summary.get('avg_mm_share_withdrawn', float('nan'))),
         'avg_mm_withdrawal_score': float(summary.get('avg_mm_withdrawal_score', float('nan'))),
     }
@@ -372,6 +513,21 @@ def _scenario_metrics(sim, scenario_key: str,
         analysis_target_mode='liquidity_composite',
     )
 
+    phase_windows = _phase_windows(sim, len(logger.iterations))
+    clob_share_series = logger.flow_share('clob')
+    amm_share_series = _aggregate_amm_share_series(logger)
+    for phase, (start, end) in phase_windows.items():
+        metrics[f'amm_share_{phase}'] = _window_mean(amm_share_series, start, end)
+        metrics[f'clob_share_{phase}'] = _window_mean(clob_share_series, start, end)
+        metrics[f'mm_share_active_{phase}'] = _window_mean(logger.mm_state_shares['active'], start, end)
+        metrics[f'mm_share_defensive_{phase}'] = _window_mean(logger.mm_state_shares['defensive'], start, end)
+        metrics[f'mm_share_withdrawn_{phase}'] = _window_mean(logger.mm_state_shares['withdrawn'], start, end)
+        metrics[f'mm_withdrawal_score_{phase}'] = _window_mean(logger.mm_avg_withdrawal_score_series, start, end)
+        metrics.update({
+            f'{name}_{phase}': value
+            for name, value in _spillover_phase_metrics(logger, start, end, lag=1).items()
+        })
+
     metrics.update({
         'price_recovery_steps': price_metrics.get('recovery_steps', float('nan')),
         'spread_recovery_steps': spread_metrics.get('recovery_steps', float('nan')),
@@ -382,6 +538,8 @@ def _scenario_metrics(sim, scenario_key: str,
         'post_shock_avg_clob_depth': _window_mean(depth_series, event_iter, horizon_end),
         'post_shock_avg_systemic_liquidity': _window_mean(logger.systemic_liquidity_series, event_iter, horizon_end),
         'post_shock_avg_realized_volatility': _window_mean(realized_vol, event_iter, horizon_end),
+        'post_shock_mm_share_active': _window_mean(logger.mm_state_shares['active'], event_iter, horizon_end),
+        'post_shock_mm_share_defensive': _window_mean(logger.mm_state_shares['defensive'], event_iter, horizon_end),
         'post_shock_mm_share_withdrawn': _window_mean(logger.mm_state_shares['withdrawn'], event_iter, horizon_end),
         'post_shock_mm_withdrawal_score': _window_mean(logger.mm_avg_withdrawal_score_series, event_iter, horizon_end),
     })
@@ -444,7 +602,7 @@ def _save_points_csv(rows: list[dict], out_dir: str) -> str:
         'scenario_key', 'scenario_label', 'structure_key', 'structure_label', 'amm_enabled', 'seed'
     ] + [name for name, _label, _rq, _shock_only in _metric_spec()]
     with open(path, 'w', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -816,6 +974,271 @@ def _save_heatmap_summary(test_rows: list[dict], out_dir: str) -> str:
     return path
 
 
+def _save_h2_phase_points_csv(rows: list[dict], out_dir: str) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, 'h2_phase_points.csv')
+    phases = ('before', 'during', 'after')
+    fieldnames = ['scenario_key', 'scenario_label', 'structure_key', 'structure_label', 'amm_enabled', 'seed']
+    for metric_name, _metric_label in H2_PHASE_METRICS:
+        for phase in phases:
+            fieldnames.append(f'{metric_name}_{phase}')
+
+    with open(path, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            if row['scenario_key'] not in PRICE_TARGET_MODE:
+                continue
+            if row['structure_key'] != 'with_amm':
+                continue
+            out = {
+                'scenario_key': row['scenario_key'],
+                'scenario_label': row['scenario_label'],
+                'structure_key': row['structure_key'],
+                'structure_label': row['structure_label'],
+                'amm_enabled': row['amm_enabled'],
+                'seed': row['seed'],
+            }
+            for metric_name, _metric_label in H2_PHASE_METRICS:
+                for phase in phases:
+                    out[f'{metric_name}_{phase}'] = row.get(f'{metric_name}_{phase}', float('nan'))
+            writer.writerow(out)
+    return path
+
+
+def _save_h2_phase_summary_csv(rows: list[dict], out_dir: str) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, 'h2_phase_summary.csv')
+    phases = ('before', 'during', 'after')
+    fieldnames = ['scenario_key', 'scenario_label', 'phase', 'n_seeds'] + [
+        metric_name for metric_name, _metric_label in H2_PHASE_METRICS
+    ]
+    with open(path, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for scenario_key, scenario_label in DEFAULT_SCENARIOS:
+            if scenario_key not in PRICE_TARGET_MODE:
+                continue
+            scenario_rows = [
+                row for row in rows
+                if row['scenario_key'] == scenario_key and row['structure_key'] == 'with_amm'
+            ]
+            if not scenario_rows:
+                continue
+            for phase in phases:
+                out = {
+                    'scenario_key': scenario_key,
+                    'scenario_label': scenario_label,
+                    'phase': phase,
+                    'n_seeds': len(scenario_rows),
+                }
+                for metric_name, _metric_label in H2_PHASE_METRICS:
+                    out[metric_name] = _mean_finite(
+                        row.get(f'{metric_name}_{phase}', float('nan')) for row in scenario_rows
+                    )
+                writer.writerow(out)
+    return path
+
+
+def _extract_phase_paired_samples(rows: list[dict], scenario_key: str,
+                                  metric_name: str,
+                                  phase_a: str,
+                                  phase_b: str) -> tuple[list[float], list[float]]:
+    sample_a = []
+    sample_b = []
+    for row in rows:
+        if row['scenario_key'] != scenario_key or row['structure_key'] != 'with_amm':
+            continue
+        value_a = row.get(f'{metric_name}_{phase_a}', float('nan'))
+        value_b = row.get(f'{metric_name}_{phase_b}', float('nan'))
+        if math.isfinite(value_a) and math.isfinite(value_b):
+            sample_a.append(float(value_a))
+            sample_b.append(float(value_b))
+    return sample_a, sample_b
+
+
+def _save_h2_phase_tests_csv(rows: list[dict], out_dir: str,
+                             bootstrap_reps: int,
+                             ci_level: float,
+                             base_seed: int,
+                             permutation_reps: int) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, 'h2_phase_tests.csv')
+    comparisons = [('during', 'before'), ('after', 'before')]
+    fieldnames = [
+        'scenario_key', 'scenario_label', 'metric_name', 'metric_label',
+        'phase_a', 'phase_b', 'n_pairs', 'mean_phase_a', 'mean_phase_b',
+        'mean_delta_a_minus_b', 'permutation_stat', 'permutation_p_value',
+        'ci_level', 'delta_ci_lo', 'delta_ci_hi',
+    ]
+    with open(path, 'w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for scenario_key, scenario_label in DEFAULT_SCENARIOS:
+            if scenario_key not in PRICE_TARGET_MODE:
+                continue
+            for metric_name, metric_label in H2_PHASE_METRICS:
+                for phase_a, phase_b in comparisons:
+                    sample_a, sample_b = _extract_phase_paired_samples(
+                        rows,
+                        scenario_key,
+                        metric_name,
+                        phase_a,
+                        phase_b,
+                    )
+                    paired = paired_permutation_test(
+                        sample_a,
+                        sample_b,
+                        n_perm=permutation_reps,
+                        seed=_stat_seed(base_seed, 'h2', scenario_key, metric_name, phase_a, phase_b),
+                    )
+                    boot = bootstrap_paired_diff_ci(
+                        sample_a,
+                        sample_b,
+                        n_boot=bootstrap_reps,
+                        ci_level=ci_level,
+                        seed=_stat_seed(base_seed, 'h2boot', scenario_key, metric_name, phase_a, phase_b),
+                    )
+                    writer.writerow({
+                        'scenario_key': scenario_key,
+                        'scenario_label': scenario_label,
+                        'metric_name': metric_name,
+                        'metric_label': metric_label,
+                        'phase_a': phase_a,
+                        'phase_b': phase_b,
+                        'n_pairs': paired['n'],
+                        'mean_phase_a': paired['mean_a'],
+                        'mean_phase_b': paired['mean_b'],
+                        'mean_delta_a_minus_b': paired['mean_diff'],
+                        'permutation_stat': paired['stat'],
+                        'permutation_p_value': paired['p_value'],
+                        'ci_level': ci_level,
+                        'delta_ci_lo': boot['ci_lo'],
+                        'delta_ci_hi': boot['ci_hi'],
+                    })
+    return path
+
+
+def _save_h2_phase_dashboard(rows: list[dict], out_dir: str) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    phases = ('before', 'during', 'after')
+    phase_positions = np.arange(len(phases))
+    scenario_palette = ['#1f77b4', '#2ca02c', '#ff7f0e', '#d62728', '#9467bd']
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
+    axes_flat = list(axes.flat)
+
+    for ax, (metric_name, metric_label) in zip(axes_flat, H2_PHASE_DASHBOARD_METRICS):
+        for idx, (scenario_key, scenario_label) in enumerate(DEFAULT_SCENARIOS):
+            if scenario_key not in PRICE_TARGET_MODE:
+                continue
+            scenario_rows = [
+                row for row in rows
+                if row['scenario_key'] == scenario_key and row['structure_key'] == 'with_amm'
+            ]
+            values = [
+                _mean_finite(row.get(f'{metric_name}_{phase}', float('nan')) for row in scenario_rows)
+                for phase in phases
+            ]
+            if not any(math.isfinite(value) for value in values):
+                continue
+            if 'share' in metric_name:
+                values = [100.0 * value if math.isfinite(value) else float('nan') for value in values]
+            ax.plot(
+                phase_positions,
+                values,
+                marker='o',
+                lw=2,
+                color=scenario_palette[idx % len(scenario_palette)],
+                label=scenario_label,
+            )
+        ax.set_xticks(phase_positions)
+        ax.set_xticklabels(['Before', 'During', 'After'])
+        ax.set_title(metric_label, fontsize=11)
+        ax.grid(alpha=0.25)
+        if 'share' in metric_name:
+            ax.set_ylabel('percent')
+        else:
+            ax.set_ylabel('value')
+
+    handles, labels = axes_flat[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc='upper center', ncol=3, frameon=False)
+    fig.suptitle(
+        'H2 Phase Dashboard\nHybrid-market phase shifts around dealer withdrawal / stress',
+        fontsize=15,
+        fontweight='bold',
+    )
+    path = os.path.join(out_dir, 'h2_phase_dashboard.png')
+    fig.savefig(path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
+
+def _save_mm_behavior_dashboard(test_rows: list[dict], out_dir: str) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    metric_names = [
+        'post_shock_mm_share_active',
+        'post_shock_mm_share_defensive',
+        'post_shock_mm_share_withdrawn',
+        'post_shock_mm_withdrawal_score',
+    ]
+    label_map = _metric_label_map()
+    scenario_rows = [
+        (scenario_key, scenario_label)
+        for scenario_key, scenario_label in DEFAULT_SCENARIOS
+        if any(
+            row['metric_name'] in metric_names and row['scenario_key'] == scenario_key
+            for row in test_rows
+        )
+    ]
+    heatmap_values = []
+    annotation_values = []
+    for scenario_key, _scenario_label in scenario_rows:
+        heatmap_row = []
+        annotation_row = []
+        for metric_name in metric_names:
+            match = next(
+                (
+                    row for row in test_rows
+                    if row['scenario_key'] == scenario_key and row['metric_name'] == metric_name
+                ),
+                None,
+            )
+            if match is None:
+                heatmap_row.append(0.0)
+                annotation_row.append('')
+                continue
+            delta = float(match.get('mean_delta_with_minus_without', float('nan')))
+            p_value = float(match.get('permutation_p_value', float('nan')))
+            heatmap_row.append(_heatmap_score(metric_name, delta, p_value))
+            annotation_row.append(_format_delta(delta, p_value))
+        heatmap_values.append(heatmap_row)
+        annotation_row = annotation_row if annotation_row else [''] * len(metric_names)
+        annotation_values.append(annotation_row)
+
+    fig, ax = plt.subplots(figsize=(10, max(4, 0.75 * len(scenario_rows) + 2.0)), constrained_layout=True)
+    image = ax.imshow(heatmap_values, aspect='auto', cmap='RdYlGn', vmin=-2.0, vmax=2.0)
+    ax.set_xticks(range(len(metric_names)))
+    ax.set_xticklabels([label_map.get(metric_name, metric_name) for metric_name in metric_names], rotation=20, ha='right')
+    ax.set_yticks(range(len(scenario_rows)))
+    ax.set_yticklabels([scenario_label for _scenario_key, scenario_label in scenario_rows])
+    ax.set_title('MM Behavior With AMM vs Without AMM', fontsize=14, fontweight='bold')
+    for y_idx, row in enumerate(annotation_values):
+        for x_idx, text in enumerate(row):
+            value = heatmap_values[y_idx][x_idx]
+            text_color = '#111111' if abs(value) < 1.25 else 'white'
+            ax.text(x_idx, y_idx, text, ha='center', va='center', fontsize=8, color=text_color)
+    cbar = fig.colorbar(image, ax=ax, shrink=0.9, pad=0.02)
+    cbar.set_label('Adverse  <  direction + statistical support  >  Favorable', fontsize=10)
+    cbar.set_ticks([-2.0, -1.0, 0.0, 1.0, 2.0])
+    cbar.set_ticklabels(['strong', 'moderate', 'neutral', 'moderate', 'strong'])
+    path = os.path.join(out_dir, 'mm_behavior_dashboard.png')
+    fig.savefig(path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    return path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='Generate RQ-oriented multi-seed tests for AMM effects on liquidity, resilience, and volatility.',
@@ -897,6 +1320,18 @@ def main() -> None:
     question_paths = _save_question_views(test_rows, out_dir=args.out_dir)
     dashboard_paths = _save_effect_dashboards(test_rows, out_dir=args.out_dir)
     heatmap_path = _save_heatmap_summary(test_rows, out_dir=args.out_dir)
+    h2_points_path = _save_h2_phase_points_csv(all_rows, out_dir=args.out_dir)
+    h2_summary_path = _save_h2_phase_summary_csv(all_rows, out_dir=args.out_dir)
+    h2_tests_path = _save_h2_phase_tests_csv(
+        all_rows,
+        out_dir=args.out_dir,
+        bootstrap_reps=args.bootstrap_reps,
+        ci_level=args.ci_level,
+        base_seed=args.base_seed,
+        permutation_reps=args.permutation_reps,
+    )
+    h2_dashboard_path = _save_h2_phase_dashboard(all_rows, out_dir=args.out_dir)
+    mm_dashboard_path = _save_mm_behavior_dashboard(test_rows, out_dir=args.out_dir)
 
     print(f'Saved raw RQ points to {points_path}')
     print(f'Saved RQ summary to {summary_path}')
@@ -907,6 +1342,11 @@ def main() -> None:
     for path in dashboard_paths:
         print(f'Saved effect dashboard to {path}')
     print(f'Saved compact heatmap summary to {heatmap_path}')
+    print(f'Saved H2 phase points to {h2_points_path}')
+    print(f'Saved H2 phase summary to {h2_summary_path}')
+    print(f'Saved H2 phase tests to {h2_tests_path}')
+    print(f'Saved H2 phase dashboard to {h2_dashboard_path}')
+    print(f'Saved MM behavior dashboard to {mm_dashboard_path}')
 
 
 if __name__ == '__main__':

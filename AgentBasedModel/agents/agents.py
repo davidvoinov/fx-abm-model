@@ -989,17 +989,44 @@ class Trader:
 
     # ---- multi-venue routing (active only when amm_pools is set) ---------
 
+    def _routing_reference_price(self) -> float:
+        """Public routing benchmark used for cross-venue AMM quotes."""
+        try:
+            clob_mid = self.clob.mid_price()
+            if _math.isfinite(clob_mid) and clob_mid > 0:
+                return float(clob_mid)
+        except Exception:
+            pass
+
+        if self.env is not None:
+            try:
+                fair_price = self.env.fair_price
+                if fair_price is not None and _math.isfinite(fair_price) and fair_price > 0:
+                    return float(fair_price)
+            except Exception:
+                pass
+
+        return float('nan')
+
     def estimate_costs(self, Q: float, side: str = 'buy') -> Dict[str, float]:
         """Return {venue_name: internal execution cost_bps} for quantity Q."""
         costs: Dict[str, float] = {}
+        benchmark_price = self._routing_reference_price()
         try:
             costs['clob'] = self.clob.cost_bps(Q, side)
         except Exception:
             costs['clob'] = float('inf')
         for name, pool in self.amm_pools.items():
             try:
-                # AMM internal TCA: slippage is measured vs local pool mid.
-                q = pool.quote_buy(Q) if side == 'buy' else pool.quote_sell(Q)
+                # Route AMMs against the public market benchmark so stale but
+                # executable AMM quotes can attract flow during CLOB stress.
+                if _math.isfinite(benchmark_price) and benchmark_price > 0:
+                    q = (
+                        pool.quote_buy(Q, S_t=benchmark_price)
+                        if side == 'buy' else pool.quote_sell(Q, S_t=benchmark_price)
+                    )
+                else:
+                    q = pool.quote_buy(Q) if side == 'buy' else pool.quote_sell(Q)
                 costs[name] = q['cost_bps']
             except Exception:
                 costs[name] = float('inf')
@@ -1050,7 +1077,10 @@ class Trader:
                 pool_mid = pool.mid_price()
                 if _math.isfinite(ref_mid) and ref_mid > 0 and _math.isfinite(pool_mid):
                     basis_bps = abs(pool_mid - ref_mid) / ref_mid * 10_000.0
-                    alignment_score = 1.0 / (1.0 + basis_bps / 20.0)
+                    # Large cross-venue basis should reduce confidence in AMM
+                    # quotes, but not fully block migration when the quote is
+                    # still materially better than the stressed CLOB.
+                    alignment_score = max(0.35, 1.0 / (1.0 + basis_bps / 120.0))
             except Exception:
                 alignment_score = 1.0
             pool_alignment[name] = alignment_score
@@ -1093,9 +1123,10 @@ class Trader:
         if self.env is not None:
             liquidity_component = 0.80 + 0.20 * max(0.0, min(1.0, liquidity_factor))
             arbitrage_component = 0.65 + 0.35 * max(0.0, min(1.0, arbitrage_capacity))
-            basis_component = 1.0 / (1.0 + max(0.0, venue_basis_bps) / 30.0)
-            amm_state_score = liquidity_component * arbitrage_component * basis_component
-            amm_state_score = max(0.20, min(1.0, amm_state_score))
+            # Arbitrage capacity already embeds venue basis, so penalizing the
+            # same basis again here would suppress realistic flight-to-AMM.
+            amm_state_score = liquidity_component * arbitrage_component
+            amm_state_score = max(0.35, min(1.0, amm_state_score))
         group_state_scores = {'clob': 1.0, 'amm': amm_state_score}
 
         group_scores: Dict[str, float] = {}
@@ -2433,7 +2464,9 @@ class MarketMaker(Trader):
         inventory_ratio = min(1.5, inventory_abs / max(1.5 * float(self.softlimit), 1.0))
         ofi_score = min(2.0, abs(self._recent_ofi()))
         liquidity_damage = min(1.5, max(0.0, 1.0 - liquidity_factor))
-        outside_option_score = min(1.5, self._amm_support_score(mid))
+        outside_option_score = 0.0
+        if self.venue_interaction_mode != 'none':
+            outside_option_score = min(1.5, self._amm_support_score(mid))
         loss_score = min(3.0, self._loss_bps_ewma / self.loss_threshold_bps)
         shock_window = min(1.0, float(getattr(self.env, 'shock_ticks_remaining', 0)) / 12.0)
         liquidity_shock = max(0.0, float(getattr(self.env, 'liquidity_shock', 0.0)))
