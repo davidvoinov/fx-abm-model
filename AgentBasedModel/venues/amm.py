@@ -662,30 +662,38 @@ class HFMMPool:
 
     # ---- rate management -------------------------------------------------
 
-    def update_rate(self, threshold: float = 0.01):
+    def update_rate(self, threshold: float = 0.01,
+                    target_rate: Optional[float] = None):
         """
-        Recenter the StableSwap curve around the current mid-price.
+        Recenter the StableSwap curve around an external equilibrium rate.
 
-        Over time the external price drifts away from the initial ``rate``
-        used to normalise reserves.  This pushes the pool onto the steep
-        part of the invariant curve and makes it behave like a CPMM
-        (losing capital efficiency).
+        In real Curve v1 deployments the rate is governance-controlled and
+        anchored on an *external* oracle (e.g. an on-chain price feed). It
+        is *not* re-pegged to the pool's own drifted mid, because doing so
+        would silently legitimise pool drift and eliminate the StableSwap
+        amplification benefit relative to the equilibrium price.
 
-        Calling this method re-derives ``rate`` and ``D`` from the
-        current physical reserves so the curve is once again centered.
+        For the FX context, the equilibrium rate is the latent fair price
+        ``S_t``. The arbitrageur supplies ``target_rate`` (typically the
+        current CLOB mid or env.fair_price). When ``target_rate`` is None,
+        the legacy behaviour of pegging to the pool's own mid is preserved
+        for backward compatibility, but production code paths should
+        always pass ``target_rate``.
 
         Parameters
         ----------
         threshold : float
-            Minimum relative drift |mid − rate| / rate before an update
-            is triggered (default 1 %).  Prevents unnecessary churn.
+            Minimum relative drift |target − rate| / rate to trigger.
+        target_rate : float or None
+            External equilibrium rate. If None, falls back to the pool mid.
         """
-        mp = self.mid_price()
-        if mp <= 0:
+        if target_rate is None:
+            target_rate = self.mid_price()
+        if target_rate is None or target_rate <= 0:
             return
-        if abs(mp - self.rate) / self.rate < threshold:
+        if abs(target_rate - self.rate) / self.rate < threshold:
             return
-        self.rate = mp
+        self.rate = float(target_rate)
         self._sync_norm()
         self.D = _hfmm_get_D(self._xn, self._yn, self.A)
 

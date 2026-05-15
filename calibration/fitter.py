@@ -156,19 +156,40 @@ class CalibrationFitter:
         return sum(value for value in amm_shares if math.isfinite(value)) if amm_shares else 0.0
 
     @staticmethod
+    def _hfmm_basis_series(sim) -> list[float]:
+        """Time series of |HFMM mid - CLOB mid| in bps.
+
+        HFMM is the economically relevant automated venue per the paper
+        (§3.2); CPMM is a benchmark protocol whose basis is naturally
+        wider because of higher curvature. Conflating the two via a
+        max-of-pools statistic distorts the FX-side reading.
+        """
+        logger = getattr(sim, 'logger', None)
+        if logger is None or 'hfmm' not in logger.amm_mid_series:
+            return []
+        clob_series = logger.clob_mid_series
+        hfmm_series = logger.amm_mid_series['hfmm']
+        out: list[float] = []
+        for clob_mid, pool_mid in zip(clob_series, hfmm_series):
+            if not (math.isfinite(clob_mid) and math.isfinite(pool_mid) and clob_mid > 0):
+                continue
+            out.append(abs(10_000.0 * (pool_mid - clob_mid) / clob_mid))
+        return out
+
+    @staticmethod
     def _parameter_sanity(sim) -> float:
         pools = getattr(sim, 'amm_pools', {}) or {}
         if not pools:
             return 1.0
 
         checks: list[bool] = []
-        max_basis = _finite_mean([
-            abs(value)
-            for value in sim.logger.max_venue_basis_series()
-            if math.isfinite(value)
-        ])
-        if math.isfinite(max_basis):
-            checks.append(max_basis <= 25.0)
+        # Use median HFMM basis (matches paper claim of "average CLOB-HFMM
+        # basis") rather than the time-mean of the max across pools, which
+        # is sensitive to outliers and conflates CPMM with HFMM.
+        hfmm_basis = CalibrationFitter._hfmm_basis_series(sim)
+        median_hfmm_basis = _finite_median(hfmm_basis) if hfmm_basis else float('nan')
+        if math.isfinite(median_hfmm_basis):
+            checks.append(median_hfmm_basis <= 25.0)
 
         for pool in pools.values():
             checks.append(100.0 <= float(pool.x) <= 50_000.0)
@@ -214,9 +235,9 @@ class CalibrationFitter:
             'recovery_half_life_ticks': recovery_half_life,
             'dealer_withdrawal_share': dealer_withdrawal_share,
             'funding_liquidity_stress_propagation': self._funding_liquidity_propagation(logger),
-            'cross_venue_basis_bps': _finite_mean([
-                abs(value) for value in logger.max_venue_basis_series() if math.isfinite(value)
-            ]),
+            # Median HFMM-CLOB basis rather than the time-mean of the
+            # max across pools, which is dominated by CPMM tail episodes.
+            'cross_venue_basis_bps': _finite_median(self._hfmm_basis_series(sim)),
             'amm_volume_share': self._amm_volume_share(logger),
             'fx_amm_parameter_sanity': self._parameter_sanity(sim),
         }

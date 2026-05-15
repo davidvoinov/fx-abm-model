@@ -1271,8 +1271,8 @@ def main() -> None:
                         help='Print progress every N seeds per scenario (default: 25, 0 disables progress output)')
     parser.add_argument('--venue-choice-rule', choices=['fixed_share', 'liquidity_aware'], default='liquidity_aware',
                         help='Use one routing regime consistently across all scenarios (default: liquidity_aware)')
-    parser.add_argument('--out-dir', default='output/scenario_stats',
-                        help='Output directory for CSV summaries (default: output/scenario_stats)')
+    parser.add_argument('--out-dir', default='output/stat_tests',
+                        help='Output directory for CSV summaries (default: output/stat_tests)')
     args = parser.parse_args()
 
     all_rows = []
@@ -1318,8 +1318,6 @@ def main() -> None:
         permutation_reps=args.permutation_reps,
     )
     question_paths = _save_question_views(test_rows, out_dir=args.out_dir)
-    dashboard_paths = _save_effect_dashboards(test_rows, out_dir=args.out_dir)
-    heatmap_path = _save_heatmap_summary(test_rows, out_dir=args.out_dir)
     h2_points_path = _save_h2_phase_points_csv(all_rows, out_dir=args.out_dir)
     h2_summary_path = _save_h2_phase_summary_csv(all_rows, out_dir=args.out_dir)
     h2_tests_path = _save_h2_phase_tests_csv(
@@ -1330,8 +1328,6 @@ def main() -> None:
         base_seed=args.base_seed,
         permutation_reps=args.permutation_reps,
     )
-    h2_dashboard_path = _save_h2_phase_dashboard(all_rows, out_dir=args.out_dir)
-    mm_dashboard_path = _save_mm_behavior_dashboard(test_rows, out_dir=args.out_dir)
 
     print(f'Saved raw RQ points to {points_path}')
     print(f'Saved RQ summary to {summary_path}')
@@ -1339,14 +1335,15 @@ def main() -> None:
     print(f'Saved with/without AMM tests to {with_without_path}')
     for path in question_paths:
         print(f'Saved research-question view to {path}')
-    for path in dashboard_paths:
-        print(f'Saved effect dashboard to {path}')
-    print(f'Saved compact heatmap summary to {heatmap_path}')
     print(f'Saved H2 phase points to {h2_points_path}')
     print(f'Saved H2 phase summary to {h2_summary_path}')
     print(f'Saved H2 phase tests to {h2_tests_path}')
-    print(f'Saved H2 phase dashboard to {h2_dashboard_path}')
-    print(f'Saved MM behavior dashboard to {mm_dashboard_path}')
+
+    # Generate individual plots in subfolders (rq1/, rq2/, h2_phase/, mm_behavior/)
+    # by reading the CSVs we just wrote.
+    from tools.regenerate_plots import regenerate_stat_tests
+    plot_paths = regenerate_stat_tests(args.out_dir)
+    print(f'Generated {len(plot_paths)} individual plots under {args.out_dir}/')
 
 
 if __name__ == '__main__':

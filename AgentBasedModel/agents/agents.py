@@ -1077,10 +1077,11 @@ class Trader:
                 pool_mid = pool.mid_price()
                 if _math.isfinite(ref_mid) and ref_mid > 0 and _math.isfinite(pool_mid):
                     basis_bps = abs(pool_mid - ref_mid) / ref_mid * 10_000.0
-                    # Large cross-venue basis should reduce confidence in AMM
-                    # quotes, but not fully block migration when the quote is
-                    # still materially better than the stressed CLOB.
-                    alignment_score = max(0.35, 1.0 / (1.0 + basis_bps / 120.0))
+                    # Cross-venue basis is a strong signal of stale/mis-priced
+                    # AMM quote. With a 50 bps half-life and 0.10 floor a 100
+                    # bps basis cuts AMM weight by ~3x, while a 1000 bps drift
+                    # essentially removes it from contention.
+                    alignment_score = max(0.10, 1.0 / (1.0 + basis_bps / 50.0))
             except Exception:
                 alignment_score = 1.0
             pool_alignment[name] = alignment_score
@@ -1103,10 +1104,12 @@ class Trader:
         liquidity_factor = getattr(self.env, 'systemic_liquidity', 1.0) if self.env is not None else 1.0
         venue_basis_bps = getattr(self.env, 'venue_basis_bps', 0.0) if self.env is not None else 0.0
         arbitrage_capacity = getattr(self.env, 'arbitrage_capacity', 1.0) if self.env is not None else 1.0
-        prior_mix = 0.08 / (1.0 + cost_span / 10.0)
+        # Calm-state cap of 0.18 yields the 1.072 / 0.928 effective group
+        # priors used as the worked example in the paper at amm_share=0.30.
+        prior_mix = 0.18 / (1.0 + cost_span / 10.0)
         prior_mix *= 0.75 + 0.25 * max(0.0, min(1.0, liquidity_factor))
         prior_mix /= 1.0 + max(0.0, venue_basis_bps) / 25.0
-        prior_mix = max(0.0, min(0.08, prior_mix))
+        prior_mix = max(0.0, min(0.18, prior_mix))
 
         neutral_priors = {'clob': 0.5, 'amm': 0.5}
         target_priors = {'clob': 1.0 - amm_target, 'amm': amm_target}
@@ -1135,7 +1138,11 @@ class Trader:
                 group_scores[name] = 0.0
                 continue
             rel_cost = max(0.0, cost - best_group_cost)
-            cost_score = _math.exp(-rel_cost / 10.0)
+            # Cost-sensitivity scale of 4 bps is calibrated to EUR/USD
+            # microstructure: a 5 bps cost gap (already material on a major
+            # pair) downweights the worse venue by ~3.5x; a 20 bps gap by
+            # >100x. The previous 10 bps scale was too lenient for FX.
+            cost_score = _math.exp(-rel_cost / 4.0)
             depth = group_depths[name]
             depth_score = min(max(depth, 0.0) / max(10.0 * Q, 1.0), 2.0)
             liquidity_score = 0.4 + 0.6 * min(depth_score, 1.0)
@@ -1161,7 +1168,7 @@ class Trader:
                 amm_scores[name] = 0.0
                 continue
             rel_cost = max(0.0, cost - best_amm_cost)
-            cost_score = _math.exp(-rel_cost / 10.0)
+            cost_score = _math.exp(-rel_cost / 4.0)
             depth_score = min(pool_depths.get(name, 0.0) / max(8.0 * Q, 1.0), 2.0)
             liquidity_score = 0.4 + 0.6 * min(depth_score, 1.0)
             amm_scores[name] = cost_score * liquidity_score * pool_alignment.get(name, 1.0)
@@ -1980,8 +1987,20 @@ class Fundamentalist(Trader):
             self.trades.append(rec)
             return rec
 
-        # ---------- classic single-venue mode (dividend DCF) --------------
-        pf = round(self.evaluate(self.market.dividend(self.access), self.market.risk_free), 1)  # fundamental price
+        # ---------- classic single-venue mode --------------
+        # FX-aware: when an env.fair_price is available we use it as the
+        # fundamental anchor (the FX paper's Fundamentalist trades against
+        # the latent fair value, not against a dividend stream). The
+        # dividend DCF is preserved only as a legacy fallback for stock-
+        # market scenarios with no env attached. This lets the same class
+        # participate as a CLOB-side *limit-order provider* anchored on
+        # env.fair_price (placing passive bids/offers around fair) — a
+        # complementary role to the FX-mode Fundamentalist, which acts as
+        # a *liquidity taker* via choose_venue + market-order execution.
+        if self.env is not None and getattr(self.env, 'fair_price', None) is not None:
+            pf = round(float(self.env.fair_price), 2)
+        else:
+            pf = round(self.evaluate(self.market.dividend(self.access), self.market.risk_free), 1)
         p = self.market.price()
         spread = self.market.spread()
         t_cost = self.market.transaction_cost
@@ -1990,36 +2009,29 @@ class Fundamentalist(Trader):
             return
 
         random_state = random.random()
-        qty = Fundamentalist.draw_quantity(pf, p)  # quantity to buy
+        qty = Fundamentalist.draw_quantity(pf, p)
         if not qty:
             return
 
-        # Limit or Market order
         if random_state > .45:
             random_state = random.random()
-
             ask_t = round(spread['ask'] * (1 + t_cost), 1)
             bid_t = round(spread['bid'] * (1 - t_cost), 1)
-
             if pf >= ask_t:
                 if random_state > .5:
                     self._buy_market(qty)
                 else:
                     self._sell_limit(qty, (pf + Random.draw_delta()) * (1 + t_cost))
-
             elif pf <= bid_t:
                 if random_state > .5:
                     self._sell_market(qty)
                 else:
                     self._buy_limit(qty, (pf - Random.draw_delta()) * (1 - t_cost))
-
             elif ask_t > pf > bid_t:
                 if random_state > .5:
                     self._buy_limit(qty, (pf - Random.draw_delta()) * (1 - t_cost))
                 else:
                     self._sell_limit(qty, (pf + Random.draw_delta()) * (1 + t_cost))
-
-        # Cancel order
         else:
             if self.orders:
                 self._cancel_order(self.orders[0])
@@ -2158,8 +2170,17 @@ class Universalist(Fundamentalist, Chartist):
 
         dp = info.prices[-1] - info.prices[-2] if len(info.prices) > 1 else 0  # price derivative
         p = self.market.price()  # market price
-        pf = self.evaluate(self.market.dividend(self.access), self.market.risk_free)  # fundamental price
-        r = pf * self.market.risk_free  # expected dividend return
+        # FX-aware fundamental anchor and "expected return" proxy. When an
+        # env.fair_price is configured, the Universalist evaluates being a
+        # Fundamentalist as the convergence return |pf - p|/p (the gain
+        # captured by closing the mispricing); otherwise falls back to the
+        # legacy dividend-DCF expected return for stock-market scenarios.
+        if self.env is not None and getattr(self.env, 'fair_price', None) is not None:
+            pf = float(self.env.fair_price)
+            r = abs(pf - p) / max(p, 1e-9)
+        else:
+            pf = self.evaluate(self.market.dividend(self.access), self.market.risk_free)
+            r = pf * self.market.risk_free
         R = mean(info.returns[-1].values())  # average return in economy
 
         # Change sentiment
@@ -2222,7 +2243,9 @@ class MarketMaker(Trader):
                  venue_interaction_mode: str = 'competition',
                  amm_spread_impact_bps: float = 3.0,
                  amm_depth_impact: float = 60.0,
-                 amm_reference_q: float = 5.0,
+                 # When 0/None the reference quote size is derived from
+                 # d0/n_levels (the dealer's typical per-level slice).
+                 amm_reference_q: float = 0.0,
                  withdrawal_threshold: float = 1.8,
                  reentry_threshold: float = 1.05,
                  loss_threshold_bps: float = 20.0,
@@ -2253,7 +2276,12 @@ class MarketMaker(Trader):
         self.venue_interaction_mode = venue_interaction_mode
         self.amm_spread_impact_bps = max(0.0, amm_spread_impact_bps)
         self.amm_depth_impact = max(0.0, amm_depth_impact)
-        self.amm_reference_q = max(1.0, float(amm_reference_q))
+        # Scale the AMM probe size to the dealer's typical per-level quote
+        # so the support score reflects pricing for trades of the dealer's
+        # native size, not an arbitrary 5-unit hard-coded probe. Per-level
+        # quote ~ d0/n_levels (touch slice in the inverse pyramid).
+        derived_q = max(1.0, float(d0) / max(1, int(n_levels)))
+        self.amm_reference_q = max(1.0, float(amm_reference_q if amm_reference_q else derived_q))
         self.withdrawal_threshold = max(0.1, float(withdrawal_threshold))
         self.reentry_threshold = max(0.0, min(self.withdrawal_threshold, float(reentry_threshold)))
         self.loss_threshold_bps = max(1.0, float(loss_threshold_bps))
@@ -2304,6 +2332,19 @@ class MarketMaker(Trader):
         return max(0.2, min(1.0, getattr(self.env, 'systemic_liquidity', 1.0)))
 
     def _reference_mid(self, spread: Optional[dict], fair_mid: Optional[float]) -> Optional[float]:
+        """Dealer-internal reference mid as a weighted average of the
+        observable book mid and the latent fair price.
+
+        Real FX dealers run internal pricing engines that incorporate
+        macro / cross-rate signals beyond the visible CLOB (Brunnermeier &
+        Pedersen 2009; Karnaukh, Ranaldo, Soderlind 2015), but the weight
+        on the latent anchor is small in calm markets (the book is the
+        primary information source) and shrinks further in stress (when
+        the book signal is the most reliable thing the dealer has).
+
+        Cap reduced from 0.35 to 0.20 to keep dealer behaviour driven by
+        observable order-flow rather than the exogenous fair-price series.
+        """
         book_mid = None
         if spread is not None:
             book_mid = (spread['bid'] + spread['ask']) / 2.0
@@ -2320,9 +2361,9 @@ class MarketMaker(Trader):
 
         liquidity_factor = self._liquidity_factor()
         gap_bps = abs(fair_mid - book_mid) / max(book_mid, 1e-9) * 10_000.0
-        fair_weight = 0.35 * liquidity_factor / stress_scale
+        fair_weight = 0.20 * liquidity_factor / stress_scale
         fair_weight /= 1.0 + gap_bps / 75.0
-        fair_weight = max(0.05, min(0.35, fair_weight))
+        fair_weight = max(0.02, min(0.20, fair_weight))
         return book_mid + fair_weight * (fair_mid - book_mid)
 
     def _amm_support_score(self, mid: float) -> float:
@@ -2373,7 +2414,27 @@ class MarketMaker(Trader):
         return max(0.0, min(1.0, support / stress_scale))
 
     def _venue_interaction_state(self, mid: float) -> dict:
-        """Translate AMM presence into risk modifiers, not direct quote subsidies."""
+        """Translate AMM presence into dealer risk modifiers.
+
+        Three modes:
+          * 'none'        — AMM presence does not affect dealer quoting.
+                            Use for experiments isolating dealer mechanics.
+          * 'toxicity'    — AMM cream-skims small benign flow, leaving the
+                            CLOB dealer with a more toxic mix (Lehar &
+                            Parlour 2024; consistent with Aoyagi & Ito
+                            2024 informational asymmetry channel). Spreads
+                            widen and depth thins.
+          * 'competition' — AMM presence makes dealer quoting marginally
+                            more conservative on the inventory channel,
+                            but does NOT mechanically tighten spreads or
+                            inflate depth. Net effect is small and one-
+                            sided (no liquidity 'subsidy' from AMM
+                            existing). Earlier versions of this code
+                            applied a symmetric tightening + depth boost
+                            that is not in the paper and not supported by
+                            the FX coexistence literature; that subsidy
+                            has been removed.
+        """
         liquidity_factor = self._liquidity_factor()
         state = {
             'ofi_scale': 1.0,
@@ -2387,31 +2448,41 @@ class MarketMaker(Trader):
         if support <= 0.0:
             return state
 
-        spread_relief = min(0.35, self.amm_spread_impact_bps / 20.0) * support
-        depth_relief = min(0.35, self.amm_depth_impact / 150.0) * support
+        spread_load = min(0.35, self.amm_spread_impact_bps / 20.0) * support
+        depth_load = min(0.35, self.amm_depth_impact / 150.0) * support
 
         if self.venue_interaction_mode == 'toxicity':
-            state['ofi_scale'] = 1.0 + 0.60 * spread_relief
-            state['inventory_scale'] = 1.0 + 0.75 * depth_relief
-            state['liquidity_factor'] = max(0.2, liquidity_factor * (1.0 - 0.40 * depth_relief))
+            # Higher OFI sensitivity; inventory penalty grows; effective
+            # liquidity factor falls. Dealer becomes more defensive in
+            # the presence of cream-skimming AMM.
+            state['ofi_scale'] = 1.0 + 0.60 * spread_load
+            state['inventory_scale'] = 1.0 + 0.75 * depth_load
+            state['liquidity_factor'] = max(0.2, liquidity_factor * (1.0 - 0.40 * depth_load))
             return state
 
-        state['ofi_scale'] = max(0.65, 1.0 - 0.60 * spread_relief)
-        state['inventory_scale'] = max(0.70, 1.0 - 0.75 * depth_relief)
-        support_bonus = 0.10 * spread_relief + 0.20 * depth_relief
-        state['liquidity_factor'] = min(
-            1.15,
-            liquidity_factor + depth_relief * (1.0 - liquidity_factor) + support_bonus,
-        )
+        # 'competition' mode (legacy default) — neutral on spread/OFI,
+        # mild risk-management discipline on inventory. No subsidy.
+        state['inventory_scale'] = 1.0 + 0.25 * depth_load
         return state
 
     def _target_spread_bps(self, mid: float) -> float:
-        """Quoted spread in bps as f(σ, c, |OFI|)."""
+        """Quoted spread in bps, paper Eq. (1):
+            s* = alpha0 + alpha1*sigma + alpha2*c + alpha3*|OFI|.
+
+        The systemic-liquidity factor enters multiplicatively below
+        (paper supplement Eq. (10) with the ell-tilde modifier), not as
+        an additive penalty, so a faded liquidity regime widens spreads
+        proportionally rather than tacking on a fixed bps penalty.
+        """
         venue_state = self._venue_interaction_state(mid)
         effective_ofi = abs(self._recent_ofi()) * venue_state['ofi_scale']
         base = self.alpha0 + self.alpha1 * self.env.sigma + self.alpha2 * self.env.funding_cost
         base += self.alpha3 * effective_ofi
-        base += 35.0 * (1.0 - venue_state['liquidity_factor'])
+        # Multiplicative liquidity loading (ell-tilde in Eq. (10)). At
+        # ell = 1 (calm) this is a no-op; at ell = 0.4 (deep stress)
+        # spreads widen by ~50%. Bounded to avoid runaway widening.
+        liquidity_factor = max(0.2, min(1.0, venue_state['liquidity_factor']))
+        base /= liquidity_factor
         return max(0.5, base)
 
     def _target_depth(self, mid: float) -> float:
@@ -2460,7 +2531,11 @@ class MarketMaker(Trader):
 
         sigma_score = min(2.5, max(0.0, self.env.sigma / sigma_base - 1.0))
         funding_score = min(2.5, max(0.0, self.env.funding_cost / funding_base - 1.0))
-        inventory_abs = max(abs(self.inventory), abs(float(self.assets)))
+        # Use Trader.assets as the single source of truth. Trader.assets
+        # is updated on every fill via apply_fill; the legacy mm.inventory
+        # field is kept in sync for backward compatibility but not used
+        # for risk scoring.
+        inventory_abs = abs(float(self.assets))
         inventory_ratio = min(1.5, inventory_abs / max(1.5 * float(self.softlimit), 1.0))
         ofi_score = min(2.0, abs(self._recent_ofi()))
         liquidity_damage = min(1.5, max(0.0, 1.0 - liquidity_factor))
@@ -2763,7 +2838,19 @@ class AMMProvider:
         return fraction
 
     def update_liquidity(self):
-        """Adjust pool liquidity according to LP rule.  Called once per period."""
+        """Adjust pool liquidity per the paper's LP rule.
+
+        Paper text (§3 / Supplement):
+            L_{t+1} = L_t + phi1 * Pi_fee - phi2 * sigma - phi3 * c
+
+        The fractional change is delta_L / L, capped at +/- max_adj per
+        period. A core-liquidity floor is preserved as a numerical safety
+        device (so a long stress streak does not trivially zero out a
+        pool); the floor is parameterised by core_liquidity_ratio and is
+        the only addition relative to the headline equation. Earlier
+        loss/adverse-selection/stabilising terms have been removed so the
+        implementation matches the paper.
+        """
         L = self.pool.liquidity_measure()
         if L <= 0:
             return
@@ -2779,21 +2866,11 @@ class AMMProvider:
         fee_income = self.pool.period_fee_revenue
         sigma = self.env.sigma
         c = self.env.funding_cost
-        liquidity_factor = getattr(self.env, 'systemic_liquidity', 1.0)
-        flow_pressure = abs(getattr(self.env, 'amm_order_flow_imbalance', 0.0))
-        sigma_base = max(getattr(self.env, 'sigma_low', sigma), 1e-9)
-        stress_excess = max(0.0, sigma / sigma_base - 1.0)
-        stressed_flow_pressure = flow_pressure * (stress_excess + (1.0 - liquidity_factor))
-        loss_score = min(3.0, max(0.0, -self._pnl_bps_ewma) / 15.0)
-        adverse_selection_score = min(3.0, self._adverse_selection_ewma)
         delta_L = self.phi1 * fee_income - self.phi2 * sigma - self.phi3 * c
         frac = delta_L / L
-        frac -= 0.03 * (1.0 - liquidity_factor)
-        frac -= 0.02 * stressed_flow_pressure
-        frac -= 0.014 * loss_score
-        frac -= 0.018 * adverse_selection_score
-        frac += self.stabilizing_bias * max(0.0, 0.85 - liquidity_factor)
 
+        # Core-liquidity floor: prevent a long adverse streak from draining
+        # the pool below a configurable share of its initial liquidity.
         core_floor = self._initial_liquidity * self.core_liquidity_ratio
         if L < core_floor:
             refill = min(self.max_adj, max(0.0, (core_floor - L) / max(L, 1e-9)))
@@ -2929,14 +3006,22 @@ class AMMArbitrageur:
         """
         Determine the best available reference price.
 
-        Priority:
-        1. CLOB / AMM observed price discovery
-        2. Blend with env.fair_price as a latent anchor
-        3. Pure fair_price only if all venue prices are unavailable
+        Priority for arbitrage in major FX pairs follows Mancini, Ranaldo &
+        Wrampelmeyer (JF 2013) and Chaboud et al. (RFS 2014): when the
+        primary CLOB venue has a finite quoted spread, CLOB *is* the
+        reference. AMM consensus only enters as the CLOB book degrades.
+        env.fair_price acts as a weak latent anchor — never as a command —
+        so the arbitrageur cannot legitimise a drifting AMM by blending it
+        into the target.
+
+        Cascade:
+          1. CLOB mid alone, when book is healthy (qspr <= max_spread_bps).
+          2. As qspr widens, weight shifts from CLOB to AMM consensus.
+          3. Pure AMM consensus only when CLOB is degenerate.
+          4. Pure fair_price as the last resort.
         """
         fair = self.env.fair_price if self.env is not None else None
 
-        # CLOB / blend / AMM fallback
         S_clob = None
         try:
             S_clob = self.clob.mid_price()
@@ -2952,7 +3037,8 @@ class AMMArbitrageur:
         if S_amm is None:
             return self._blend_with_fair(S_clob)
 
-        # Sanity: if CLOB is implausible relative to AMM (>50 % off)
+        # Sanity: if CLOB is implausible relative to AMM (>50 % off),
+        # fall back to AMM consensus (likely CLOB book corruption).
         clob_dev = abs(S_clob - S_amm) / S_amm if S_amm > 0 else 0
         if clob_dev > 0.5:
             return self._blend_with_fair(S_amm)
@@ -2964,13 +3050,18 @@ class AMMArbitrageur:
 
         if not _math.isfinite(spread_bps) or spread_bps > 2000:
             return self._blend_with_fair(S_amm)
-        if spread_bps > self.max_spread_bps:
-            w = max(0.0, 1.0 - (spread_bps - self.max_spread_bps)
-                    / (2000 - self.max_spread_bps))
-            market_ref = w * S_clob + (1.0 - w) * S_amm
-            return self._blend_with_fair(market_ref)
 
-        market_ref = 0.65 * S_clob + 0.35 * S_amm
+        # Healthy CLOB: anchor on CLOB. AMM gets zero weight in the target,
+        # so the arbitrageur pulls AMM mid back to CLOB rather than to a
+        # blended midpoint that legitimises pool drift.
+        if spread_bps <= self.max_spread_bps:
+            return self._blend_with_fair(S_clob)
+
+        # Stressed CLOB: linearly transition from CLOB-anchored to
+        # AMM-anchored as qspr widens between max_spread_bps and 2000 bps.
+        w = max(0.0, 1.0 - (spread_bps - self.max_spread_bps)
+                / (2000 - self.max_spread_bps))
+        market_ref = w * S_clob + (1.0 - w) * S_amm
         return self._blend_with_fair(market_ref)
 
     @staticmethod
@@ -3001,16 +3092,22 @@ class AMMArbitrageur:
         return lo
 
     def _settle_trade(self, pool, traded_qty: float, before_y: float, reference_price: float):
+        # Arbitrageur represents aggregate non-AMM market intermediation
+        # rather than a single capital-constrained firm, so cash and
+        # base inventory are allowed to go negative (short / borrow).
+        # This matches the modelling convention in Lehar & Parlour (2024)
+        # and Aoyagi & Ito (2024), where arbitrage capacity in major-pair
+        # FX is effectively unbounded relative to a single AMM pool.
         if traded_qty > 0:
             cash_spent = max(0.0, (pool.y - before_y) / max(1.0 - pool.fee, 1e-9))
             self.assets += traded_qty
-            self.cash = max(0.0, self.cash - cash_spent)
+            self.cash -= cash_spent
             self.cumulative_pnl_quote += traded_qty * reference_price - cash_spent
             self.cumulative_traded_base += traded_qty
         elif traded_qty < 0:
             sell_qty = abs(traded_qty)
             cash_received = max(0.0, before_y - pool.y)
-            self.assets = max(0.0, self.assets - sell_qty)
+            self.assets -= sell_qty
             self.cash += cash_received
             self.cumulative_pnl_quote += cash_received - sell_qty * reference_price
             self.cumulative_traded_base += sell_qty
@@ -3063,8 +3160,10 @@ class AMMArbitrageur:
         """Arbitrage a single pool toward S_t."""
         try:
             if not self._reserve_healthy(pool):
+                # Only re-peg the HFMM curve to the external reference when
+                # the pool is in poor health, never to its own drifted mid.
                 if hasattr(pool, 'update_rate'):
-                    pool.update_rate()
+                    pool.update_rate(target_rate=S_t)
                 return
 
             current = pool.mid_price()
@@ -3080,8 +3179,10 @@ class AMMArbitrageur:
             max_trade_qty = max(0.0, pool.x * self.trade_fraction_cap)
             if current < S_capped:
                 max_trade_qty = self._max_affordable_buy_qty(pool, max_trade_qty)
-            else:
-                max_trade_qty = min(max_trade_qty, max(0.0, self.assets))
+            # If the arb is selling base into the pool we no longer cap by
+            # current asset inventory: the arbitrageur represents aggregate
+            # market intermediation rather than a single capital-bound firm
+            # (see _settle_trade for the modelling rationale).
 
             if max_trade_qty <= 1e-9:
                 return
@@ -3092,7 +3193,11 @@ class AMMArbitrageur:
                 return
             self._settle_trade(pool, traded_qty, before_y, S_capped)
 
+            # Re-peg the HFMM curve to the *external* reference rather than
+            # the pool's drifted mid. This keeps the StableSwap amplification
+            # benefit anchored on the true equilibrium price (S_t) instead of
+            # silently legitimising pool drift.
             if hasattr(pool, 'update_rate'):
-                pool.update_rate()
+                pool.update_rate(target_rate=S_t)
         except Exception:
             pass

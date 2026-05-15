@@ -889,11 +889,16 @@ def test_mm_amm_interaction():
     depth_comp = mm_comp._target_depth(mid)
     depth_tox = mm_tox._target_depth(mid)
 
-    check_bool("Competition mode tightens CLOB MM spread",
-               spread_comp < spread_none,
+    # Competition mode is neutral on the spread/OFI channel: AMM presence
+    # does not mechanically tighten quoted spreads (no implicit subsidy).
+    # Earlier code applied a tightening relief that is not in the paper
+    # and not supported by the FX coexistence literature; this test now
+    # documents the corrected neutral behaviour.
+    check_bool("Competition mode is neutral on CLOB MM spread",
+               abs(spread_comp - spread_none) < 1e-9,
                f"competition={spread_comp:.3f}, none={spread_none:.3f}")
-    check_bool("Competition mode boosts CLOB MM depth",
-               depth_comp > depth_none,
+    check_bool("Competition mode keeps CLOB MM depth flat or marginally lower",
+               depth_comp <= depth_none + 1e-6,
                f"competition={depth_comp:.3f}, none={depth_none:.3f}")
     check_bool("Toxicity mode widens CLOB MM spread",
                spread_tox > spread_none,
@@ -1316,10 +1321,19 @@ def test_signed_flow_diagnostics():
 
 
 def test_environment_session_cycle():
-    """Primary environment should expose an FX session cycle for flow calibration."""
+    """The optional FX session cycle should engage all four named sessions."""
     section("FX SESSION CYCLE — Unit Tests")
 
-    env = MarketEnvironment(price=100.0)
+    # Default is now session_cycle=0 (no intraday cycle). Verify the
+    # opt-in behaviour first.
+    env_off = MarketEnvironment(price=100.0)
+    env_off.step()
+    check_bool("Default FX environment runs in single-session mode",
+               env_off.session_name == 'AllDay'
+               and env_off.session_flow_multiplier == 1.0,
+               f"name={env_off.session_name}, flow_mult={env_off.session_flow_multiplier}")
+
+    env = MarketEnvironment(price=100.0, session_cycle=24)
     seen = set()
     for _ in range(24):
         env.step()
@@ -1686,27 +1700,6 @@ def test_mm_withdrawal_preset():
                f"mm={args.bg_target_ratio_recovery}, funding={main_module.REALISM_PRESETS['funding_liquidity_shock']['bg_target_ratio_recovery']}")
 
 
-def test_mm_withdrawal_feedback_preset():
-    """Feedback preset should preserve the coupled AMM-vs-MM competition channel."""
-    section("MM WITHDRAWAL FEEDBACK PRESET — Unit Tests")
-
-    parser = main_module.build_parser()
-    args = parser.parse_args(['--preset', 'mm_withdrawal_feedback'])
-    main_module._apply_preset_defaults(parser, args)
-
-    check_bool("Feedback preset remains a realism preset",
-               main_module._preset_family(args.preset) == 'realism',
-               f"preset_family={main_module._preset_family(args.preset)}")
-    check_bool("Feedback preset keeps the competition channel on",
-               args.clob_amm_interaction == 'competition',
-               f"clob_amm_interaction={args.clob_amm_interaction}")
-    check_bool("Feedback preset preserves the same withdrawal shock core",
-               args.order_flow_shock_qty == main_module.REALISM_PRESETS['mm_withdrawal']['order_flow_shock_qty']
-               and args.liquidity_shock_frac == main_module.REALISM_PRESETS['mm_withdrawal']['liquidity_shock_frac']
-               and args.mm_withdraw_threshold == main_module.REALISM_PRESETS['mm_withdrawal']['mm_withdraw_threshold'],
-               f"qty={args.order_flow_shock_qty}, liq={args.liquidity_shock_frac}, threshold={args.mm_withdraw_threshold}")
-
-
 def test_realism_preset_interaction_modes():
     """Every realism preset should resolve to an explicit, stable MM-AMM interaction mode."""
     section("REALISM PRESET INTERACTION MODES — Unit Tests")
@@ -1714,7 +1707,6 @@ def test_realism_preset_interaction_modes():
     expected_modes = {
         'baseline': 'competition',
         'mm_withdrawal': 'none',
-        'mm_withdrawal_feedback': 'competition',
         'flash_crash': 'none',
         'dealer_liquidity_crisis': 'competition',
         'funding_liquidity_shock': 'competition',

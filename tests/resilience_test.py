@@ -33,10 +33,9 @@ from AgentBasedModel.metrics.statistics import (
     independent_permutation_test,
     paired_permutation_test,
 )
-from AgentBasedModel.visualization.resilience_plots import (
-    plot_kaplan_meier_panels,
-    plot_resilience_scatter_panels,
-)
+# Plots are generated via tools.regenerate_plots after CSVs are written
+# (see end of _run_study). The legacy 2x2 dashboards in
+# AgentBasedModel.visualization.resilience_plots are no longer used.
 
 
 DEFAULT_PANELS = [
@@ -908,8 +907,6 @@ def _run_study(forced_venue_choice_rule: str | None = None,
             ],
         })
 
-    png_path = plot_resilience_scatter_panels(panel_specs, out_dir=args.out_dir)
-    km_path = plot_kaplan_meier_panels(panel_specs, out_dir=args.out_dir)
     csv_path = _save_csv(panel_specs, out_dir=args.out_dir)
     summary_path = _save_summary_csv(panel_specs, out_dir=args.out_dir)
     priority_csv_path = _save_priority_metric_csv(panel_specs, out_dir=args.out_dir)
@@ -937,10 +934,7 @@ def _run_study(forced_venue_choice_rule: str | None = None,
         base_seed=args.base_seed,
         permutation_reps=args.permutation_reps,
     )
-    spread_survival_path = _save_spread_recovery_survival_panels(panel_specs, out_dir=args.out_dir)
 
-    print(f'Saved resilience scatter panels to {png_path}')
-    print(f'Saved recovery survival panels to {km_path}')
     print(f'Saved resilience point data to {csv_path}')
     print(f'Saved resilience panel summary to {summary_path}')
     print(f'Saved priority resilience metric data to {priority_csv_path}')
@@ -948,7 +942,12 @@ def _run_study(forced_venue_choice_rule: str | None = None,
     print(f'Saved statistical resilience summary to {stats_summary_path}')
     print(f'Saved pairwise statistical tests to {pairwise_path}')
     print(f'Saved with/without AMM comparison summary to {comparison_path}')
-    print(f'Saved spread recovery survival panels to {spread_survival_path}')
+
+    # Generate individual plots in subfolders (scatter/, km_curves/, peak_impact/,
+    # normalized_impact/, recovery_boxplots/) by reading the CSVs we just wrote.
+    from tools.regenerate_plots import regenerate_resilience
+    plot_paths = regenerate_resilience(args.out_dir)
+    print(f'Generated {len(plot_paths)} individual plots under {args.out_dir}/')
 
 
 def main():

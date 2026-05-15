@@ -435,21 +435,13 @@ class Simulator:
                         pool.update_fee(self.env.sigma, self.env.sigma_low,
                                         sigma_prev=_sigma_prev)
 
-            # 1b. Pre-trade arbitrage — align AMM prices *before* FX
-            #     takers observe quotes.  This second pass (together with
-            #     the post-trade pass in step 7) keeps pool mid-prices
-            #     close to S_t even under high-σ GBM dynamics.
-            skip_pretrade_arb = (
-                self.shock_mode == 'realism'
-                and self.env is not None
-                and self.env.shock_ticks_remaining > 0
-                and (
-                    self.env.systemic_liquidity < 0.80
-                    or getattr(self.env, 'arbitrage_capacity', 0.0) < 0.12
-                )
-            )
-            if self.arbitrageur is not None and not skip_pretrade_arb:
-                self.arbitrageur.arbitrage()
+            # 1b. Pre-trade arbitrage removed: the post-trade arbitrage
+            # pass at step 7 already aligns AMM prices once per tick, and
+            # major-pair FX arbitrage (Mancini, Ranaldo, Wrampelmeyer 2013)
+            # converges within a single quote interval in normal conditions.
+            # Running it twice per tick effectively doubled the per-tick
+            # correction and made the documented arb_trade_fraction_cap
+            # less meaningful as a robustness control.
 
             # 1c. SimulatorInfo capture + behaviour changes
             if self.info is not None:
@@ -485,8 +477,7 @@ class Simulator:
                 except Exception:
                     pass
 
-            # 4. Dividends
-            self.exchange.generate_dividend()
+            # 4. (Dividends skipped in FX mode — no FX-side use.)
 
             # 5. Reset AMM period fees
             for pool in self.amm_pools.values():
@@ -551,11 +542,27 @@ class Simulator:
     @classmethod
     def default_fx(cls,
                    n_noise: int = 12,
-                   n_mm: int = 2,
+                   # Top-tier EUR/USD intermediation is supplied by ~5-8
+                   # heterogeneous dealers (BIS WP 1073; Triennial 2022).
+                   # Default of 5 reflects the major-pair tier-1 set (JPM,
+                   # Deutsche, Citi, UBS, HSBC) with stepped alpha0 / d0
+                   # for aggressiveness heterogeneity.
+                   n_mm: int = 5,
                    n_fast_lp: int = 10,
                    n_latent_lp: int = 6,
+                   # CLOB-side fundamental / momentum book agents. With
+                   # the FX-aware Fundamentalist branch (env.fair_price
+                   # anchor) these participate as *limit-order liquidity
+                   # providers* complementary to the FX-taker fundament-
+                   # alists (n_fx_fund) which consume liquidity via market
+                   # orders. Heterogeneous strategy mix is consistent with
+                   # the literature on FX participant types: macro funds /
+                   # CTAs (Fundamentalist), trend followers (Chartist),
+                   # and regime-switching hedge funds (Universalist). Kept
+                   # small (2/1/1 = 4 extra agents) so the calibrated
+                   # dealer pack remains the primary liquidity supplier.
                    n_clob_fund: int = 2,
-                   n_clob_chart: int = 0,
+                   n_clob_chart: int = 1,
                    n_clob_univ: int = 1,
                    n_fx_takers: int = 15,
                    n_fx_fund: int = 5,
@@ -575,7 +582,10 @@ class Simulator:
                    c_low: float = 0.001,
                    c_high: float = 0.02,
                    price: float = 100.0,
-                   amm_share_pct: float = 30.0,
+                   # Calibration target (ssrn-3808755) is 22% AMM share
+                   # in major-pair coexistence; the 30% used elsewhere in
+                   # the paper is a worked example, not the fit value.
+                   amm_share_pct: float = 22.0,
                    venue_choice_rule: str = 'fixed_share',
                    deterministic: bool = False,
                    # ── intra-AMM venue selection ────────────────
@@ -587,21 +597,31 @@ class Simulator:
                    clob_liq: float = 1.0,
                    clob_anchor_strength: float = 0.35,
                    clob_anchor_threshold_bps: float = 5.0,
-                   clob_background_target_ratio: float = 1.5,
-                   clob_support_max_share: float = 1.0,
+                   # Anonymous background liquidity is a *backstop* for the
+                   # CLOB book, not a replacement for trader-owned depth.
+                   # With 5 MMs the trader pack meets the touch-depth
+                   # anchor on its own; the background layer is capped at
+                   # 0.30 * trader near-mid depth so it does not over-
+                   # supply liquidity in calm conditions.
+                   clob_background_target_ratio: float = 1.0,
+                   clob_support_max_share: float = 0.30,
                    clob_amm_interaction: str = 'competition',
                    clob_amm_spread_impact_bps: float = 3.0,
                    clob_amm_depth_impact: float = 60.0,
                    mm_alpha0_base: float = 2.1,
                    mm_alpha0_step: float = 0.3,
                    mm_alpha1: float = 320.0,
-                   mm_alpha2: float = 560.0,
+                   mm_alpha2: float = 700.0,
                    mm_alpha3: float = 35.0,
-                   mm_d0_base: float = 90.0,
+                   # 5 MMs * mm_d0_base ~ 200 displayed depth per side,
+                   # plus FastRecyclerLP and a capped anonymous support
+                   # layer, lands near the 220 base/side touch-depth
+                   # anchor (Lo & Hall L1).
+                   mm_d0_base: float = 40.0,
                    mm_d0_step: float = 5.0,
-                   mm_d1: float = 620.0,
-                   mm_d2: float = 420.0,
-                   mm_d3: float = 18.0,
+                   mm_d1: float = 560.0,
+                   mm_d2: float = 360.0,
+                   mm_d3: float = 12.0,
                    hedger_flow_persistence: float = 0.10,
                    retail_flow_persistence: float = 0.28,
                    institutional_flow_persistence: float = 0.18,
@@ -628,8 +648,13 @@ class Simulator:
                    arb_trade_fraction_cap: float = 0.20,
                    amm_lp_wallet_cash_buffer_ratio: float = 0.20,
                    amm_lp_wallet_base_buffer_ratio: float = 0.20,
-                   amm_arb_cash_buffer_ratio: float = 0.15,
-                   amm_arb_base_buffer_ratio: float = 0.15,
+                   # Arbitrageur represents aggregate non-AMM market
+                   # intermediation; default buffer is 1x pool size so it
+                   # is not the binding constraint on price alignment under
+                   # normal conditions. Combined with shorting allowed in
+                   # _settle_trade this keeps cross-venue basis tight.
+                   amm_arb_cash_buffer_ratio: float = 1.0,
+                   amm_arb_base_buffer_ratio: float = 1.0,
                    dynamic_fee: bool = False,
                    # ── liquidity shock decay rates ──────────────
                    reprice_prob_recovery: Optional[float] = None,

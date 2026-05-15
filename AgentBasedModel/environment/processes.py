@@ -62,7 +62,12 @@ class MarketEnvironment:
                  price_vol_scale: float = 0.35,
                  shock_anchor_weight: float = 0.75,
                  shock_price_freeze_ticks: int = 1,
-                 session_cycle: int = 24):
+                 # session_cycle <= 0 disables the intraday cycle. The
+                 # paper's primary scope (calibration manifest) deliberately
+                 # excludes Asia/London/NY decomposition, so the default for
+                 # FX runs is now disabled; a positive value re-enables a
+                 # 4-session round-robin for studies that explicitly want it.
+                 session_cycle: int = 0):
         """
         Parameters
         ----------
@@ -151,11 +156,20 @@ class MarketEnvironment:
         self._shock_anchor_weight = max(0.0, min(1.0, shock_anchor_weight))
         self._shock_price_freeze_default = max(0, int(shock_price_freeze_ticks))
         self._price_freeze_ticks = 0
-        self._session_cycle = max(4, int(session_cycle))
-        self._session_name = 'Asia'
-        self._session_flow_multiplier = 0.85
-        self._session_liquidity_multiplier = 0.90
-        self._session_vol_multiplier = 0.92
+        self._session_cycle = int(session_cycle)
+        # When the cycle is disabled (<=0) all session multipliers are 1.0
+        # and the session name is 'AllDay'. This avoids implicit intraday
+        # heterogeneity in the FX baseline that the paper does not document.
+        if self._session_cycle <= 0:
+            self._session_name = 'AllDay'
+            self._session_flow_multiplier = 1.0
+            self._session_liquidity_multiplier = 1.0
+            self._session_vol_multiplier = 1.0
+        else:
+            self._session_name = 'Asia'
+            self._session_flow_multiplier = 0.85
+            self._session_liquidity_multiplier = 0.90
+            self._session_vol_multiplier = 0.92
 
         # History
         self.sigma_history: List[float] = []
@@ -724,19 +738,27 @@ class MarketEnvironment:
         self._systemic_liquidity = max(0.2, min(1.0, liquidity))
 
     def _update_session_state(self):
-        """Simple intraday FX session cycle for flow and liquidity timing."""
+        """Optional intraday FX session cycle for flow and liquidity timing.
+
+        Disabled when session_cycle <= 0 (the FX baseline default). When
+        enabled the cycle implements a four-session round-robin (Asia /
+        London / Overlap / NewYork) over session_cycle ticks.
+        """
+        if self._session_cycle <= 0:
+            return
         bucket = self._t % self._session_cycle
-        if bucket < 6:
+        cycle = self._session_cycle
+        if bucket < cycle * 6 // 24:
             self._session_name = 'Asia'
             self._session_flow_multiplier = 0.85
             self._session_liquidity_multiplier = 0.90
             self._session_vol_multiplier = 0.92
-        elif bucket < 12:
+        elif bucket < cycle * 12 // 24:
             self._session_name = 'London'
             self._session_flow_multiplier = 1.10
             self._session_liquidity_multiplier = 1.05
             self._session_vol_multiplier = 1.05
-        elif bucket < 17:
+        elif bucket < cycle * 17 // 24:
             self._session_name = 'Overlap'
             self._session_flow_multiplier = 1.25
             self._session_liquidity_multiplier = 1.10

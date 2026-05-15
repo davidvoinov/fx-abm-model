@@ -5,9 +5,8 @@ Base scenario (without any shocks):
     python3 main.py --seed 42 --preset baseline   
 
 Event simulations presets (with different shock types/mechanics):                                 
-    python3 main.py --seed 42 --preset mm_withdrawal            
-    python3 main.py --seed 42 --preset mm_withdrawal_feedback   
-    python3 main.py --seed 42 --preset flash_crash              
+    python3 main.py --seed 42 --preset mm_withdrawal
+    python3 main.py --seed 42 --preset flash_crash
     python3 main.py --seed 42 --preset dealer_liquidity_crisis  
     python3 main.py --seed 42 --preset funding_liquidity_shock   
     python3 main.py --seed 42 --preset high_vol_stress           
@@ -317,31 +316,6 @@ REALISM_PRESETS = {
         mm_min_withdraw_ticks=4,
         mm_reentry_ticks=2,
     ),
-    "mm_withdrawal_feedback": dict(
-        shock_iter=350,
-        shock_mode="realism",
-        clob_amm_interaction="competition",
-        # Coupled dealer-withdrawal event: same shock as mm_withdrawal, but
-        # AMM quality also affects CLOB MM quoting and retreat decisions.
-        # Use this when the research question explicitly includes dealer
-        # competition from AMMs as part of the shock transmission channel.
-        fundamental_shock_pct=0.0,
-        order_flow_shock_qty=135.0,
-        order_flow_shock_side="sell",
-        liquidity_shock_frac=0.54,
-        funding_vol_shock_intensity=0.35,
-        arb_trade_fraction_cap=0.08,
-        reprice_prob_recovery=0.045,
-        anchor_strength_recovery=0.022,
-        bg_target_ratio_recovery=0.085,
-        toxic_flow_decay=0.83,
-        liquidity_shock_decay=0.87,
-        mm_withdraw_threshold=1.70,
-        mm_reentry_threshold=1.00,
-        mm_loss_threshold_bps=19.0,
-        mm_min_withdraw_ticks=4,
-        mm_reentry_ticks=2,
-    ),
     "flash_crash": dict(
         shock_iter=350,
         shock_mode="realism",
@@ -370,7 +344,7 @@ REALISM_PRESETS = {
         # → price discovery breaks (BIS WP 1073, Huang et al.)
         fundamental_shock_pct=-3.0,
         # Large directional sweep typical of institutional panic selling
-        order_flow_shock_qty=250.0,
+        order_flow_shock_qty=200.0,
         order_flow_shock_side="sell",
         # Deep cancellation wave: dealers pull quotes (Mancini et al.)
         liquidity_shock_frac=0.60,
@@ -379,11 +353,18 @@ REALISM_PRESETS = {
         # Restrict arbitrageur capacity during stress
         arb_trade_fraction_cap=0.05,
         # Slow recovery: dealer constraints persist (Lo & Hall resiliency)
-        reprice_prob_recovery=0.015,       # ~37 ticks to restore (was 0.05 → 12 ticks)
-        anchor_strength_recovery=0.008,    # ~28 ticks (was 0.03 → 8 ticks)
-        bg_target_ratio_recovery=0.025,    # ~26 ticks (was 0.08 → 8 ticks)
-        toxic_flow_decay=0.93,             # slower toxic flow fade (was 0.85)
-        liquidity_shock_decay=0.95,        # slower systemic recovery (was 0.90)
+        reprice_prob_recovery=0.015,
+        anchor_strength_recovery=0.008,
+        bg_target_ratio_recovery=0.025,
+        toxic_flow_decay=0.93,
+        liquidity_shock_decay=0.95,
+        # With the heterogeneous CLOB book, dealer inventory churn is
+        # higher; raise the withdrawal threshold so withdrawal share
+        # lands near the BIS proxy (~10%) and the resulting recovery
+        # half-life sits in the Lo & Hall band (~20 ticks). Re-entry
+        # stays sticky so the recovery is gradual.
+        mm_withdraw_threshold=1.85,
+        mm_reentry_threshold=1.10,
     ),
     "funding_liquidity_shock": dict(
         shock_iter=350,
