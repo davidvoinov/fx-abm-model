@@ -1,8 +1,10 @@
 output/*
-!output/resilience_aware_300/
-!output/resilience_aware_300/**
-!output/scenario_stats_300/
-!output/scenario_stats_300/**
+!output/resilience/
+!output/resilience/**
+!output/stat_tests/
+!output/stat_tests/**
+!output/main_aware/
+!output/main_aware/**
 .github/
 .obsidian-vault/
 .vscode/
